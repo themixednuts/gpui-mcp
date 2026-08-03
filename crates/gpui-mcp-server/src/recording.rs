@@ -161,11 +161,13 @@ impl ArtifactStore {
 fn install_artifact(
     temporary: NamedTempFile,
     final_path: &Path,
-    _directory: &Path,
+    directory: &Path,
     artifact_name: &str,
     encoded_bytes: u64,
     overwrite: bool,
 ) -> Result<(), String> {
+    #[cfg(not(unix))]
+    let _ = directory;
     temporary
         .as_file()
         .sync_all()
@@ -204,7 +206,7 @@ fn install_artifact(
         })?,
     );
     #[cfg(unix)]
-    if let Err(error) = sync_parent_directory(_directory) {
+    if let Err(error) = sync_parent_directory(directory) {
         tracing::warn!(
             %error,
             artifact = %final_path.display(),

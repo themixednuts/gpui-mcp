@@ -370,7 +370,10 @@ fn validate_local_endpoint(endpoint: &LocalEndpoint, descriptor_path: &Path) -> 
         }
         LocalEndpoint::Namespaced { name } => {
             #[cfg(not(windows))]
-            bail!("namespaced local endpoints are unsupported on this platform");
+            {
+                let _ = name;
+                bail!("namespaced local endpoints are unsupported on this platform");
+            }
             #[cfg(windows)]
             if name.is_empty()
                 || name.len() > 256
