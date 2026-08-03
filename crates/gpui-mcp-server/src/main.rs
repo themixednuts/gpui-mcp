@@ -42,8 +42,8 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     artifact_dir: Option<PathBuf>,
 
-    /// Maximum Windows WGC/DWM stability wait, in milliseconds (32..=2000).
-    #[arg(long, default_value_t = 250, value_name = "MS")]
+    /// Maximum Windows Graphics Capture freshness wait, in milliseconds (32..=2000).
+    #[arg(long, default_value_t = 1_000, value_name = "MS")]
     capture_stability_deadline_ms: u64,
 }
 

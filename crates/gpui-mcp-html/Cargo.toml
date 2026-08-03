@@ -17,8 +17,8 @@ ron = ["dep:ron"]
 visual-parity = [
     "dep:anyhow",
     "dep:clap",
+    "dep:gpui-mcp-capture",
     "dep:image",
-    "dep:xcap",
     "gpui-mcp/test-support",
 ]
 
@@ -28,6 +28,7 @@ clap = { workspace = true, optional = true }
 gpui.workspace = true
 gpui-component.workspace = true
 gpui-mcp = { path = "../gpui-mcp", default-features = false }
+gpui-mcp-capture = { path = "../gpui-mcp-capture", optional = true }
 htmlswap.workspace = true
 image = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }
@@ -35,7 +36,6 @@ ron = { workspace = true, optional = true }
 serde.workspace = true
 serde_json = { workspace = true, optional = true }
 thiserror.workspace = true
-xcap = { workspace = true, optional = true }
 
 [[bin]]
 name = "gpui-mcp"

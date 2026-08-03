@@ -7,23 +7,23 @@ use std::time::Instant;
 
 use base64::Engine as _;
 use gpui_mcp_protocol::{Rect, Screenshot, ScreenshotTarget};
-use image::{DynamicImage, ImageFormat};
+use image::{DynamicImage, ImageFormat, RgbaImage};
 
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_ENCODED_BYTES: usize = 16 * 1024 * 1024;
 const COMPOSITOR_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MIN_STABILITY_DEADLINE: Duration = Duration::from_millis(32);
 const MAX_STABILITY_DEADLINE: Duration = Duration::from_secs(2);
-const MIN_STABILITY_SAMPLES: u8 = 3;
+const MIN_FRESHNESS_SAMPLES: u8 = 3;
 
-/// Bounded Windows WGC/DWM capture-freshness policy.
+/// Bounded Windows Graphics Capture freshness policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaptureOptions {
     compositor_stability_deadline: Duration,
 }
 
 impl CaptureOptions {
-    /// Configure the maximum time Windows capture spends waiting for a stable compositor image.
+    /// Configure the maximum time Windows capture spends obtaining fresh compositor samples.
     ///
     /// # Errors
     ///
@@ -40,7 +40,7 @@ impl CaptureOptions {
         })
     }
 
-    /// Return the configured compositor stability deadline.
+    /// Return the configured compositor freshness deadline.
     #[must_use]
     pub const fn compositor_stability_deadline(self) -> Duration {
         self.compositor_stability_deadline
@@ -50,9 +50,25 @@ impl CaptureOptions {
 impl Default for CaptureOptions {
     fn default() -> Self {
         Self {
-            compositor_stability_deadline: Duration::from_millis(250),
+            compositor_stability_deadline: Duration::from_secs(1),
         }
     }
+}
+
+/// Native window pixels plus display metadata reported by the operating system.
+///
+/// The image is bounded by this crate's safety limits and, on Windows, has
+/// passed the same compositor-freshness policy used by MCP screenshots.
+#[derive(Clone, Debug)]
+pub struct NativeWindowCapture {
+    /// Captured native RGBA pixels, including any frame retained by the OS API.
+    pub image: RgbaImage,
+    /// Native global window origin when the platform reports one.
+    pub origin: Option<(i32, i32)>,
+    /// Physical pixels per logical display pixel from the native monitor API.
+    pub scale_factor: f32,
+    /// Window dimensions reported by the native window API, when available.
+    pub reported_size: Option<(u32, u32)>,
 }
 
 /// GPUI client-area geometry used to map logical element coordinates into a decorated native
@@ -87,7 +103,7 @@ pub enum CaptureFailure {
     },
     /// The operating system could not capture the matched window.
     CaptureUnavailable,
-    /// The compositor did not produce a stable frame before the configured deadline.
+    /// The compositor did not produce enough fresh samples before the configured deadline.
     UnstableFrame,
     /// Captured dimensions exceeded the safety bound.
     DimensionsOutOfBounds,
@@ -111,7 +127,7 @@ impl std::fmt::Display for CaptureFailure {
             }
             Self::TargetNotFound { .. } => "application window was not available for capture",
             Self::UnstableFrame => {
-                "native screenshot capture did not become stable before the freshness deadline"
+                "native screenshot capture did not produce a fresh frame before the deadline"
             }
             Self::DimensionsOutOfBounds => {
                 "captured image dimensions are outside the safety bound"
@@ -164,7 +180,7 @@ pub fn capture_window(
 /// # Errors
 ///
 /// Returns a sanitized [`CaptureFailure`] when validation, native capture,
-/// compositor stability, cropping, or bounded PNG encoding fails.
+/// compositor freshness sampling, cropping, or bounded PNG encoding fails.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -179,26 +195,9 @@ pub fn capture_window_with_options(
     options: CaptureOptions,
 ) -> Result<Screenshot, CaptureFailure> {
     validate_target(target)?;
-
-    let windows = xcap::Window::all().map_err(|_| CaptureFailure::WindowEnumeration)?;
-    let native_window = find_native_window(windows, pid, title)?;
-    let native_origin = native_window.x().ok().zip(native_window.y().ok());
-    let mut image = capture_after_compositor_settle(
-        || {
-            native_window
-                .capture_image()
-                .map_err(|_| CaptureFailure::CaptureUnavailable)
-        },
-        options,
-    )?;
-
-    if image.width() == 0
-        || image.height() == 0
-        || image.width() > MAX_IMAGE_DIMENSION
-        || image.height() > MAX_IMAGE_DIMENSION
-    {
-        return Err(CaptureFailure::DimensionsOutOfBounds);
-    }
+    let native = capture_native_window_with_options(pid, title, options)?;
+    let native_origin = native.origin;
+    let mut image = native.image;
 
     if let ScreenshotTarget::Region { rect } = target {
         let mapping = region_mapping(
@@ -241,6 +240,67 @@ pub fn capture_window_with_options(
         base64_data: base64::engine::general_purpose::STANDARD.encode(bytes),
         width,
         height,
+    })
+}
+
+/// Capture bounded native RGBA pixels for an exact process-and-title pair.
+///
+/// This is the common platform abstraction used by MCP screenshots and visual
+/// parity tests. It uses the platform backend selected by `xcap`: Windows
+/// Graphics Capture on Windows, CoreGraphics on macOS, and X11 window capture
+/// on Linux. Native Wayland compositors intentionally do not expose unattended
+/// cross-process window capture by process ID and title.
+///
+/// # Errors
+///
+/// Returns a sanitized [`CaptureFailure`] when the window cannot be found,
+/// native display metadata is unavailable, or capture does not settle.
+pub fn capture_native_window(pid: u32, title: &str) -> Result<NativeWindowCapture, CaptureFailure> {
+    capture_native_window_with_options(pid, title, CaptureOptions::default())
+}
+
+/// Capture native RGBA pixels with a caller-selected bounded freshness policy.
+///
+/// # Errors
+///
+/// Returns a sanitized [`CaptureFailure`] when window enumeration, display
+/// metadata, native capture, or compositor settlement fails.
+pub fn capture_native_window_with_options(
+    pid: u32,
+    title: &str,
+    options: CaptureOptions,
+) -> Result<NativeWindowCapture, CaptureFailure> {
+    let windows = xcap::Window::all().map_err(|_| CaptureFailure::WindowEnumeration)?;
+    let native_window = find_native_window(windows, pid, title)?;
+    let origin = native_window.x().ok().zip(native_window.y().ok());
+    let scale_factor = native_window
+        .current_monitor()
+        .and_then(|monitor| monitor.scale_factor())
+        .map_err(|_| CaptureFailure::CaptureUnavailable)?;
+    if !scale_factor.is_finite() || !(0.25..=8.0).contains(&scale_factor) {
+        return Err(CaptureFailure::CaptureUnavailable);
+    }
+    let reported_size = native_window.width().ok().zip(native_window.height().ok());
+    let image = capture_after_compositor_settle(
+        || {
+            native_window
+                .capture_image()
+                .map_err(|_| CaptureFailure::CaptureUnavailable)
+        },
+        options,
+    )?;
+    if image.width() == 0
+        || image.height() == 0
+        || image.width() > MAX_IMAGE_DIMENSION
+        || image.height() > MAX_IMAGE_DIMENSION
+    {
+        return Err(CaptureFailure::DimensionsOutOfBounds);
+    }
+    Ok(NativeWindowCapture {
+        image,
+        origin,
+        scale_factor,
+        reported_size,
     })
 }
 
@@ -354,13 +414,13 @@ fn region_mapping(
     }
 }
 
-fn capture_after_compositor_settle<T: PartialEq>(
+fn capture_after_compositor_settle<T>(
     capture: impl FnMut() -> Result<T, CaptureFailure>,
     options: CaptureOptions,
 ) -> Result<T, CaptureFailure> {
     #[cfg(target_os = "windows")]
     {
-        capture_until_stable(
+        capture_fresh_frame(
             capture,
             options,
             Instant::now,
@@ -377,24 +437,22 @@ fn capture_after_compositor_settle<T: PartialEq>(
     }
 }
 
-fn capture_until_stable<T: PartialEq, E: Clone>(
+fn capture_fresh_frame<T, E: Clone>(
     mut capture: impl FnMut() -> Result<T, E>,
     options: CaptureOptions,
     mut now: impl FnMut() -> std::time::Instant,
     mut wait: impl FnMut(Duration),
     unstable_error: E,
 ) -> Result<T, E> {
-    // Windows Graphics Capture can initially return the same stale frame more than once before a
-    // newly committed surface arrives. Require at least three samples before accepting equality,
-    // then continue until two consecutive samples match. Animated or otherwise unstable content
-    // fails explicitly at the caller-selected deadline instead of returning an arbitrary last frame.
+    // Windows Graphics Capture can initially return an older composited frame. Take a bounded
+    // sequence of ordered samples and return the newest one. Requiring byte equality is incorrect:
+    // native capture borders and legitimate animation may change between every sample.
     let started = now();
     let Some(deadline) = started.checked_add(options.compositor_stability_deadline()) else {
         return Err(unstable_error.clone());
     };
-    let mut previous = capture()?;
-    let mut samples = 1_u8;
-    loop {
+    let mut latest = capture()?;
+    for _ in 1..MIN_FRESHNESS_SAMPLES {
         let current_time = now();
         let Some(remaining) = deadline.checked_duration_since(current_time) else {
             return Err(unstable_error.clone());
@@ -406,13 +464,9 @@ fn capture_until_stable<T: PartialEq, E: Clone>(
         if now() >= deadline {
             return Err(unstable_error.clone());
         }
-        let current = capture()?;
-        samples = samples.saturating_add(1);
-        if samples >= MIN_STABILITY_SAMPLES && current == previous {
-            return Ok(current);
-        }
-        previous = current;
+        latest = capture()?;
     }
+    Ok(latest)
 }
 
 fn validate_target(target: ScreenshotTarget) -> Result<(), CaptureFailure> {
@@ -456,7 +510,7 @@ mod tests {
     use gpui_mcp_protocol::{Rect, ScreenshotTarget};
 
     use super::{
-        CaptureFailure, CaptureGeometry, CaptureOptions, RegionMapping, capture_until_stable,
+        CaptureFailure, CaptureGeometry, CaptureOptions, RegionMapping, capture_fresh_frame,
         region_mapping, validate_target,
     };
 
@@ -482,12 +536,12 @@ mod tests {
     }
 
     #[test]
-    fn stability_wait_does_not_accept_two_initial_stale_frames() -> Result<(), CaptureFailure> {
+    fn freshness_sampling_returns_the_third_ordered_frame() -> Result<(), CaptureFailure> {
         let calls = Cell::new(0_usize);
         let elapsed = Cell::new(Duration::ZERO);
         let started = Instant::now();
-        let frames = [1_u8, 1, 2, 2];
-        let captured = capture_until_stable(
+        let frames = [1_u8, 1, 2];
+        let captured = capture_fresh_frame(
             || {
                 let call = calls.get();
                 calls.set(call.saturating_add(1));
@@ -506,29 +560,29 @@ mod tests {
         )?;
 
         assert_eq!(captured, 2);
-        assert_eq!(calls.get(), 4);
+        assert_eq!(calls.get(), 3);
         Ok(())
     }
 
     #[test]
-    fn stability_wait_fails_when_frames_never_settle() -> Result<(), CaptureFailure> {
+    fn freshness_sampling_honors_the_deadline() -> Result<(), CaptureFailure> {
         let calls = Cell::new(0_u8);
         let elapsed = Cell::new(Duration::ZERO);
         let started = Instant::now();
-        let captured = capture_until_stable(
+        let captured = capture_fresh_frame(
             || {
                 let frame = calls.get();
                 calls.set(frame.saturating_add(1));
                 Ok::<_, CaptureFailure>(frame)
             },
-            CaptureOptions::new(Duration::from_millis(48))?,
+            CaptureOptions::new(Duration::from_millis(32))?,
             || started + elapsed.get(),
             |duration| elapsed.set(elapsed.get().saturating_add(duration)),
             CaptureFailure::UnstableFrame,
         );
 
         assert_eq!(captured, Err(CaptureFailure::UnstableFrame));
-        assert_eq!(calls.get(), 3);
+        assert_eq!(calls.get(), 2);
         Ok(())
     }
 

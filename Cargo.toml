@@ -48,7 +48,7 @@ tokio = { version = "1.52.3", features = ["io-std", "io-util", "macros", "net", 
 tokio-util = { version = "0.7.18", features = ["rt"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
-xcap = "0.9.6"
+xcap = { version = "0.9.6", features = ["wgc"] }
 widestring = "1.2.1"
 
 [workspace.lints.rust]

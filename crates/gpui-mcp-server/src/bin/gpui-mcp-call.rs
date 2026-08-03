@@ -35,8 +35,8 @@ struct Args {
     #[arg(long)]
     artifact_dir: Option<PathBuf>,
 
-    /// Compositor stability deadline passed to the child server, in milliseconds.
-    #[arg(long, default_value_t = 250)]
+    /// Windows capture freshness deadline passed to the child server, in milliseconds.
+    #[arg(long, default_value_t = 1_000)]
     capture_stability_deadline_ms: u64,
 
     /// MCP tool name. Omit with --list-tools or --batch.

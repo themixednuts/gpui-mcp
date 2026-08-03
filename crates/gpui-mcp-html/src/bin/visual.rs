@@ -5,13 +5,15 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, bail, ensure};
+use anyhow::{Context as _, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use gpui::{
-    App, AppContext as _, Application, Bounds, Context, IntoElement, Render, Timer, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, px, size,
+    App, AppContext as _, Application, AsyncWindowContext, Bounds, Context, IntoElement, Render,
+    Timer, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, px,
+    size,
 };
 use gpui_mcp::{Automation, MouseButton, SemanticAction};
+use gpui_mcp_capture::CaptureFailure;
 use gpui_mcp_html::{BindingDocument, HookRegistry, HtmlUi, LiveHtml};
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 
@@ -164,7 +166,7 @@ fn run_fixture(fixture: FixtureName, state: FixtureState) -> Result<()> {
 
     Application::new().run(move |cx: &mut App| {
         gpui_mcp_html::init(cx);
-        let bounds = Bounds::centered(None, fixture_window_size(), cx);
+        let bounds = Bounds::centered(None, fixture_content_size(), cx);
         let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -179,10 +181,13 @@ fn run_fixture(fixture: FixtureName, state: FixtureState) -> Result<()> {
             },
             |window, cx| {
                 window.set_window_title(WINDOW_TITLE);
+                // `Window::resize` is GPUI's cross-platform content-size API. Its
+                // platform implementations account for each OS's non-client area.
+                window.resize(fixture_content_size());
                 let automation = automation.clone();
                 window
                     .spawn(cx, async move |cx| {
-                        if let Err(error) = wait_for_completed_frame(&automation, 0).await {
+                        if let Err(error) = wait_for_content_surface(&automation, cx).await {
                             eprintln!("could not present fixture window: {error:#}");
                             let _ = cx.update(|_, cx| cx.quit());
                             return;
@@ -235,6 +240,30 @@ fn run_fixture(fixture: FixtureName, state: FixtureState) -> Result<()> {
     Ok(())
 }
 
+async fn wait_for_content_surface(
+    automation: &Automation,
+    cx: &mut AsyncWindowContext,
+) -> Result<()> {
+    let target = fixture_content_size();
+    let started = Instant::now();
+    loop {
+        let viewport = cx
+            .update(|window, _| window.viewport_size())
+            .context("inspect fixture viewport")?;
+        if viewport == target {
+            let completed_frame = automation.completed_test_frame_count();
+            cx.update(|window, _| window.refresh())
+                .context("refresh resized fixture")?;
+            return wait_for_completed_frame(automation, completed_frame).await;
+        }
+        ensure!(
+            started.elapsed() < FIXTURE_READY_TIMEOUT,
+            "fixture viewport remained {viewport:?}; expected {target:?} within {FIXTURE_READY_TIMEOUT:?}"
+        );
+        Timer::after(FRAME_POLL_INTERVAL).await;
+    }
+}
+
 async fn wait_for_completed_frame(automation: &Automation, after_frame: u64) -> Result<()> {
     let started = Instant::now();
     while automation.completed_test_frame_count() <= after_frame {
@@ -272,64 +301,59 @@ fn capture_window(request: &CaptureRequest) -> Result<()> {
         request.width <= 16_384 && request.height <= 16_384,
         "capture size exceeds 16384 pixels"
     );
-    let started = Instant::now();
-    let native_window = loop {
-        let windows = xcap::Window::all().context("enumerate native windows")?;
-        if let Some(window) = windows.into_iter().find(|window| {
-            window.pid().ok() == Some(request.pid)
-                && window.title().ok().as_deref() == Some(request.title.as_str())
-        }) {
-            break window;
-        }
-        if started.elapsed() >= request.timeout {
-            bail!(
-                "window with pid {} and title {:?} was not available within {:?}",
-                request.pid,
-                request.title,
-                request.timeout
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-
     thread::sleep(request.settle);
-    let image = native_window
-        .capture_image()
-        .context("capture GPUI fixture window")?;
-    ensure!(
-        image.width() > 0 && image.height() > 0,
-        "native capture was empty"
-    );
+    let started = Instant::now();
+    let native = loop {
+        match gpui_mcp_capture::capture_native_window(request.pid, &request.title) {
+            Ok(capture) => break capture,
+            Err(CaptureFailure::TargetNotFound { .. }) if started.elapsed() < request.timeout => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error).context("capture GPUI fixture window"),
+        }
+    };
+    let image = native.image;
     if let Some(path) = &request.raw_output {
         save_png(&image, path)?;
     }
-    let normalized = normalize_capture(&image, request.width, request.height)?;
+    let normalized = normalize_capture(&image, request.width, request.height, native.scale_factor)?;
     save_png(&normalized, &request.output)?;
     let scale = f64::from(normalized.width()) / f64::from(request.width);
+    let reported_size = native
+        .reported_size
+        .unwrap_or((image.width(), image.height()));
     println!(
         "CAPTURED {}x{} -> {}x{} at {scale:.2}x",
-        native_window.width().unwrap_or(normalized.width()),
-        native_window.height().unwrap_or(normalized.height()),
+        reported_size.0,
+        reported_size.1,
         normalized.width(),
         normalized.height()
     );
     Ok(())
 }
 
-fn fixture_window_size() -> gpui::Size<gpui::Pixels> {
-    // Native compositors retain small non-client edges even with GPUI client
-    // decorations. Compensate when requesting the window so the rendered HTML
-    // surface remains exactly 640x480 CSS pixels.
-    #[cfg(target_os = "windows")]
-    let requested = (646.0, 480.0);
-    #[cfg(target_os = "macos")]
-    let requested = (642.0, 482.0);
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    let requested = (640.0, 480.0);
-    size(px(requested.0), px(requested.1))
+// The fixed fixture dimensions are exactly representable as f32 values.
+#[allow(clippy::cast_precision_loss)]
+fn fixture_content_size() -> gpui::Size<gpui::Pixels> {
+    size(px(VIEWPORT_WIDTH as f32), px(VIEWPORT_HEIGHT as f32))
 }
 
-fn normalize_capture(image: &RgbaImage, width: u32, height: u32) -> Result<RgbaImage> {
+// The logical dimensions and native scale are bounded before conversion.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn normalize_capture(
+    image: &RgbaImage,
+    width: u32,
+    height: u32,
+    scale_factor: f32,
+) -> Result<RgbaImage> {
+    ensure!(
+        scale_factor.is_finite() && (0.25..=8.0).contains(&scale_factor),
+        "native display scale factor {scale_factor} is invalid"
+    );
     let horizontal_probe = image.height().saturating_mul(3) / 4;
     let vertical_probe = image.width() / 2;
     let left = (0..image.width())
@@ -352,18 +376,13 @@ fn normalize_capture(image: &RgbaImage, width: u32, height: u32) -> Result<RgbaI
     );
     let content_width = right - left;
     let content_height = bottom - top;
-    let minimum_width = width.saturating_mul(3) / 4;
-    let maximum_width = width.saturating_mul(4);
+    let scaled_width = (width as f32 * scale_factor).round() as u32;
+    let scaled_height = (height as f32 * scale_factor).round() as u32;
+    let frame_allowance = (8.0 * scale_factor).ceil() as u32;
     ensure!(
-        (minimum_width..=maximum_width).contains(&content_width),
-        "native client width {content_width} is outside the supported 0.75x to 4x scale range for logical width {width}"
+        content_width.abs_diff(scaled_width) <= frame_allowance,
+        "native client width {content_width} does not match scaled target width {scaled_width} within the frame allowance"
     );
-    let scaled_width = content_width;
-    let scaled_height = u32::try_from(
-        (u64::from(content_width) * u64::from(height) + u64::from(width / 2)) / u64::from(width),
-    )
-    .context("scaled capture height exceeds u32")?;
-    let frame_allowance = 8_u32.saturating_mul(content_width.div_ceil(width).max(1));
     ensure!(
         content_height.abs_diff(scaled_height) <= frame_allowance,
         "native client surface {content_width}x{content_height} does not match scaled target {scaled_width}x{scaled_height} within the frame allowance"
@@ -407,7 +426,7 @@ mod tests {
             }
         }
         native.put_pixel(2, 2, Rgba([255, 0, 0, 255]));
-        let result = normalize_capture(&native, 8, 6);
+        let result = normalize_capture(&native, 8, 6, 1.0);
         assert!(result.is_ok(), "normalization failed: {:?}", result.err());
         let Some(result) = result.ok() else {
             return;
@@ -425,12 +444,32 @@ mod tests {
             }
         }
         native.put_pixel(3, 3, Rgba([255, 0, 0, 255]));
-        let result = normalize_capture(&native, 8, 6);
+        let result = normalize_capture(&native, 8, 6, 2.0);
         assert!(result.is_ok(), "normalization failed: {:?}", result.err());
         let Some(result) = result.ok() else {
             return;
         };
         assert_eq!(result.dimensions(), (16, 12));
         assert_eq!(*result.get_pixel(2, 2), Rgba([255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn native_scale_preserves_target_size_when_one_edge_pixel_is_framed() {
+        let mut native = RgbaImage::from_pixel(10, 8, Rgba([0, 0, 0, 255]));
+        for y in 1..7 {
+            for x in 1..9 {
+                native.put_pixel(x, y, FIXTURE_BACKGROUND);
+            }
+        }
+        native.put_pixel(2, 2, Rgba([255, 0, 0, 255]));
+        native.put_pixel(8, 6, Rgba([0, 0, 0, 255]));
+
+        let result = normalize_capture(&native, 8, 6, 1.0);
+        assert!(result.is_ok(), "normalization failed: {:?}", result.err());
+        let Some(result) = result.ok() else {
+            return;
+        };
+        assert_eq!(result.dimensions(), (8, 6));
+        assert_eq!(*result.get_pixel(1, 1), Rgba([255, 0, 0, 255]));
     }
 }

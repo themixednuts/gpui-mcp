@@ -28,9 +28,7 @@ pub(crate) async fn capture(
     timeout(
         CAPTURE_WORKER_DEADLINE,
         tokio::task::spawn_blocking(move || {
-            capture_after_worker_reopen(|| {
-                capture_window_with_options(pid, &worker_title, target, logical_size, None, options)
-            })
+            capture_window_with_options(pid, &worker_title, target, logical_size, None, options)
         }),
     )
     .await
@@ -59,18 +57,6 @@ pub(crate) async fn capture(
     })
 }
 
-fn capture_after_worker_reopen<T, E>(mut capture: impl FnMut() -> Result<T, E>) -> Result<T, E> {
-    #[cfg(target_os = "windows")]
-    {
-        // The first complete external WGC capture prompts DWM to republish all GPUI surfaces.
-        // Release that worker session in full before opening the capture returned to the client.
-        drop(capture()?);
-        std::thread::sleep(Duration::from_millis(16));
-    }
-
-    capture()
-}
-
 fn logical_window_size(tree: &UiTree) -> Option<(f32, f32)> {
     tree.roots
         .iter()
@@ -82,12 +68,11 @@ fn logical_window_size(tree: &UiTree) -> Option<(f32, f32)> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::collections::BTreeMap;
 
     use gpui_mcp_protocol::{NodeState, Rect, Role, UiNode, UiTree};
 
-    use super::{capture_after_worker_reopen, logical_window_size};
+    use super::logical_window_size;
 
     #[test]
     fn uses_largest_semantic_root_for_capture_scaling() {
@@ -117,20 +102,5 @@ mod tests {
             );
         }
         assert_eq!(logical_window_size(&tree), Some((900.0, 700.0)));
-    }
-
-    #[test]
-    fn windows_reopens_the_complete_external_capture_worker() {
-        let calls = Cell::new(0_u8);
-        let captured = capture_after_worker_reopen(|| {
-            calls.set(calls.get() + 1);
-            Ok::<_, ()>(calls.get())
-        });
-
-        assert_eq!(
-            captured,
-            Ok(if cfg!(target_os = "windows") { 2 } else { 1 })
-        );
-        assert_eq!(calls.get(), if cfg!(target_os = "windows") { 2 } else { 1 });
     }
 }

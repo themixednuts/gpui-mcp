@@ -64,10 +64,11 @@ a tool call:
 target/release/gpui-mcp-server --app-id gpui-mcp-demo --artifact-dir /private/test-artifacts
 ```
 
-On Windows, `--capture-stability-deadline-ms` configures the bounded WGC/DWM
-freshness deadline from 32 through 2000 milliseconds (default 250). An unstable
-frame fails explicitly rather than returning the last image observed. Other
-capture backends currently perform one native capture and ignore this Windows-specific deadline.
+On Windows, `--capture-stability-deadline-ms` configures the bounded Graphics Capture
+freshness deadline from 32 through 2000 milliseconds (default 1000). The backend
+returns the newest of three ordered native samples, which avoids stale startup
+frames without rejecting animated content. Other capture backends currently
+perform one native capture and ignore this Windows-specific deadline.
 
 A generic MCP client configuration looks like:
 
