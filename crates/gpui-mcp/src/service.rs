@@ -58,23 +58,33 @@ pub struct BridgeConfig {
 }
 
 impl BridgeConfig {
-    /// Create configuration. `window_title` must exactly match the native GPUI title.
+    /// Create configuration with a developer-chosen stable application ID.
+    ///
+    /// `app_id` is declared once in Rust and discovered automatically by the
+    /// MCP server; users do not repeat it in MCP client configuration. Multiple
+    /// running bridges with the same logical ID receive independent automatic
+    /// instance IDs. The native window title defaults to `app_name`; use
+    /// [`Self::window_title`] when they differ.
     #[must_use]
-    pub fn new(
-        app_id: impl Into<String>,
-        app_name: impl Into<String>,
-        window_title: impl Into<String>,
-    ) -> Self {
+    pub fn new(app_id: impl Into<String>, app_name: impl Into<String>) -> Self {
+        let app_name = app_name.into();
         Self {
             app_id: app_id.into(),
-            app_name: app_name.into(),
-            window_title: window_title.into(),
+            window_title: app_name.clone(),
+            app_name,
             endpoint_dir: None,
             operation_timeout: Duration::from_secs(5),
             live_document: false,
             context_resources: false,
             application_commands: false,
         }
+    }
+
+    /// Override the exact native title used to match this window for capture.
+    #[must_use]
+    pub fn window_title(mut self, title: impl Into<String>) -> Self {
+        self.window_title = title.into();
+        self
     }
 
     /// Override the private endpoint descriptor directory.
@@ -424,6 +434,7 @@ impl BridgeHandle {
             protocol_version: PROTOCOL_VERSION,
             app_id: config.app_id.clone(),
             app_name: config.app_name.clone(),
+            instance_id,
             pid,
             endpoint,
             token: token.clone(),
@@ -1641,8 +1652,21 @@ mod tests {
 
     #[test]
     fn application_identifier_blocks_path_traversal() {
-        let config = BridgeConfig::new("../unsafe", "App", "App");
+        let config = BridgeConfig::new("../unsafe", "App");
         assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn application_name_is_the_default_window_title() {
+        let config = BridgeConfig::new("app", "My App");
+        assert_eq!(config.window_title, "My App");
+    }
+
+    #[test]
+    fn window_title_can_be_overridden() {
+        let config = BridgeConfig::new("app", "My App").window_title("My App — Settings");
+        assert_eq!(config.app_name, "My App");
+        assert_eq!(config.window_title, "My App — Settings");
     }
 
     #[test]

@@ -137,6 +137,8 @@ impl GpuiMcp {
         if !(1..=30).contains(&args.frames_per_second) {
             return Err("frames_per_second must be between 1 and 30".to_owned());
         }
+        let _transition = self.target_transition.lock().await;
+        let target = self.client().await?;
         let frame_duration_ms = 1_000 / u32::from(args.frames_per_second);
         let mut task = self
             .recording_task
@@ -167,6 +169,7 @@ impl GpuiMcp {
             "ok": true,
             "action": "video_recording_started",
             "session_id": session_id,
+            "target_id": target.target_id(),
             "format": "mp4",
             "codec": "h264",
             "pointer_overlay": args.include_pointer,

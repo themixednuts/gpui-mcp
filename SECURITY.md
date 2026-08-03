@@ -37,11 +37,11 @@ The following are outside its boundary:
 
 - Use a dedicated downstream Cargo feature and disable it in release builds.
 - Keep the endpoint descriptor in the default private directory or an equally protected directory.
-- Keep recording artifacts in the default app/process runtime directory or an explicitly private `--artifact-dir`; never point it at a shared or privileged directory.
+- Keep recording artifacts in the default MCP-server-session runtime directory or an explicitly private `--artifact-dir`; never point it at a shared or privileged directory.
 - Drive a recording through one long-lived MCP client session (or one bounded `gpui-mcp-call --batch` invocation); separate one-shot tool processes do not share recording state.
 - Keep Unix socket, descriptor, and artifact-directory modes owner-only; do not weaken the Windows named-pipe DACL.
 - Never copy the descriptor or token into logs, chat messages, CI artifacts, or shared directories.
-- Give each independently discoverable window a clear application ID and use `--endpoint` when multiple instances run.
+- Give each application a clear logical ID in Rust. Use the non-secret IDs from `list_apps` with `select_app` when multiple instances run; never copy endpoint descriptors or bearer tokens into MCP configuration.
 - Mark secret inputs redacted and publish no secret log content.
 - Review requested macOS Screen Recording and Linux portal permissions.
 - Keep `gpui`, `rmcp`, `xcap`, Rust, and transitive dependencies current.

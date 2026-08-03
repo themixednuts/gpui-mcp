@@ -20,7 +20,7 @@ impl GpuiMcp {
         description = "List bounded structured commands advertised by the connected GPUI application, including each command's JSON input schema and mutation status"
     )]
     async fn list_app_commands(&self) -> Result<Json<Value>, String> {
-        let result = self.client.call(Operation::ListApplicationCommands).await?;
+        let result = self.call(Operation::ListApplicationCommands).await?;
         let BridgeResult::ApplicationCommands(commands) = result else {
             return Err("bridge returned the wrong application command list".to_owned());
         };
@@ -35,7 +35,6 @@ impl GpuiMcp {
         Parameters(args): Parameters<ExecuteApplicationCommandArgs>,
     ) -> Result<Json<Value>, String> {
         let result = self
-            .client
             .call(Operation::ExecuteApplicationCommand {
                 name: args.name,
                 arguments: args.arguments,

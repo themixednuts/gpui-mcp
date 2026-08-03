@@ -1,4 +1,4 @@
-//! Stdio MCP server for one authenticated, instrumented GPUI window.
+//! Stdio MCP server for locally discoverable, instrumented GPUI windows.
 
 mod capture;
 mod client;
@@ -14,7 +14,7 @@ use gpui_mcp_capture::CaptureOptions;
 use rmcp::{ServiceExt as _, transport::stdio};
 use tracing_subscriber::EnvFilter;
 
-use client::{BridgeClient, default_runtime_root};
+use client::{BridgeRegistry, default_runtime_root};
 use recording::ArtifactStore;
 use tools::GpuiMcp;
 
@@ -25,11 +25,12 @@ use tools::GpuiMcp;
     about = "Hardened MCP stdio server for an instrumented GPUI application"
 )]
 struct Args {
-    /// Exact endpoint descriptor. Recommended when more than one GPUI app is running.
+    /// Restrict discovery to one exact endpoint descriptor.
     #[arg(long, value_name = "PATH")]
     endpoint: Option<PathBuf>,
 
-    /// Discover an endpoint with this application identifier.
+    /// Restrict discovery to this Rust-configured application identifier.
+    /// Normal MCP setup does not need this option.
     #[arg(long, value_name = "ID", conflicts_with = "endpoint")]
     app_id: Option<String>,
 
@@ -58,33 +59,23 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let client = BridgeClient::discover(
-        args.endpoint.as_deref(),
-        args.app_id.as_deref(),
-        args.endpoint_dir.as_deref(),
-    )
-    .await
-    .context("GPUI bridge discovery failed")?;
+    let registry = BridgeRegistry::new(args.endpoint, args.app_id, args.endpoint_dir);
     let capture_options =
         CaptureOptions::new(Duration::from_millis(args.capture_stability_deadline_ms))
             .map_err(anyhow::Error::msg)?;
     let artifact_dir = args.artifact_dir.unwrap_or_else(|| {
-        default_runtime_root().join("artifacts").join(format!(
-            "{}-{}",
-            client.descriptor().app_id,
-            client.descriptor().pid
-        ))
+        default_runtime_root()
+            .join("artifacts")
+            .join(format!("server-{}", std::process::id()))
     });
     let artifacts = ArtifactStore::open(artifact_dir).map_err(anyhow::Error::msg)?;
     tracing::info!(
-        app_id = client.descriptor().app_id,
-        pid = client.descriptor().pid,
         artifact_dir = %artifacts.directory().display(),
         capture_stability_deadline_ms = args.capture_stability_deadline_ms,
-        "connected GPUI MCP endpoint"
+        "started GPUI MCP discovery server"
     );
 
-    let service = GpuiMcp::new(client, artifacts, capture_options)
+    let service = GpuiMcp::new(registry, artifacts, capture_options)
         .serve(stdio())
         .await
         .context("could not start MCP stdio transport")?;

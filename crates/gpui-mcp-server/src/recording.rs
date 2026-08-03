@@ -343,6 +343,10 @@ pub(crate) struct RecordingArtifact {
 }
 
 impl RecordingState {
+    pub(crate) const fn is_idle(&self) -> bool {
+        matches!(self.phase, RecordingPhase::Idle)
+    }
+
     #[cfg(test)]
     pub(crate) fn start(&mut self) -> Result<u64, String> {
         self.start_with_config(true, DEFAULT_FRAME_DELAY_MS)

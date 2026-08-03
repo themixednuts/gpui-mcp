@@ -55,7 +55,6 @@ impl GpuiMcp {
         Parameters(args): Parameters<LogsArgs>,
     ) -> Result<Json<Value>, String> {
         let result = self
-            .client
             .call(Operation::GetLogs {
                 limit: args.limit,
                 min_level: args.min_level,

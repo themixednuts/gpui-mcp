@@ -10,7 +10,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Current wire protocol version.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 /// Maximum accepted request frame, including its four-byte length prefix.
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// Maximum accepted response frame. Screenshots are base64 encoded inside it.
@@ -772,6 +772,12 @@ pub struct EndpointDescriptor {
     pub app_id: String,
     /// Human-readable application name.
     pub app_name: String,
+    /// Random, non-secret identifier for this bridge lifetime.
+    ///
+    /// Unlike `app_id`, this distinguishes concurrently running windows of the
+    /// same application. It is safe to expose to MCP clients and must never be
+    /// used as an authentication credential.
+    pub instance_id: u64,
     /// Process identifier that owns the endpoint.
     pub pid: u32,
     /// Owner-restricted local socket or named-pipe endpoint.

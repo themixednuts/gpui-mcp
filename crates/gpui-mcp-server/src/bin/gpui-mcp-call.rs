@@ -27,7 +27,8 @@ struct Args {
     #[arg(long, conflicts_with = "app_id")]
     endpoint: Option<PathBuf>,
 
-    /// Discover the running GPUI application by its stable application ID.
+    /// Restrict discovery to the Rust-configured application ID.
+    /// Omit for normal automatic discovery.
     #[arg(long, conflicts_with = "endpoint")]
     app_id: Option<String>,
 
@@ -76,10 +77,6 @@ struct BatchCall {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    if args.endpoint.is_none() && args.app_id.is_none() {
-        bail!("pass either --endpoint or --app-id");
-    }
-
     let mut command = Command::new(&args.server);
     if let Some(endpoint) = &args.endpoint {
         command.arg("--endpoint").arg(endpoint);

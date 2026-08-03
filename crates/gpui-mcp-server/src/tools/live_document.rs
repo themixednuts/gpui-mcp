@@ -24,7 +24,7 @@ impl GpuiMcp {
         description = "Return the active revisioned HTML/CSS/RON preview document; this capability is app opt-in and performs no filesystem access"
     )]
     async fn get_live_document(&self) -> Result<Json<Value>, String> {
-        let result = self.client.call(Operation::GetLiveDocument).await?;
+        let result = self.call(Operation::GetLiveDocument).await?;
         let BridgeResult::LiveDocument(document) = result else {
             return Err("bridge returned the wrong live document result".to_owned());
         };
@@ -42,7 +42,6 @@ impl GpuiMcp {
         let frame_count = self.frame_stats().await?.frame_count;
         let apply_started = Instant::now();
         let result = self
-            .client
             .call(Operation::PreviewLiveDocument {
                 expected_revision: args.expected_revision,
                 source: LiveDocumentSource {

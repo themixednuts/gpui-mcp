@@ -32,7 +32,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
-use crate::client::BridgeClient;
+use crate::client::{AppInfo, BridgeClient, BridgeRegistry};
 use crate::recording::{ArtifactStore, RecordingState};
 
 mod application_commands;
@@ -53,16 +53,17 @@ struct SnapshotStore {
     images: BTreeMap<String, Screenshot>,
 }
 
-/// MCP tool suite backed by one authenticated GPUI application endpoint.
+/// MCP tool suite backed by a lazily selected, authenticated GPUI endpoint.
 #[derive(Clone)]
 pub(crate) struct GpuiMcp {
-    client: BridgeClient,
+    registry: BridgeRegistry,
     tool_router: ToolRouter<Self>,
     snapshots: Arc<RwLock<SnapshotStore>>,
     recording: Arc<Mutex<RecordingState>>,
     recording_task: Arc<Mutex<Option<RecordingTask>>>,
     artifacts: ArtifactStore,
     capture_options: CaptureOptions,
+    target_transition: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct RecordingTask {
@@ -82,6 +83,12 @@ type Value = ObjectOutput;
 struct ElementArgs {
     /// Stable semantic node identifier.
     id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SelectAppArgs {
+    /// Opaque target ID returned by `list_apps`.
+    target_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -416,18 +423,19 @@ struct LogsArgs {
 #[tool_router(router = core_router)]
 impl GpuiMcp {
     pub(crate) fn new(
-        client: BridgeClient,
+        registry: BridgeRegistry,
         artifacts: ArtifactStore,
         capture_options: CaptureOptions,
     ) -> Self {
         Self {
-            client,
+            registry,
             tool_router: Self::production_router(),
             snapshots: Arc::new(RwLock::new(SnapshotStore::default())),
             recording: Arc::new(Mutex::new(RecordingState::default())),
             recording_task: Arc::new(Mutex::new(None)),
             artifacts,
             capture_options,
+            target_transition: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -444,7 +452,7 @@ impl GpuiMcp {
     }
 
     async fn tree(&self) -> Result<UiTree, String> {
-        let result = self.client.call(Operation::GetTree).await?;
+        let result = self.call(Operation::GetTree).await?;
         match result {
             BridgeResult::Tree(tree) => Ok(tree),
             _ => Err("bridge returned the wrong result for the semantic tree".to_owned()),
@@ -452,7 +460,7 @@ impl GpuiMcp {
     }
 
     async fn ack(&self, operation: Operation) -> Result<(), String> {
-        match self.client.call(operation).await? {
+        match self.call(operation).await? {
             BridgeResult::Ack => Ok(()),
             _ => Err("bridge returned the wrong acknowledgement".to_owned()),
         }
@@ -474,10 +482,36 @@ impl GpuiMcp {
     }
 
     async fn current_pointer_location(&self) -> Result<Point, String> {
-        match self.client.call(Operation::GetPointerLocation).await? {
+        match self.call(Operation::GetPointerLocation).await? {
             BridgeResult::PointerLocation(point) => Ok(point),
             _ => Err("bridge returned the wrong result for pointer location".to_owned()),
         }
+    }
+
+    async fn client(&self) -> Result<BridgeClient, String> {
+        self.registry.client().await
+    }
+
+    async fn call(&self, operation: Operation) -> Result<BridgeResult, String> {
+        self.client().await?.call(operation).await
+    }
+
+    async fn select_target(&self, target_id: &str) -> Result<AppInfo, String> {
+        let _transition = self.target_transition.lock().await;
+        if !self
+            .recording
+            .lock()
+            .map_err(|_| "recording state lock is poisoned".to_owned())?
+            .is_idle()
+        {
+            return Err(
+                "cannot switch GPUI targets while recording or encoding video; stop the recording first"
+                    .to_owned(),
+            );
+        }
+        let selected = self.registry.select(target_id).await?;
+        *self.snapshots.write().await = SnapshotStore::default();
+        Ok(selected)
     }
 
     async fn native_click_at(
@@ -625,7 +659,6 @@ impl GpuiMcp {
                 ));
             }
             let result = self
-                .client
                 .call(Operation::Invoke {
                     node_id: id.to_owned(),
                     expected_generation: current_tree.generation,
@@ -660,7 +693,6 @@ impl GpuiMcp {
             .unwrap_or(MAX_WAIT_MS)
             .clamp(1, MAX_WAIT_MS);
         match self
-            .client
             .call(Operation::WaitForTree {
                 after_generation: generation,
                 timeout_ms,
@@ -677,7 +709,6 @@ impl GpuiMcp {
             .unwrap_or(MAX_WAIT_MS)
             .clamp(1, MAX_WAIT_MS);
         match self
-            .client
             .call(Operation::WaitForFrame {
                 after_frame_count: frame_count,
                 timeout_ms,
@@ -690,13 +721,14 @@ impl GpuiMcp {
     }
 
     async fn settle_after_refresh(&self, wait: Duration) -> Result<FrameStats, String> {
-        settle_refresh_frames(wait, |operation| self.client.call(operation)).await
+        settle_refresh_frames(wait, |operation| self.call(operation)).await
     }
 
     async fn capture(&self, target: ScreenshotTarget) -> Result<Screenshot, String> {
         self.settle_after_refresh(Duration::from_secs(2)).await?;
         let tree = self.tree().await?;
-        crate::capture::capture(&self.client, &tree, target, self.capture_options).await
+        let client = self.client().await?;
+        crate::capture::capture(&client, &tree, target, self.capture_options).await
     }
 
     async fn stored_images(
@@ -719,7 +751,7 @@ impl GpuiMcp {
     }
 
     async fn frame_stats(&self) -> Result<FrameStats, String> {
-        match self.client.call(Operation::GetFrameStats).await? {
+        match self.call(Operation::GetFrameStats).await? {
             BridgeResult::FrameStats(stats) => Ok(stats),
             _ => Err("bridge returned the wrong result for frame statistics".to_owned()),
         }
@@ -755,23 +787,14 @@ where
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for GpuiMcp {
     fn get_info(&self) -> ServerInfo {
-        let capabilities = if self
-            .client
-            .descriptor()
-            .capabilities
-            .supports(Capability::ContextResources)
-        {
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_resources()
-                .build()
-        } else {
-            ServerCapabilities::builder().enable_tools().build()
-        };
+        let capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .build();
         ServerInfo::new(capabilities)
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "Inspect and automate one explicitly instrumented GPUI window. Prefer semantic element tools over coordinates. Pointer actions require app-provided NodeSpec::on_event handlers; keyboard input uses GPUI directly. Screenshots and snapshots remain in memory, and all coordinates are logical pixels relative to the target window. Video recording is a continuous bounded screencast by default: keep one MCP transport open for start_video_recording and stop_video_recording; capture_video_frame is an optional explicit checkpoint. The recording artifact is an H.264 MP4 with an optional GPUI pointer overlay; it never controls or reads the global OS cursor. Video tools accept only a portable MP4 artifact name inside the server-configured artifact directory; overwrite is opt-in."
+                "Discover, inspect, and automate explicitly instrumented GPUI windows. Call list_apps first when more than one app may be running, then select_app with the desired target_id; a single live app is selected automatically. Selection persists for this MCP transport. Prefer semantic element tools over coordinates. Pointer actions require app-provided NodeSpec::on_event handlers; keyboard input uses GPUI directly. Screenshots and snapshots remain in memory, and all coordinates are logical pixels relative to the selected window. Video recording is a continuous bounded screencast by default: keep one MCP transport open for start_video_recording and stop_video_recording; capture_video_frame is an optional explicit checkpoint. Targets cannot be switched during recording or encoding. The recording artifact is an H.264 MP4 with an optional GPUI pointer overlay; it never controls or reads the global OS cursor. Video tools accept only a portable MP4 artifact name inside the server-configured artifact directory; overwrite is opt-in."
                     .to_owned(),
             )
     }
@@ -781,20 +804,29 @@ impl ServerHandler for GpuiMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        let result = self
-            .client
-            .call(Operation::ListContextResources)
-            .await
-            .map_err(context_resource_error)?;
-        let BridgeResult::ContextResources(resources) = result else {
-            return Err(ErrorData::internal_error(
-                "bridge returned the wrong result for context resources",
-                None,
-            ));
-        };
-        Ok(ListResourcesResult::with_all_items(
-            resources.into_iter().map(mcp_resource).collect(),
-        ))
+        let mut resources = vec![apps_resource()];
+        if let Ok(client) = self.registry.client().await
+            && client
+                .descriptor()
+                .capabilities
+                .supports(Capability::ContextResources)
+        {
+            match client.call(Operation::ListContextResources).await {
+                Ok(BridgeResult::ContextResources(context_resources)) => {
+                    resources.extend(context_resources.into_iter().map(mcp_resource));
+                }
+                Ok(_) => tracing::warn!(
+                    target_id = client.target_id(),
+                    "bridge returned the wrong result while listing context resources"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    target_id = client.target_id(),
+                    "could not list selected bridge context resources"
+                ),
+            }
+        }
+        Ok(ListResourcesResult::with_all_items(resources))
     }
 
     async fn read_resource(
@@ -802,8 +834,20 @@ impl ServerHandler for GpuiMcp {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, ErrorData> {
+        if request.uri == "gpui://apps" {
+            let apps = self
+                .registry
+                .list_apps()
+                .await
+                .map_err(|message| ErrorData::internal_error(message, None))?;
+            let text = serde_json::to_string_pretty(&json!({ "apps": apps })).map_err(|_| {
+                ErrorData::internal_error("could not encode the GPUI application registry", None)
+            })?;
+            return Ok(ReadResourceResult::new(vec![
+                ResourceContents::text(text, request.uri).with_mime_type("application/json"),
+            ]));
+        }
         let result = self
-            .client
             .call(Operation::ReadContextResource {
                 uri: request.uri.clone(),
             })
@@ -820,6 +864,15 @@ impl ServerHandler for GpuiMcp {
                 .with_mime_type(resource.descriptor.mime_type),
         ]))
     }
+}
+
+fn apps_resource() -> Resource {
+    Resource::new("gpui://apps", "gpui-applications")
+        .with_title("Live GPUI applications")
+        .with_description(
+            "Live instrumented GPUI windows and their non-secret target IDs for select_app",
+        )
+        .with_mime_type("application/json")
 }
 
 fn mcp_resource(descriptor: ContextResourceDescriptor) -> Resource {
@@ -1362,6 +1415,8 @@ mod tests {
             [
                 "ping",
                 "check_connection",
+                "list_apps",
+                "select_app",
                 "list_app_commands",
                 "execute_app_command",
                 "get_frame_stats",

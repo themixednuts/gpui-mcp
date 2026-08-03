@@ -149,7 +149,7 @@ fn main() {
                 let bridge = match BridgeHandle::install(
                     window,
                     cx,
-                    BridgeConfig::new("gpui-mcp-demo", TITLE, TITLE),
+                    BridgeConfig::new("gpui-mcp-demo", TITLE),
                 ) {
                     Ok(bridge) => bridge,
                     Err(error) => {

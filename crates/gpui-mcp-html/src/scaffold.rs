@@ -21,7 +21,7 @@ pub struct ProjectOptions {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 enum ProjectDependencies {
     #[default]
-    Published,
+    PublicRepository,
     LocalWorkspace(PathBuf),
 }
 
@@ -70,7 +70,7 @@ impl ProjectOptions {
         Self {
             name: name.into(),
             destination: destination.into(),
-            dependencies: ProjectDependencies::Published,
+            dependencies: ProjectDependencies::PublicRepository,
             window_decorations: OutputWindowDecorations::Native,
         }
     }
@@ -120,7 +120,7 @@ pub fn scaffold_project(options: &ProjectOptions) -> Result<PathBuf, ScaffoldErr
         });
     }
     let dependencies = match &options.dependencies {
-        ProjectDependencies::Published => ManifestDependencies::Published,
+        ProjectDependencies::PublicRepository => ManifestDependencies::PublicRepository,
         ProjectDependencies::LocalWorkspace(path) => {
             let workspace = path
                 .canonicalize()
@@ -236,13 +236,13 @@ fn create_project_files(
 }
 
 enum ManifestDependencies {
-    Published,
+    PublicRepository,
     LocalWorkspace(String),
 }
 
 fn cargo_manifest(name: &str, dependencies: &ManifestDependencies) -> String {
     let dependencies = match dependencies {
-        ManifestDependencies::Published => format!(
+        ManifestDependencies::PublicRepository => format!(
             r#"gpui = "0.2.2"
 gpui-mcp = {{ git = "{GPUI_MCP_REPOSITORY}", branch = "main" }}
 gpui-mcp-html = {{ git = "{GPUI_MCP_REPOSITORY}", branch = "main", features = ["dev-watch"] }}
@@ -337,7 +337,7 @@ fn build_live(window: &Window, cx: &App) -> Result<AppView, String> {{
     let bridge = BridgeHandle::install(
         window,
         cx,
-        BridgeConfig::new(APP_ID, TITLE, TITLE).enable_live_document(),
+        BridgeConfig::new(APP_ID, TITLE).enable_live_document(),
     )
     .map_err(|error| error.to_string())?;
     let paths = ProjectPaths::open(PathBuf::from(env!("CARGO_MANIFEST_DIR")))

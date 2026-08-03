@@ -4,6 +4,14 @@
 
 The current dependency baseline is GPUI **0.2.2**, the official Rust MCP SDK (`rmcp`) **2.2.0**, and XCap **0.9.6**. Cargo.lock retains the exact transitive dependency set.
 
+## Project status
+
+This repository is a cross-platform technical preview. Git-based consumption
+from the public `main` branch is supported and CI exercises Windows, Linux, and
+macOS. The crates are not published to crates.io yet because GPUI 0.2.2 still
+requires the two narrowly scoped downstream fixes documented in
+[`vendor/README.md`](vendor/README.md). APIs may evolve before a 1.0 release.
+
 ## Why it is embedded
 
 The released GPUI 0.2.2 crate does not expose a cross-platform accessibility tree. GPUI's main branch merged an AccessKit foundation after that release, but application-level coverage is still being rolled out and the API is not yet available from the latest crates.io release. This project therefore keeps its own semantic source while making its roles, states, actions, and stable IDs straightforward to adapt to the upstream accessibility tree when it ships. The application explicitly annotates ordinary GPUI elements:
@@ -33,9 +41,9 @@ flowchart LR
 | Platform | Semantic actions | Synthetic native pointer | Keyboard | Screenshots |
 |---|---:|---:|---:|---:|
 | Windows 11 | Yes | Yes, in-process GPUI | Yes | XCap/Windows Graphics Capture |
-| macOS | Yes | Yes, in-process GPUI | Yes | XCap/ScreenCaptureKit; Screen Recording permission may be required |
+| macOS | Yes | Yes, in-process GPUI | Yes | XCap/CoreGraphics; Screen Recording permission may be required |
 | Linux X11 | Yes | Yes, in-process GPUI | Yes | XCap/X11 |
-| Linux Wayland | Yes | Yes, in-process GPUI | Yes | XCap through the desktop portal/PipeWire; compositor support and user approval vary |
+| Linux Wayland | Yes | Yes, in-process GPUI | Yes | Exact unattended cross-process capture is unavailable; use X11 or a future user-mediated portal flow |
 
 Semantic inspection and GPUI-thread actions do not require OS accessibility privileges. Native screenshot constraints do not disable the rest of the tool suite. Capture runs in the separate server process because Windows window enumeration intentionally excludes windows owned by the enumerating process. Build `gpui-mcp` with `default-features = false` when an application should expose no screenshot capability; the server enforces that advertised capability before capture.
 
@@ -48,20 +56,32 @@ cargo build --release -p gpui-mcp-server
 cargo run -p gpui-mcp-demo
 ```
 
-The demo prints its private endpoint descriptor path to stderr. Start the MCP server with either the application ID or that exact path:
+The server is intentionally independent of application startup. Run it with no
+application-specific arguments; it discovers private descriptors as GPUI apps
+open and close:
 
 ```console
-target/release/gpui-mcp-server --app-id gpui-mcp-demo
-target/release/gpui-mcp-server --endpoint /path/printed/by/the/demo.json
+target/release/gpui-mcp-server
 ```
 
+When exactly one instrumented app is live, it is selected automatically. When
+several are live, call `list_apps` and pass the chosen non-secret `target_id` to
+`select_app`. Selection persists for that initialized MCP transport. The same
+registry is available as the `gpui://apps` MCP resource. App restarts and
+additional windows do not require editing MCP configuration.
+
+`--app-id` remains an optional filter for specialized deployments, and
+`--endpoint` can restrict the server to one exact private descriptor. Neither is
+part of normal setup, and descriptor paths and tokens should never be copied
+into MCP configuration.
+
 Recording artifacts are confined to a server-owned directory. By default it is
-an app/process-specific directory below the user's runtime area (falling back to
+an MCP-server-session directory below the user's runtime area (falling back to
 the process temp area). Override it only as server configuration, never through
 a tool call:
 
 ```console
-target/release/gpui-mcp-server --app-id gpui-mcp-demo --artifact-dir /private/test-artifacts
+target/release/gpui-mcp-server --artifact-dir /private/test-artifacts
 ```
 
 On Windows, `--capture-stability-deadline-ms` configures the bounded Graphics Capture
@@ -76,14 +96,14 @@ A generic MCP client configuration looks like:
 {
   "mcpServers": {
     "gpui": {
-      "command": "/absolute/path/to/gpui-mcp-server",
-      "args": ["--app-id", "my-gpui-app"]
+      "command": "/absolute/path/to/gpui-mcp-server"
     }
   }
 }
 ```
 
-When several matching windows are running, use `--endpoint` to avoid ambiguity.
+The stable logical application ID is declared once in Rust with
+`BridgeConfig`; it is discovered at runtime and is never duplicated here.
 
 For first-party dogfooding and CI scripts, build the companion MCP client as
 well. A plain `--tool` invocation is intentionally one-shot: it starts the stdio
@@ -92,9 +112,10 @@ exits. It does not bypass the MCP transport or call the embedded bridge directly
 
 ```console
 cargo build -p gpui-mcp-server --bins
-target/debug/gpui-mcp-call --server target/debug/gpui-mcp-server --app-id gpui-mcp-demo --list-tools
-target/debug/gpui-mcp-call --server target/debug/gpui-mcp-server --app-id gpui-mcp-demo --tool click_element --arguments '{"id":"save"}'
-target/debug/gpui-mcp-call --server target/debug/gpui-mcp-server --app-id gpui-mcp-demo --tool screenshot --image-out target/demo.png
+target/debug/gpui-mcp-call --server target/debug/gpui-mcp-server --list-tools
+target/debug/gpui-mcp-call --server target/debug/gpui-mcp-server --tool list_apps
+target/debug/gpui-mcp-call --server target/debug/gpui-mcp-server --tool click_element --arguments '{"id":"save"}'
+target/debug/gpui-mcp-call --server target/debug/gpui-mcp-server --tool screenshot --image-out target/demo.png
 ```
 
 Video recording state lives in the MCP server process, so `start_video_recording` and
@@ -116,11 +137,12 @@ to 256 calls:
 ```
 
 ```console
-target/debug/gpui-mcp-call --server target/debug/gpui-mcp-server --app-id gpui-mcp-demo --batch recording.json
+target/debug/gpui-mcp-call --server target/debug/gpui-mcp-server --batch recording.json
 ```
 
-A normal long-lived MCP client may call the same tools interactively. Use
-`--endpoint` instead of `--app-id` when more than one matching app is open.
+A normal long-lived MCP client may call the same tools interactively. When
+multiple apps are open, begin the batch or interaction with `list_apps` and
+`select_app`.
 `start_video_recording` returns a monotonically increasing server-process session ID;
 each checkpoint and the final artifact report that same ID. The server binds in-flight
 capture and encoding work to that session internally, rejects overlaps, reports dropped
@@ -129,17 +151,22 @@ and restores captured frames when encoding fails so `stop_video_recording` can b
 
 ## Instrument a GPUI application
 
-Add the integration crate and retain one `BridgeHandle` for the lifetime of each automated window:
+From another Cargo project, use the public repository for both the bridge and
+its patched GPUI source. Retain one `BridgeHandle` for the lifetime of each
+automated window:
 
 ```toml
 [dependencies]
 gpui = "0.2.2"
-gpui-mcp = { path = "crates/gpui-mcp" }
+gpui-mcp = { git = "https://github.com/themixednuts/gpui-mcp", branch = "main" }
 
 [patch.crates-io]
-# Required until GPUI publishes DispatchEventResult publicly; adjust this path when vendored elsewhere.
-gpui = { path = "vendor/gpui" }
+# Required until an upstream GPUI release includes the fixes in vendor/README.md.
+gpui = { git = "https://github.com/themixednuts/gpui-mcp", branch = "main" }
 ```
+
+For offline development from a clone, replace the two Git dependencies with
+paths to `crates/gpui-mcp` and `vendor/gpui` in that checkout.
 
 Install it while constructing the window root:
 
@@ -148,10 +175,21 @@ window.set_window_title("My App");
 let bridge = BridgeHandle::install(
     window,
     cx,
-    BridgeConfig::new("my-app", "My App", "My App"),
+    BridgeConfig::new("my-app", "My App"),
 )?;
 let automation = bridge.automation();
 // Store both `bridge` and `automation` in the root view.
+```
+
+`"my-app"` is the developer-chosen stable logical ID. Set it once in Rust; it
+groups releases and windows of the same application for optional filtering.
+Every installed bridge also receives an automatic random instance ID so two
+windows or processes with the same logical ID remain independently selectable.
+When the native title differs from the display name, override only that value:
+
+```rust,ignore
+let config = BridgeConfig::new("my-app", "My App")
+    .window_title("My App — Settings");
 ```
 
 Wrap the complete rendered hierarchy in exactly one root annotation and annotate useful descendants:
@@ -283,21 +321,27 @@ The `native_*` tools drive the **real GPUI pointer pipeline**. The bridge constr
 
 This mechanism is OS-agnostic by construction: it does not move the real cursor, synthesize operating-system events, require focus or accessibility permission, depend on screen position or DPI conversion, or use platform crates. Compound clicks and drags send one native event per bridge operation and settle GPUI frames between events without sleeping, so slow machines observe the same deterministic sequence.
 
-GPUI 0.2.2 publishes `Window::dispatch_event` but accidentally leaves its return type crate-private. The workspace therefore carries an otherwise unchanged `vendor/gpui` 0.2.2 patch that makes only `DispatchEventResult` public, allowing the published method to be called safely without changing input behavior.
+The workspace carries two small GPUI 0.2.2 changes. It makes
+`DispatchEventResult` public so downstream code can call the already-public
+`Window::dispatch_event` method without changing input behavior. It also keeps
+the requested font features, weight, and style when GPUI resolves a fallback
+font family, which prevents fallback typography from silently reverting to the
+fallback's defaults. [`vendor/README.md`](vendor/README.md) records the exact
+source baseline and removal conditions.
 
 Example native calls:
 
 ```console
-target/debug/gpui-mcp-call --server target/debug/gpui-mcp-server --app-id gpui-mcp-demo --tool pointer_move --arguments '{"x":400,"y":300}'
-target/debug/gpui-mcp-call --server target/debug/gpui-mcp-server --app-id gpui-mcp-demo --tool pointer_click --arguments '{"x":400,"y":300}'
-target/debug/gpui-mcp-call --server target/debug/gpui-mcp-server --app-id gpui-mcp-demo --tool pointer_drag --arguments '{"from_x":400,"from_y":300,"to_x":600,"to_y":400,"steps":12}'
+target/debug/gpui-mcp-call --server target/debug/gpui-mcp-server --tool pointer_move --arguments '{"x":400,"y":300}'
+target/debug/gpui-mcp-call --server target/debug/gpui-mcp-server --tool pointer_click --arguments '{"x":400,"y":300}'
+target/debug/gpui-mcp-call --server target/debug/gpui-mcp-server --tool pointer_drag --arguments '{"from_x":400,"from_y":300,"to_x":600,"to_y":400,"steps":12}'
 ```
 
 ## MCP tools
 
 The stdio server currently exposes:
 
-- Connectivity: `ping`, `check_connection`
+- Connectivity and target selection: `ping`, `check_connection`, `list_apps`, `select_app`
 - Tree and search: `get_ui_tree`, `find_elements`, `get_element`, `get_element_bounds`
 - Semantic pointer actions (direct annotated handlers): `click_element`, `double_click_element`, `click_coordinates`, `hover_element`, `drag_element`, `drag_coordinates`, `focus_element`, `scroll`
 - Portable native pointer pipeline: `pointer_location`, `pointer_move`, `pointer_down`, `pointer_up`, `pointer_click`, `pointer_drag`, `pointer_scroll`. These use in-process GPUI pointer state, hit testing, drag/drop, and wheel handling on Windows, Linux, and macOS; they do not inspect or move the global OS cursor. Legacy `native_*` tools remain for element-targeted calls.

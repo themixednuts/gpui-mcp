@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, bail};
 use directories::BaseDirs;
 use gpui_mcp_protocol::{
     BridgeResult, EndpointDescriptor, LocalEndpoint, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
@@ -14,14 +14,18 @@ use interprocess::local_socket::{
     GenericFilePath, GenericNamespaced, Name, ToFsName as _, ToNsName as _,
     tokio::{Stream as LocalSocketStream, prelude::*},
 };
+use serde::Serialize;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DESCRIPTOR_BYTES: u64 = 16 * 1024;
 const MAX_IDLE_CONNECTIONS: usize = 4;
+const MAX_DISCOVERY_CANDIDATES: usize = 128;
+const DISCOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct ConnectionPool {
     idle: Mutex<Vec<LocalSocketStream>>,
@@ -59,17 +63,8 @@ pub(crate) struct BridgeClient {
 }
 
 impl BridgeClient {
-    pub(crate) async fn discover(
-        endpoint: Option<&Path>,
-        app_id: Option<&str>,
-        endpoint_dir: Option<&Path>,
-    ) -> Result<Self> {
-        let path = if let Some(endpoint) = endpoint {
-            endpoint.to_path_buf()
-        } else {
-            discover_descriptor(app_id, endpoint_dir).await?
-        };
-        let descriptor = read_descriptor(&path)?;
+    fn from_path(path: &Path, app_id: Option<&str>) -> Result<Self> {
+        let descriptor = read_descriptor(path)?;
         if let Some(expected) = app_id
             && descriptor.app_id != expected
         {
@@ -79,7 +74,7 @@ impl BridgeClient {
                 expected
             );
         }
-        validate_descriptor(&descriptor, &path)?;
+        validate_descriptor(&descriptor, path)?;
         Ok(Self {
             descriptor: Arc::new(descriptor),
             next_request_id: Arc::new(AtomicU64::new(1)),
@@ -89,6 +84,10 @@ impl BridgeClient {
 
     pub(crate) fn descriptor(&self) -> &EndpointDescriptor {
         &self.descriptor
+    }
+
+    pub(crate) fn target_id(&self) -> String {
+        target_id(&self.descriptor)
     }
 
     pub(crate) async fn call(&self, operation: Operation) -> Result<BridgeResult, String> {
@@ -139,6 +138,171 @@ impl BridgeClient {
     }
 }
 
+/// Public, non-secret identity for one discoverable GPUI bridge.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct AppInfo {
+    pub(crate) target_id: String,
+    pub(crate) app_id: String,
+    pub(crate) app_name: String,
+    pub(crate) pid: u32,
+    pub(crate) window_title: String,
+    pub(crate) selected: bool,
+    pub(crate) capabilities: gpui_mcp_protocol::Capabilities,
+}
+
+impl AppInfo {
+    fn from_client(client: &BridgeClient, selected: bool) -> Self {
+        let descriptor = client.descriptor();
+        Self {
+            target_id: client.target_id(),
+            app_id: descriptor.app_id.clone(),
+            app_name: descriptor.app_name.clone(),
+            pid: descriptor.pid,
+            window_title: descriptor.window_title.clone(),
+            selected,
+            capabilities: descriptor.capabilities.clone(),
+        }
+    }
+}
+
+/// Lazily discovers GPUI bridges for one long-lived MCP transport.
+///
+/// A single available bridge is selected automatically. When several are live,
+/// callers select one by the opaque, non-secret target ID returned by
+/// [`Self::list_apps`]. The optional application ID remains a compatibility
+/// filter; normal MCP configuration does not need one.
+#[derive(Clone)]
+pub(crate) struct BridgeRegistry {
+    endpoint: Option<PathBuf>,
+    app_id: Option<String>,
+    endpoint_dir: Option<PathBuf>,
+    selected: Arc<RwLock<Option<BridgeClient>>>,
+}
+
+impl BridgeRegistry {
+    pub(crate) fn new(
+        endpoint: Option<PathBuf>,
+        app_id: Option<String>,
+        endpoint_dir: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            endpoint,
+            app_id,
+            endpoint_dir,
+            selected: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    pub(crate) async fn list_apps(&self) -> Result<Vec<AppInfo>, String> {
+        let clients = self
+            .discover()
+            .await
+            .map_err(|error| format_discovery_error(&error))?;
+        let mut selected = self.selected.write().await;
+        if selected.as_ref().is_some_and(|selected| {
+            clients
+                .iter()
+                .all(|client| client.target_id() != selected.target_id())
+        }) {
+            *selected = None;
+        }
+        if selected.is_none()
+            && let [client] = clients.as_slice()
+        {
+            *selected = Some(client.clone());
+        }
+        let selected_id = selected.as_ref().map(BridgeClient::target_id);
+        drop(selected);
+        Ok(clients
+            .iter()
+            .map(|client| {
+                AppInfo::from_client(
+                    client,
+                    selected_id
+                        .as_ref()
+                        .is_some_and(|selected| client.target_id() == *selected),
+                )
+            })
+            .collect())
+    }
+
+    pub(crate) async fn select(&self, requested: &str) -> Result<AppInfo, String> {
+        let clients = self
+            .discover()
+            .await
+            .map_err(|error| format_discovery_error(&error))?;
+        let Some(client) = clients
+            .into_iter()
+            .find(|client| client.target_id() == requested)
+        else {
+            return Err(format!(
+                "GPUI target {requested:?} is not live; call list_apps to refresh available targets"
+            ));
+        };
+        *self.selected.write().await = Some(client.clone());
+        Ok(AppInfo::from_client(&client, true))
+    }
+
+    pub(crate) async fn client(&self) -> Result<BridgeClient, String> {
+        if let Some(client) = self.selected.read().await.clone() {
+            return Ok(client);
+        }
+        let clients = self
+            .discover()
+            .await
+            .map_err(|error| format_discovery_error(&error))?;
+        match clients.as_slice() {
+            [] => Err(
+                "no live GPUI applications were found; start an instrumented app and retry"
+                    .to_owned(),
+            ),
+            [client] => {
+                let client = client.clone();
+                *self.selected.write().await = Some(client.clone());
+                Ok(client)
+            }
+            _ => {
+                let listing = clients
+                    .iter()
+                    .map(|client| {
+                        let descriptor = client.descriptor();
+                        format!(
+                            "{} ({}, pid {}, target {})",
+                            descriptor.app_name,
+                            descriptor.app_id,
+                            descriptor.pid,
+                            client.target_id()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(format!(
+                    "multiple GPUI applications are live [{listing}]; call list_apps, then select_app"
+                ))
+            }
+        }
+    }
+
+    async fn discover(&self) -> Result<Vec<BridgeClient>> {
+        if let Some(endpoint) = &self.endpoint {
+            let client = BridgeClient::from_path(endpoint, self.app_id.as_deref())?;
+            if probe(&client).await {
+                return Ok(vec![client]);
+            }
+            return Ok(Vec::new());
+        }
+        discover_clients(self.app_id.as_deref(), self.endpoint_dir.as_deref()).await
+    }
+}
+
+fn format_discovery_error(error: &anyhow::Error) -> String {
+    format!("GPUI bridge discovery failed: {error:#}")
+}
+
+fn target_id(descriptor: &EndpointDescriptor) -> String {
+    format!("{}-{:016x}", descriptor.app_id, descriptor.instance_id)
+}
+
 async fn exchange(
     stream: &mut LocalSocketStream,
     payload: &[u8],
@@ -187,27 +351,36 @@ fn endpoint_name(endpoint: &LocalEndpoint) -> std::io::Result<Name<'_>> {
     }
 }
 
-async fn discover_descriptor(app_id: Option<&str>, endpoint_dir: Option<&Path>) -> Result<PathBuf> {
+async fn discover_clients(
+    app_id: Option<&str>,
+    endpoint_dir: Option<&Path>,
+) -> Result<Vec<BridgeClient>> {
     let directory = endpoint_dir.map_or_else(default_endpoint_dir, Path::to_path_buf);
-    let entries = fs::read_dir(&directory).with_context(|| {
-        format!(
-            "could not read endpoint directory {}; start the GPUI app first or pass --endpoint",
-            directory.display()
-        )
-    })?;
-    let mut candidates = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-            continue;
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("could not read endpoint directory {}", directory.display())
+            });
         }
+    };
+    let mut paths = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.truncate(MAX_DISCOVERY_CANDIDATES);
+    let mut candidates = Vec::new();
+    for path in paths {
         let Ok(descriptor) = read_descriptor(&path) else {
             continue;
         };
         candidates.push((path, descriptor));
     }
     let liveness = ProcessLiveness::query(candidates.iter().map(|(_, descriptor)| descriptor.pid));
-    let mut matches = Vec::new();
+    let mut probes = JoinSet::new();
     for (path, descriptor) in candidates {
         if liveness.is_stale(descriptor.pid, &path) {
             // The owning process is gone; drop its descriptor so stale files
@@ -217,30 +390,34 @@ async fn discover_descriptor(app_id: Option<&str>, endpoint_dir: Option<&Path>) 
         }
         if app_id.is_none_or(|expected| descriptor.app_id == expected)
             && validate_descriptor(&descriptor, &path).is_ok()
-            && timeout(Duration::from_millis(200), connect(&descriptor.endpoint))
-                .await
-                .is_ok_and(|result| result.is_ok())
         {
-            matches.push((path, descriptor));
+            probes.spawn(async move {
+                let client = BridgeClient {
+                    descriptor: Arc::new(descriptor),
+                    next_request_id: Arc::new(AtomicU64::new(1)),
+                    pool: Arc::new(ConnectionPool::new()),
+                };
+                probe(&client).await.then_some(client)
+            });
         }
     }
-    match matches.as_slice() {
-        [] => Err(anyhow!(
-            "no matching GPUI MCP endpoint found in {}",
-            directory.display()
-        )),
-        [(path, _)] => Ok(path.clone()),
-        _ => {
-            let listing = matches
-                .iter()
-                .map(|(_, descriptor)| format!("{} (pid {})", descriptor.app_id, descriptor.pid))
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "multiple matching GPUI MCP endpoints found [{listing}]; pass --endpoint explicitly"
-            )
+    let mut clients = Vec::new();
+    while let Some(result) = probes.join_next().await {
+        if let Ok(Some(client)) = result {
+            clients.push(client);
         }
     }
+    clients.sort_unstable_by_key(BridgeClient::target_id);
+    Ok(clients)
+}
+
+async fn probe(client: &BridgeClient) -> bool {
+    timeout(
+        DISCOVERY_PROBE_TIMEOUT,
+        connect(&client.descriptor().endpoint),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
 }
 
 /// Once a process that wrote a descriptor could plausibly have started this
@@ -254,7 +431,9 @@ struct ProcessLiveness {
 
 impl ProcessLiveness {
     fn query(pids: impl Iterator<Item = u32>) -> Self {
-        let pids: Vec<sysinfo::Pid> = pids.map(sysinfo::Pid::from_u32).collect();
+        let mut pids: Vec<sysinfo::Pid> = pids.map(sysinfo::Pid::from_u32).collect();
+        pids.sort_unstable();
+        pids.dedup();
         let mut system = sysinfo::System::new();
         system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
         Self { system }
@@ -428,7 +607,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    use super::BridgeClient;
+    use super::{BridgeClient, BridgeRegistry};
 
     #[tokio::test]
     async fn authenticated_persistent_connection_round_trips_twice() -> Result<()> {
@@ -478,6 +657,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             app_id: "test".to_owned(),
             app_name: "Test".to_owned(),
+            instance_id: 7,
             pid: 7,
             endpoint,
             token,
@@ -491,7 +671,7 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         }
 
-        let client = BridgeClient::discover(Some(&path), None, None).await?;
+        let client = BridgeClient::from_path(&path, None)?;
         for _ in 0..2 {
             let result = client
                 .call(Operation::Ping)
@@ -533,12 +713,182 @@ mod tests {
         let dead_path = directory.path().join("dead.json");
         write_test_descriptor(&dead_path, exited_process_id()?, dead_endpoint)?;
 
-        let discovered =
-            super::discover_descriptor(Some("test-app"), Some(directory.path())).await?;
-        assert_eq!(discovered, live_path);
+        let discovered = super::discover_clients(Some("test-app"), Some(directory.path())).await?;
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].descriptor().app_id, "test-app");
         assert!(live_path.exists());
         assert!(!dead_path.exists(), "stale descriptor should be deleted");
         drop(listener);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_starts_before_any_gpui_application() -> Result<()> {
+        let directory = tempdir()?;
+        let registry = BridgeRegistry::new(None, None, Some(directory.path().to_path_buf()));
+
+        assert!(
+            registry
+                .list_apps()
+                .await
+                .map_err(anyhow::Error::msg)?
+                .is_empty()
+        );
+        assert!(registry.client().await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_auto_selects_one_live_application() -> Result<()> {
+        let directory = tempdir()?;
+        let endpoint = test_endpoint_named(directory.path(), "single");
+        let listener = create_test_listener(&endpoint)?;
+        let listener_task = serve_test_listener(listener);
+        let path = directory.path().join("single.json");
+        write_named_test_descriptor(&path, std::process::id(), endpoint, "single-app", 0x101)?;
+        let registry = BridgeRegistry::new(None, None, Some(directory.path().to_path_buf()));
+
+        let client = registry.client().await.map_err(anyhow::Error::msg)?;
+        assert_eq!(client.target_id(), "single-app-0000000000000101");
+        let apps = registry.list_apps().await.map_err(anyhow::Error::msg)?;
+        assert_eq!(apps.len(), 1);
+        assert!(apps[0].selected);
+        listener_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_requires_explicit_selection_for_multiple_instances() -> Result<()> {
+        let directory = tempdir()?;
+        let first_endpoint = test_endpoint_named(directory.path(), "first");
+        let second_endpoint = test_endpoint_named(directory.path(), "second");
+        let first_listener = create_test_listener(&first_endpoint)?;
+        let second_listener = create_test_listener(&second_endpoint)?;
+        let first_listener_task = serve_test_listener(first_listener);
+        let second_listener_task = serve_test_listener(second_listener);
+        let first_path = directory.path().join("first.json");
+        let second_path = directory.path().join("second.json");
+        write_named_test_descriptor(
+            &first_path,
+            std::process::id(),
+            first_endpoint,
+            "shared-app",
+            0x101,
+        )?;
+        write_named_test_descriptor(
+            &second_path,
+            std::process::id(),
+            second_endpoint,
+            "shared-app",
+            0x202,
+        )?;
+        let registry = BridgeRegistry::new(None, None, Some(directory.path().to_path_buf()));
+
+        let apps = registry.list_apps().await.map_err(anyhow::Error::msg)?;
+        assert_eq!(apps.len(), 2);
+        assert!(
+            registry
+                .client()
+                .await
+                .is_err_and(|error| error.contains("select_app"))
+        );
+        let selected = registry
+            .select("shared-app-0000000000000202")
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(selected.target_id, "shared-app-0000000000000202");
+        assert_eq!(
+            registry
+                .client()
+                .await
+                .map_err(anyhow::Error::msg)?
+                .target_id(),
+            selected.target_id
+        );
+        first_listener_task.abort();
+        second_listener_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rust_application_id_can_filter_automatic_discovery() -> Result<()> {
+        let directory = tempdir()?;
+        let alpha_endpoint = test_endpoint_named(directory.path(), "alpha");
+        let beta_endpoint = test_endpoint_named(directory.path(), "beta");
+        let alpha_task = serve_test_listener(create_test_listener(&alpha_endpoint)?);
+        let beta_task = serve_test_listener(create_test_listener(&beta_endpoint)?);
+        write_named_test_descriptor(
+            &directory.path().join("alpha.json"),
+            std::process::id(),
+            alpha_endpoint,
+            "alpha",
+            0xA,
+        )?;
+        write_named_test_descriptor(
+            &directory.path().join("beta.json"),
+            std::process::id(),
+            beta_endpoint,
+            "beta",
+            0xB,
+        )?;
+        let registry = BridgeRegistry::new(
+            None,
+            Some("beta".to_owned()),
+            Some(directory.path().to_path_buf()),
+        );
+
+        let apps = registry.list_apps().await.map_err(anyhow::Error::msg)?;
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].app_id, "beta");
+        assert!(apps[0].selected);
+        alpha_task.abort();
+        beta_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_refreshes_selection_after_application_restart() -> Result<()> {
+        let directory = tempdir()?;
+        let first_endpoint = test_endpoint_named(directory.path(), "before-restart");
+        let first_task = serve_test_listener(create_test_listener(&first_endpoint)?);
+        let first_path = directory.path().join("before-restart.json");
+        write_named_test_descriptor(
+            &first_path,
+            std::process::id(),
+            first_endpoint,
+            "restartable",
+            0x1,
+        )?;
+        let registry = BridgeRegistry::new(None, None, Some(directory.path().to_path_buf()));
+
+        let before = registry.list_apps().await.map_err(anyhow::Error::msg)?;
+        assert_eq!(before[0].target_id, "restartable-0000000000000001");
+        assert!(before[0].selected);
+
+        first_task.abort();
+        fs::remove_file(&first_path)?;
+        assert!(
+            registry
+                .list_apps()
+                .await
+                .map_err(anyhow::Error::msg)?
+                .is_empty()
+        );
+
+        let second_endpoint = test_endpoint_named(directory.path(), "after-restart");
+        let second_task = serve_test_listener(create_test_listener(&second_endpoint)?);
+        write_named_test_descriptor(
+            &directory.path().join("after-restart.json"),
+            std::process::id(),
+            second_endpoint,
+            "restartable",
+            0x2,
+        )?;
+
+        let after = registry.list_apps().await.map_err(anyhow::Error::msg)?;
+        assert_eq!(after[0].target_id, "restartable-0000000000000002");
+        assert!(after[0].selected);
+        second_task.abort();
         Ok(())
     }
 
@@ -579,10 +929,21 @@ mod tests {
     }
 
     fn write_test_descriptor(path: &Path, pid: u32, endpoint: LocalEndpoint) -> Result<()> {
+        write_named_test_descriptor(path, pid, endpoint, "test-app", u64::from(pid))
+    }
+
+    fn write_named_test_descriptor(
+        path: &Path,
+        pid: u32,
+        endpoint: LocalEndpoint,
+        app_id: &str,
+        instance_id: u64,
+    ) -> Result<()> {
         let descriptor = EndpointDescriptor {
             protocol_version: PROTOCOL_VERSION,
-            app_id: "test-app".to_owned(),
+            app_id: app_id.to_owned(),
             app_name: "Test".to_owned(),
+            instance_id,
             pid,
             endpoint,
             token: "ab".repeat(32),
@@ -625,10 +986,14 @@ mod tests {
     }
 
     fn test_endpoint(directory: &Path) -> LocalEndpoint {
+        test_endpoint_named(directory, "test")
+    }
+
+    fn test_endpoint_named(directory: &Path, suffix: &str) -> LocalEndpoint {
         #[cfg(unix)]
         {
             LocalEndpoint::Filesystem {
-                path: directory.join("test.sock"),
+                path: directory.join(format!("{suffix}.sock")),
             }
         }
         #[cfg(windows)]
@@ -636,7 +1001,7 @@ mod tests {
             let _ = directory;
             LocalEndpoint::Namespaced {
                 name: format!(
-                    "gpui-mcp-test-{}-{}",
+                    "gpui-mcp-test-{suffix}-{}-{}",
                     std::process::id(),
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -644,5 +1009,33 @@ mod tests {
                 ),
             }
         }
+    }
+
+    fn create_test_listener(
+        endpoint: &LocalEndpoint,
+    ) -> Result<interprocess::local_socket::tokio::Listener> {
+        let name = match endpoint {
+            LocalEndpoint::Filesystem { path } => path.as_path().to_fs_name::<GenericFilePath>()?,
+            LocalEndpoint::Namespaced { name } => {
+                name.as_str().to_ns_name::<GenericNamespaced>()?
+            }
+        };
+        let listener = ListenerOptions::new().name(name).create_tokio()?;
+        #[cfg(unix)]
+        if let LocalEndpoint::Filesystem { path } = endpoint {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(listener)
+    }
+
+    fn serve_test_listener(
+        listener: interprocess::local_socket::tokio::Listener,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Ok(stream) = listener.accept().await {
+                drop(stream);
+            }
+        })
     }
 }

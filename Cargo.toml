@@ -71,6 +71,7 @@ strip = "symbols"
 opt-level = 2
 
 [patch.crates-io]
-# GPUI 0.2.2 exposes Window::dispatch_event publicly but accidentally keeps its return type
-# crate-private. This one-line visibility patch makes the published API callable downstream.
+# GPUI 0.2.2 needs two small downstream fixes: expose the return type of the already-public
+# Window::dispatch_event API, and preserve requested font traits when resolving a fallback family.
+# See vendor/README.md for the exact scope and upstream-removal conditions.
 gpui = { path = "vendor/gpui" }

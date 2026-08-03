@@ -129,7 +129,7 @@ fn build_live(window: &Window, cx: &App) -> Result<AppView, String> {
     let bridge = BridgeHandle::install(
         window,
         cx,
-        BridgeConfig::new(APP_ID, TITLE, TITLE).enable_live_document(),
+        BridgeConfig::new(APP_ID, TITLE).enable_live_document(),
     )
     .map_err(|error| error.to_string())?;
     let paths = ProjectPaths::open(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
