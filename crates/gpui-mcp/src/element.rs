@@ -261,15 +261,18 @@ impl<E: Element> Element for SemanticElement<E> {
     ) -> Self::PrepaintState {
         if self.spec.root {
             self.automation.state.begin_frame();
-            let mut content_bounds = window.bounds();
-            // `Window::bounds` carries the global native-window origin on Windows, but its size
-            // includes the non-client frame. Semantic element coordinates are relative to GPUI's
-            // drawable viewport, so publish that size and let the capture mapper derive the
-            // decoration insets from the captured native image.
-            content_bounds.size = window.viewport_size();
-            self.automation
-                .state
-                .set_window_geometry(rect_from_gpui(content_bounds), window.scale_factor());
+            #[cfg(feature = "native-screenshot")]
+            {
+                let mut content_bounds = window.bounds();
+                // `Window::bounds` carries the global native-window origin on Windows, but its size
+                // includes the non-client frame. Semantic element coordinates are relative to GPUI's
+                // drawable viewport, so publish that size and let the capture mapper derive the
+                // decoration insets from the captured native image.
+                content_bounds.size = window.viewport_size();
+                self.automation
+                    .state
+                    .set_window_geometry(rect_from_gpui(content_bounds), window.scale_factor());
+            }
         }
         let recorded = self.automation.state.record(self.spec.to_node(bounds));
         if recorded {

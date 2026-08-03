@@ -18,6 +18,7 @@ const MAX_TIMING_SAMPLES: usize = 240;
 const MAX_DIAGNOSTICS: usize = 128;
 const MAX_ACTION_REASON_BYTES: usize = 512;
 
+#[cfg(feature = "native-screenshot")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WindowGeometry {
     pub(crate) content_bounds: Rect,
@@ -73,6 +74,7 @@ pub(crate) struct SharedState {
     logs: Mutex<VecDeque<LogEntry>>,
     generation: watch::Sender<u64>,
     completed_frame: watch::Sender<FrameStats>,
+    #[cfg(feature = "native-screenshot")]
     window_geometry: RwLock<Option<WindowGeometry>>,
 }
 
@@ -90,6 +92,7 @@ impl SharedState {
             logs: Mutex::new(VecDeque::with_capacity(512)),
             generation,
             completed_frame,
+            #[cfg(feature = "native-screenshot")]
             window_geometry: RwLock::new(None),
         })
     }
@@ -176,6 +179,7 @@ impl SharedState {
         self.completed_frame.send_replace(stats);
     }
 
+    #[cfg(feature = "native-screenshot")]
     pub(crate) fn set_window_geometry(&self, content_bounds: Rect, scale_factor: f32) {
         if !content_bounds.is_valid() || !scale_factor.is_finite() || scale_factor <= 0.0 {
             return;
@@ -189,6 +193,7 @@ impl SharedState {
         });
     }
 
+    #[cfg(feature = "native-screenshot")]
     pub(crate) fn window_geometry(&self) -> Option<WindowGeometry> {
         *self
             .window_geometry
