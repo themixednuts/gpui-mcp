@@ -32,7 +32,7 @@ jobs:
             libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
             libxcb-xfixes0-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-xinput-dev \
             libxcb-composite0-dev libpipewire-0.3-dev libdbus-1-dev libegl1-mesa-dev \
-            mesa-vulkan-drivers xvfb
+            mesa-vulkan-drivers openbox xvfb
 
       - name: Install pinned Rust toolchain
         shell: bash
@@ -69,7 +69,7 @@ jobs:
 
       - name: Test Chromium/GPUI visual parity under Xvfb
         if: runner.os == 'Linux'
-        run: xvfb-run -a npm run test:visual
+        run: xvfb-run -a bash visual-tests/run-xvfb.sh
         env:
           WAYLAND_DISPLAY: ""
 
