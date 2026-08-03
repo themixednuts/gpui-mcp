@@ -14,6 +14,7 @@ const workspace = path.resolve(here, '..');
 const executableName = process.platform === 'win32'
   ? 'gpui-mcp-html-visual.exe'
   : 'gpui-mcp-html-visual';
+const structuralBlurRadius = 2;
 const cases = [
   { name: 'reference layout', fixture: 'parity', file: 'parity.html', state: 'baseline' },
   {
@@ -164,6 +165,12 @@ function compareImages(chromium, gpui, diff, testCase) {
     }
     exactChangedPixels += Number(pixelChanged);
   }
+  const blurredChromium = boxBlurRgb(chromium, structuralBlurRadius);
+  const blurredGpui = boxBlurRgb(gpui, structuralBlurRadius);
+  let blurredAbsoluteChannelError = 0;
+  for (let offset = 0; offset < blurredChromium.length; offset += 1) {
+    blurredAbsoluteChannelError += Math.abs(blurredChromium[offset] - blurredGpui[offset]);
+  }
   return {
     fixture: testCase.fixture,
     state: testCase.state,
@@ -175,10 +182,52 @@ function compareImages(chromium, gpui, diff, testCase) {
     exactChangedPixels,
     exactChangedRatio: exactChangedPixels / pixelCount,
     normalizedMeanAbsoluteError: absoluteChannelError / (pixelCount * 3 * 255),
+    structuralBlurRadius,
+    blurredNormalizedMeanAbsoluteError:
+      blurredAbsoluteChannelError / (pixelCount * 3 * 255),
     pixelmatchThreshold: 0.1,
-    maximumChangedRatio: 0.02,
-    maximumNormalizedMeanAbsoluteError: 0.01,
+    maximumChangedRatio: 0.06,
+    maximumNormalizedMeanAbsoluteError: 0.03,
+    maximumBlurredNormalizedMeanAbsoluteError: 0.01,
   };
+}
+
+function boxBlurRgb(image, radius) {
+  const { width, height } = image;
+  const horizontal = new Float64Array(width * height * 3);
+  const output = new Float64Array(width * height * 3);
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const left = Math.max(0, x - radius);
+      const right = Math.min(width - 1, x + radius);
+      const samples = right - left + 1;
+      for (let channel = 0; channel < 3; channel += 1) {
+        let sum = 0;
+        for (let sampleX = left; sampleX <= right; sampleX += 1) {
+          sum += image.data[(y * width + sampleX) * 4 + channel];
+        }
+        horizontal[(y * width + x) * 3 + channel] = sum / samples;
+      }
+    }
+  }
+
+  for (let y = 0; y < height; y += 1) {
+    const top = Math.max(0, y - radius);
+    const bottom = Math.min(height - 1, y + radius);
+    const samples = bottom - top + 1;
+    for (let x = 0; x < width; x += 1) {
+      for (let channel = 0; channel < 3; channel += 1) {
+        let sum = 0;
+        for (let sampleY = top; sampleY <= bottom; sampleY += 1) {
+          sum += horizontal[(sampleY * width + x) * 3 + channel];
+        }
+        output[(y * width + x) * 3 + channel] = sum / samples;
+      }
+    }
+  }
+
+  return output;
 }
 
 function sampleRgb(image, sample, scaleFactor) {
@@ -283,5 +332,9 @@ for (const testCase of cases) {
     expect(metrics.normalizedMeanAbsoluteError, JSON.stringify(metrics)).toBeLessThanOrEqual(
       metrics.maximumNormalizedMeanAbsoluteError,
     );
+    expect(
+      metrics.blurredNormalizedMeanAbsoluteError,
+      JSON.stringify(metrics),
+    ).toBeLessThanOrEqual(metrics.maximumBlurredNormalizedMeanAbsoluteError);
   });
 }

@@ -152,7 +152,8 @@ impl TextSystem {
             return font_id;
         }
         for fallback in &self.fallback_font_stack {
-            if let Ok(font_id) = self.font_id(fallback) {
+            let fallback = fallback_with_requested_traits(fallback, font);
+            if let Ok(font_id) = self.font_id(&fallback) {
                 return font_id;
             }
         }
@@ -325,6 +326,16 @@ impl TextSystem {
         let raster_bounds = self.raster_bounds(params)?;
         self.platform_text_system
             .rasterize_glyph(params, raster_bounds)
+    }
+}
+
+fn fallback_with_requested_traits(fallback: &Font, requested: &Font) -> Font {
+    Font {
+        family: fallback.family.clone(),
+        features: requested.features.clone(),
+        fallbacks: fallback.fallbacks.clone(),
+        weight: requested.weight,
+        style: requested.style,
     }
 }
 
