@@ -61,7 +61,7 @@ function fixtureExecutable() {
   return path.join(metadata.target_directory, 'debug', executableName);
 }
 
-async function waitForReady(child) {
+async function waitForReady(child, diagnostics) {
   let output = '';
   child.stdout.setEncoding('utf8');
   for await (const chunk of child.stdout) {
@@ -70,7 +70,11 @@ async function waitForReady(child) {
       return;
     }
   }
-  throw new Error(`GPUI fixture exited before readiness: ${output}`);
+  const errorOutput = diagnostics().trim();
+  throw new Error([
+    `GPUI fixture exited before readiness: ${output}`,
+    errorOutput && `GPUI fixture diagnostics: ${errorOutput}`,
+  ].filter(Boolean).join('\n'));
 }
 
 async function stopFixture(child) {
@@ -205,7 +209,7 @@ for (const testCase of cases) {
     });
 
     try {
-      await waitForReady(fixture);
+      await waitForReady(fixture, () => stderr);
       execFileSync(
         executable,
         [

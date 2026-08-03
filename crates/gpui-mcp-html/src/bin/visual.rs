@@ -317,13 +317,16 @@ fn capture_window(request: &CaptureRequest) -> Result<()> {
 }
 
 fn fixture_window_size() -> gpui::Size<gpui::Pixels> {
-    // DWM keeps a six-pixel horizontal non-client inset even when GPUI hides the
-    // Windows titlebar. Requesting those pixels yields a 640px client surface.
+    // Native compositors retain small non-client edges even with GPUI client
+    // decorations. Compensate when requesting the window so the rendered HTML
+    // surface remains exactly 640x480 CSS pixels.
     #[cfg(target_os = "windows")]
-    let width = 646.0;
-    #[cfg(not(target_os = "windows"))]
-    let width = 640.0;
-    size(px(width), px(480.0))
+    let requested = (646.0, 480.0);
+    #[cfg(target_os = "macos")]
+    let requested = (642.0, 482.0);
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let requested = (640.0, 480.0);
+    size(px(requested.0), px(requested.1))
 }
 
 fn normalize_capture(image: &RgbaImage, width: u32, height: u32) -> Result<RgbaImage> {
