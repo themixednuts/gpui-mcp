@@ -11,9 +11,11 @@ use image::{DynamicImage, ImageFormat, RgbaImage};
 
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_ENCODED_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(any(target_os = "windows", test))]
 const COMPOSITOR_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MIN_STABILITY_DEADLINE: Duration = Duration::from_millis(32);
 const MAX_STABILITY_DEADLINE: Duration = Duration::from_secs(2);
+#[cfg(any(target_os = "windows", test))]
 const MIN_FRESHNESS_SAMPLES: u8 = 3;
 
 /// Bounded Windows Graphics Capture freshness policy.
@@ -437,6 +439,7 @@ fn capture_after_compositor_settle<T>(
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn capture_fresh_frame<T, E: Clone>(
     mut capture: impl FnMut() -> Result<T, E>,
     options: CaptureOptions,
