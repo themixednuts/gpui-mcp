@@ -523,11 +523,13 @@ fn validate_local_endpoint(endpoint: &LocalEndpoint, descriptor_path: &Path) -> 
                 }
                 let descriptor_parent = descriptor_path
                     .parent()
-                    .ok_or_else(|| anyhow!("descriptor has no parent directory"))?
+                    .ok_or_else(|| anyhow::Error::msg("descriptor has no parent directory"))?
                     .canonicalize()?;
                 let endpoint_parent = path
                     .parent()
-                    .ok_or_else(|| anyhow!("filesystem local endpoint has no parent directory"))?
+                    .ok_or_else(|| {
+                        anyhow::Error::msg("filesystem local endpoint has no parent directory")
+                    })?
                     .canonicalize()?;
                 if endpoint_parent != descriptor_parent {
                     bail!("filesystem local endpoint must share the descriptor directory");
