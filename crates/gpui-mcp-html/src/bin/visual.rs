@@ -23,6 +23,8 @@ const WINDOW_TITLE: &str = "gpui-mcp visual parity fixture";
 const VIEWPORT_WIDTH: u32 = 640;
 const VIEWPORT_HEIGHT: u32 = 480;
 const FIXTURE_BACKGROUND: Rgba<u8> = Rgba([16, 20, 28, 255]);
+const FIXTURE_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Parser)]
 #[command(about = "Run and capture the gpui-mcp HTML visual parity fixture")]
@@ -177,11 +179,17 @@ fn run_fixture(fixture: FixtureName, state: FixtureState) -> Result<()> {
             },
             |window, cx| {
                 window.set_window_title(WINDOW_TITLE);
-                if let Some((node_id, action)) = state.action() {
-                    let automation = automation.clone();
-                    window
-                        .spawn(cx, async move |cx| {
-                            Timer::after(Duration::from_millis(150)).await;
+                let automation = automation.clone();
+                window
+                    .spawn(cx, async move |cx| {
+                        if let Err(error) = wait_for_completed_frame(&automation, 0).await {
+                            eprintln!("could not present fixture window: {error:#}");
+                            let _ = cx.update(|_, cx| cx.quit());
+                            return;
+                        }
+
+                        if let Some((node_id, action)) = state.action() {
+                            let completed_frame = automation.completed_test_frame_count();
                             let result = cx.update(|window, cx| {
                                 let generation = automation.snapshot().generation;
                                 let result = automation
@@ -192,23 +200,28 @@ fn run_fixture(fixture: FixtureName, state: FixtureState) -> Result<()> {
                                 result
                             });
                             match result {
-                                Ok(Ok(_)) => {
-                                    Timer::after(Duration::from_millis(100)).await;
-                                    print_ready();
-                                }
+                                Ok(Ok(_)) => {}
                                 Ok(Err(error)) => {
                                     eprintln!("could not apply fixture state: {}", error.message);
                                     let _ = cx.update(|_, cx| cx.quit());
+                                    return;
                                 }
                                 Err(error) => {
                                     eprintln!("could not update fixture window: {error}");
+                                    return;
                                 }
                             }
-                        })
-                        .detach();
-                } else {
-                    print_ready();
-                }
+                            if let Err(error) =
+                                wait_for_completed_frame(&automation, completed_frame).await
+                            {
+                                eprintln!("could not present fixture state: {error:#}");
+                                let _ = cx.update(|_, cx| cx.quit());
+                                return;
+                            }
+                        }
+                        print_ready();
+                    })
+                    .detach();
                 cx.new(|_| FixtureView { live })
             },
         );
@@ -219,6 +232,18 @@ fn run_fixture(fixture: FixtureName, state: FixtureState) -> Result<()> {
         }
         cx.activate(true);
     });
+    Ok(())
+}
+
+async fn wait_for_completed_frame(automation: &Automation, after_frame: u64) -> Result<()> {
+    let started = Instant::now();
+    while automation.completed_test_frame_count() <= after_frame {
+        ensure!(
+            started.elapsed() < FIXTURE_READY_TIMEOUT,
+            "fixture did not complete a root-paint frame within {FIXTURE_READY_TIMEOUT:?}"
+        );
+        Timer::after(FRAME_POLL_INTERVAL).await;
+    }
     Ok(())
 }
 

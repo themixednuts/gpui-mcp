@@ -346,7 +346,11 @@ fn validate_local_endpoint(endpoint: &LocalEndpoint, descriptor_path: &Path) -> 
                     .parent()
                     .ok_or_else(|| anyhow!("descriptor has no parent directory"))?
                     .canonicalize()?;
-                if path.parent() != Some(descriptor_parent.as_path()) {
+                let endpoint_parent = path
+                    .parent()
+                    .ok_or_else(|| anyhow!("filesystem local endpoint has no parent directory"))?
+                    .canonicalize()?;
+                if endpoint_parent != descriptor_parent {
                     bail!("filesystem local endpoint must share the descriptor directory");
                 }
                 let socket_metadata = fs::symlink_metadata(path)?;
@@ -434,6 +438,11 @@ mod tests {
             }
         };
         let listener = ListenerOptions::new().name(name).create_tokio()?;
+        #[cfg(unix)]
+        if let LocalEndpoint::Filesystem { path } = &endpoint {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
         let token = "ab".repeat(32);
         let server_token = token.clone();
         let task = tokio::spawn(async move {

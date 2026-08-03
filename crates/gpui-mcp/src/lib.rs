@@ -82,6 +82,16 @@ impl Automation {
         self.state.tree_generation()
     }
 
+    /// Return the count of the most recently completed root-paint frame.
+    ///
+    /// This is available only to deterministic runtime tests. A frame is not
+    /// counted until the annotated root has finished painting.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn completed_test_frame_count(&self) -> u64 {
+        self.state.frame_stats().frame_count
+    }
+
     /// Retain a bounded, sanitized diagnostic log entry for MCP inspection.
     ///
     /// Do not pass secrets. Newlines are replaced and messages are capped at 4 KiB.
