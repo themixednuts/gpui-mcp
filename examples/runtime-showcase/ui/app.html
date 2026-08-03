@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Runtime Studio</title>
+</head>
+<body id="app">
+  <header id="top-header">
+    <div id="brand">
+      <div id="brand-mark"><span></span><span></span></div>
+      <div id="brand-copy">
+        <h1>Runtime Studio</h1>
+        <p>Pure HTML compiled into a native GPUI application</p>
+      </div>
+    </div>
+    <div id="runtime-badge"><span id="live-dot"></span><strong>LIVE GPUI</strong></div>
+  </header>
+
+  <main id="shell">
+    <aside id="sidebar">
+      <p class="eyebrow">WORKSPACE</p>
+      <nav id="navigation">
+        <div class="nav-item active"><span class="nav-glyph"></span><strong>Overview</strong></div>
+        <div class="nav-item"><span class="nav-glyph"></span><span>Components</span></div>
+        <div class="nav-item"><span class="nav-glyph"></span><span>Bindings</span></div>
+        <div class="nav-item"><span class="nav-glyph"></span><span>Automation</span></div>
+      </nav>
+      <div id="sidebar-card">
+        <strong>MCP connected</strong>
+        <p>Semantic actions are available for every instrumented element.</p>
+      </div>
+    </aside>
+
+    <section id="workspace">
+      <div id="toolbar">
+        <div id="toolbar-copy">
+          <h2>Application pipeline</h2>
+          <p>Rendered at runtime from app.html and app.css</p>
+        </div>
+        <div id="toolbar-actions">
+          <button id="reset-build" type="button">Reset</button>
+          <button id="run-build" type="button">Run build</button>
+        </div>
+      </div>
+
+      <section id="metrics">
+        <article class="metric-card">
+          <span class="metric-label">HTML nodes</span>
+          <strong>86</strong>
+          <p>Pure document</p>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">Components</span>
+          <strong>24</strong>
+          <p>Native elements</p>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">Bindings</span>
+          <strong>4</strong>
+          <p>Validated hooks</p>
+        </article>
+        <article class="metric-card accent-card">
+          <span class="metric-label">Builds</span>
+          <strong id="build-count">12</strong>
+          <p>This session</p>
+        </article>
+      </section>
+
+      <div id="lower-grid">
+        <section id="pipeline-panel" class="panel">
+          <div class="panel-heading">
+            <div>
+              <h2>Live render pipeline</h2>
+              <p>Every stage stays typed and inspectable</p>
+            </div>
+            <span class="healthy-pill">Healthy</span>
+          </div>
+
+          <div id="stages">
+            <article class="stage-card">
+              <div class="stage-number">01</div>
+              <strong>Parse HTML</strong>
+              <p>Standards-based DOM</p>
+              <span class="stage-status">Complete</span>
+            </article>
+            <article class="stage-card">
+              <div class="stage-number">02</div>
+              <strong>Resolve styles</strong>
+              <p>Target-neutral plan</p>
+              <span class="stage-status">Complete</span>
+            </article>
+            <article class="stage-card">
+              <div class="stage-number">03</div>
+              <strong>Paint GPUI</strong>
+              <p>Native GPU frame</p>
+              <span class="stage-status">Complete</span>
+            </article>
+          </div>
+
+          <div id="activity-feed">
+            <div class="activity-row">
+              <span class="activity-dot blue"></span>
+              <div><strong>Semantic tree published</strong><p>MCP can inspect and control this window</p></div>
+              <small>now</small>
+            </div>
+            <div class="activity-row">
+              <span class="activity-dot green"></span>
+              <div><strong>Visual parity checked</strong><p>Chromium and GPUI remain within gate</p></div>
+              <small>13s</small>
+            </div>
+          </div>
+        </section>
+
+        <aside id="inspector" class="panel">
+          <div class="panel-heading compact">
+            <div><h2>Runtime inspector</h2><p>Interactive native state</p></div>
+          </div>
+
+          <details id="runtime-menu">
+            <summary><span>Runtime actions</span><strong>Open</strong></summary>
+            <div id="action-menu">
+              <div class="menu-item">Inspect</div>
+              <div class="menu-item">Focus</div>
+              <div class="menu-item">Capture</div>
+              <div class="menu-item">Compare</div>
+            </div>
+          </details>
+
+          <div id="runtime-status">
+            <span class="status-icon"></span>
+            <div>
+              <strong>Runtime status</strong>
+              <p id="status-message">Ready - document compiled into native GPUI elements.</p>
+            </div>
+          </div>
+
+          <div id="document-shape">
+            <p class="eyebrow">DOCUMENT SHAPE</p>
+            <div class="shape-row"><span>app.html</span><strong>Structure</strong></div>
+            <div class="shape-row"><span>app.css</span><strong>Visuals</strong></div>
+            <div class="shape-row"><span>bindings.ron</span><strong>Behavior</strong></div>
+          </div>
+        </aside>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

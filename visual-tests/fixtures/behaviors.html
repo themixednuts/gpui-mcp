@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>GPUI behavior parity fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      html { width: 640px; height: 480px; margin: 0; }
+      body {
+        display: flex;
+        flex-direction: column;
+        width: 640px;
+        height: 480px;
+        margin: 0;
+        padding: 24px;
+        gap: 16px;
+        background-color: #10141c;
+        color: #e8eef7;
+        font-family: system-ui;
+        font-size: 14px;
+        line-height: 20px;
+      }
+      header { display: flex; flex-direction: column; width: 592px; gap: 4px; }
+      h1 { margin: 0; color: #ffffff; font-size: 24px; font-weight: 700; line-height: 30px; }
+      p { margin: 0; color: #9dabc1; font-size: 13px; line-height: 18px; }
+      #interaction-row { display: flex; flex-direction: row; width: 592px; height: 126px; gap: 12px; }
+      .interaction-card {
+        display: flex;
+        flex-direction: column;
+        width: 290px;
+        height: 126px;
+        padding: 16px;
+        gap: 8px;
+        background-color: #182231;
+        border-width: 2px;
+        border-style: solid;
+        border-color: #2d3c52;
+        border-radius: 10px;
+      }
+      .interaction-card strong { color: #ffffff; font-size: 16px; font-weight: 700; line-height: 20px; }
+      #hover-card:hover { background-color: #22314a; border-color: #5d8cff; }
+      #focus-card:focus { background-color: #1c3040; border-color: #45d39a; outline: none; }
+      details { display: flex; flex-direction: column; width: 592px; }
+      summary {
+        display: flex;
+        flex-direction: row;
+        width: 592px;
+        height: 46px;
+        padding: 12px;
+        align-items: center;
+        justify-content: space-between;
+        background-color: #172131;
+        border-width: 1px;
+        border-style: solid;
+        border-color: #34455f;
+        border-radius: 8px;
+        color: #f5f8fc;
+      }
+      #menu {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        width: 592px;
+        height: 94px;
+        margin-top: 8px;
+        padding: 10px;
+        gap: 8px;
+        background-color: #141d2a;
+        border-width: 1px;
+        border-style: solid;
+        border-color: #2d3c52;
+        border-radius: 8px;
+      }
+      .menu-item {
+        display: flex;
+        height: 72px;
+        padding: 10px;
+        align-items: center;
+        justify-content: center;
+        background-color: #1d293b;
+        border-radius: 6px;
+        color: #cdd9ea;
+      }
+      #nested-state {
+        display: flex;
+        flex-direction: row;
+        width: 592px;
+        height: 74px;
+        padding: 12px;
+        gap: 12px;
+        align-items: center;
+        background-color: #121b28;
+        border-radius: 8px;
+      }
+      #state-dot { width: 12px; height: 12px; border-radius: 6px; background-color: #5d8cff; }
+      #state-copy { display: flex; flex-direction: column; gap: 2px; }
+      #state-copy strong { font-size: 14px; font-weight: 700; color: #eef4fc; }
+      #state-copy span { font-size: 12px; color: #8f9db2; }
+    </style>
+  </head>
+  <body>
+    <header><h1>Behavior laboratory</h1><p>Real hover, keyboard focus, disclosure state, and nested layout.</p></header>
+    <section id="interaction-row">
+      <div id="hover-card" class="interaction-card" tabindex="0"><strong>Hover target</strong><p>Semantic hover and pointer hover share one visual state.</p></div>
+      <div id="focus-card" class="interaction-card" tabindex="0"><strong>Focus target</strong><p>Keyboard focus applies the native GPUI focus refinement.</p></div>
+    </section>
+    <details id="dropdown">
+      <summary><span>Component dropdown</span><span>Toggle</span></summary>
+      <div id="menu">
+        <div class="menu-item">Button</div>
+        <div class="menu-item">Input</div>
+        <div class="menu-item">Panel</div>
+      </div>
+    </details>
+    <section id="nested-state">
+      <div id="state-dot"></div>
+      <div id="state-copy"><strong>Interactive state is deterministic</strong><span>Each state is captured and diffed independently.</span></div>
+    </section>
+  </body>
+</html>

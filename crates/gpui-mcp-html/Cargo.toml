@@ -1,0 +1,56 @@
+[package]
+name = "gpui-mcp-html"
+description = "Pure HTML authoring, live rendering, bindings, and scaffolding for GPUI MCP applications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = ["cli", "json", "ron"]
+cli = ["dep:clap", "ron"]
+dev-watch = ["dep:notify", "ron"]
+json = ["dep:serde_json"]
+ron = ["dep:ron"]
+visual-parity = [
+    "dep:anyhow",
+    "dep:clap",
+    "dep:image",
+    "dep:xcap",
+    "gpui-mcp/test-support",
+]
+
+[dependencies]
+anyhow = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+gpui.workspace = true
+gpui-component.workspace = true
+gpui-mcp = { path = "../gpui-mcp", default-features = false }
+htmlswap.workspace = true
+image = { workspace = true, optional = true }
+notify = { workspace = true, optional = true }
+ron = { workspace = true, optional = true }
+serde.workspace = true
+serde_json = { workspace = true, optional = true }
+thiserror.workspace = true
+xcap = { workspace = true, optional = true }
+
+[[bin]]
+name = "gpui-mcp"
+path = "src/bin/gpui-mcp.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "gpui-mcp-html-visual"
+path = "src/bin/visual.rs"
+required-features = ["visual-parity"]
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+gpui-mcp = { path = "../gpui-mcp", default-features = false, features = ["test-support"] }
+tempfile = "3.23.0"
+
+[lints]
+workspace = true

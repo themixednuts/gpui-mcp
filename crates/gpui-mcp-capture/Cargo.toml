@@ -1,0 +1,18 @@
+[package]
+name = "gpui-mcp-capture"
+description = "Native window capture backend shared by GPUI MCP bridges and servers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+base64.workspace = true
+gpui-mcp-protocol = { path = "../gpui-mcp-protocol" }
+image.workspace = true
+xcap.workspace = true
+
+[lints]
+workspace = true

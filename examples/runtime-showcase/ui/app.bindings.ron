@@ -1,0 +1,27 @@
+(
+    version: 1,
+    bindings: [
+        Event(
+            target: Id("run-build"),
+            event: Click,
+            handler: "run_build",
+        ),
+        Event(
+            target: Id("reset-build"),
+            event: Click,
+            handler: "reset_build",
+        ),
+        Property(
+            target: Id("build-count"),
+            property: Text,
+            source: "build_count",
+            mode: OneWay,
+        ),
+        Property(
+            target: Id("status-message"),
+            property: Text,
+            source: "status_message",
+            mode: OneWay,
+        ),
+    ],
+)

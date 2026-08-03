@@ -1,0 +1,11 @@
+/target
+target/
+/node_modules
+/visual-tests/artifacts
+/test-results
+/playwright-report
+/plans/
+.DS_Store
+Thumbs.db
+*.log
+*.tmp

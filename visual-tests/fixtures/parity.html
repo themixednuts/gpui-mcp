@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>GPUI visual parity fixture</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        width: 640px;
+        height: 480px;
+        margin: 0;
+      }
+
+      body {
+        display: flex;
+        flex-direction: column;
+        width: 640px;
+        height: 480px;
+        margin: 0;
+        padding: 24px;
+        gap: 16px;
+        background-color: #10141c;
+        color: #e8eef7;
+        font-family: system-ui;
+        font-size: 16px;
+        line-height: 20px;
+      }
+
+      header {
+        display: flex;
+        flex-direction: column;
+        margin: 0;
+        gap: 6px;
+      }
+
+      h1 {
+        margin: 0;
+        color: #f8fbff;
+        font-size: 28px;
+        font-weight: 700;
+        line-height: 34px;
+      }
+
+      p {
+        margin: 0;
+        color: #aebbd0;
+        font-size: 14px;
+        font-weight: 400;
+        line-height: 20px;
+      }
+
+      #cards {
+        display: flex;
+        flex-direction: row;
+        width: 592px;
+        height: 164px;
+        gap: 12px;
+      }
+
+      .card {
+        display: flex;
+        flex-direction: column;
+        width: 290px;
+        height: 164px;
+        padding: 16px;
+        gap: 10px;
+        background-color: #1a2130;
+        border-width: 1px;
+        border-style: solid;
+        border-color: #3c4a62;
+        border-radius: 10px;
+      }
+
+      .card-title {
+        margin: 0;
+        color: #ffffff;
+        font-size: 17px;
+        font-weight: 700;
+        line-height: 22px;
+      }
+
+      .bar {
+        width: 256px;
+        height: 12px;
+        background-color: #293448;
+        border-radius: 6px;
+      }
+
+      .bar-accent {
+        width: 176px;
+        height: 12px;
+        background-color: #5d8cff;
+        border-radius: 6px;
+      }
+
+      #status {
+        display: flex;
+        flex-direction: row;
+        width: 592px;
+        height: 58px;
+        padding: 12px;
+        gap: 12px;
+        align-items: center;
+        background-color: #141b27;
+        border-width: 1px;
+        border-style: solid;
+        border-color: #2f3c52;
+        border-radius: 8px;
+      }
+
+      #status-dot {
+        width: 12px;
+        height: 12px;
+        background-color: #45d39a;
+        border-radius: 6px;
+      }
+
+      #status-copy {
+        color: #dce6f5;
+        font-size: 14px;
+        font-weight: 400;
+        line-height: 20px;
+      }
+    </style>
+  </head>
+  <body>
+    <header id="intro">
+      <h1 id="title">HTML to GPUI</h1>
+      <p id="subtitle">One document, two renderers, measurable visual parity.</p>
+    </header>
+    <section id="cards">
+      <article id="source-card" class="card">
+        <h2 class="card-title">Chromium source</h2>
+        <p>Pure HTML and CSS establish the reference frame.</p>
+        <div class="bar"><div class="bar-accent"></div></div>
+      </article>
+      <article id="runtime-card" class="card">
+        <h2 class="card-title">GPUI runtime</h2>
+        <p>Resolved styles build native GPUI elements.</p>
+        <div class="bar"><div class="bar-accent"></div></div>
+      </article>
+    </section>
+    <footer id="status">
+      <div id="status-dot"></div>
+      <span id="status-copy">Visual comparison is ready.</span>
+    </footer>
+  </body>
+</html>

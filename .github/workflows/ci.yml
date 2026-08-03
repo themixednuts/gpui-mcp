@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "23 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04, macos-latest]
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            clang libclang-dev pkg-config cmake \
+            libfontconfig-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxrandr-dev libegl-dev \
+            libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-xinput-dev \
+            libxcb-composite0-dev libpipewire-0.3-dev libdbus-1-dev libegl1-mesa-dev \
+            xvfb
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt && rustup default 1.96.0
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install visual parity dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Install pinned Playwright Chromium
+        run: npx playwright install --with-deps --no-shell chromium
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --all-features --locked
+
+      - name: Check screenshot-free integration
+        run: cargo check -p gpui-mcp --no-default-features --locked
+
+      - name: Test workspace
+        run: cargo test --workspace --all-features --locked
+
+      - name: Test Chromium/GPUI visual parity
+        if: runner.os != 'Linux'
+        run: npm run test:visual
+
+      - name: Test Chromium/GPUI visual parity under Xvfb
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:visual
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Upload visual parity failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: visual-parity-${{ matrix.os }}
+          path: visual-tests/artifacts
+          if-no-files-found: ignore
+
+  audit:
+    name: RustSec audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit

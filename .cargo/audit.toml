@@ -1,0 +1,12 @@
+[advisories]
+# Temporary, build-time-only exceptions. The latest wayland-scanner 0.31.10
+# and xcb 1.7.0 parse their bundled/trusted protocol XML with affected
+# quick-xml releases. No untrusted MCP or application data reaches these
+# code generators, and neither upstream currently offers a fixed release.
+# Remove both exceptions as soon as GPUI/XCap can resolve quick-xml >=0.41.
+ignore = [
+    "RUSTSEC-2026-0194", # duplicate-attribute quadratic behavior
+    "RUSTSEC-2026-0195", # namespace allocation exhaustion
+]
+informational_warnings = ["unmaintained"]
+severity_threshold = "low"

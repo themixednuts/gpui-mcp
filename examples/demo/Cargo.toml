@@ -1,0 +1,15 @@
+[package]
+name = "gpui-mcp-demo"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui.workspace = true
+gpui-mcp = { path = "../../crates/gpui-mcp" }
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+{
+  "name": "gpui-mcp-visual-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:visual": "cargo build --locked -p gpui-mcp-html --bin gpui-mcp-html-visual --features visual-parity -j 1",
+    "install:chromium": "playwright install --no-shell chromium",
+    "test:visual": "npm run build:visual && playwright test --config visual-tests/playwright.config.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1",
+    "pixelmatch": "7.2.0",
+    "pngjs": "7.0.0"
+  }
+}

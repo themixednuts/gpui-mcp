@@ -1,0 +1,40 @@
+[package]
+name = "gpui-mcp"
+description = "A hardened, cross-platform MCP automation bridge for GPUI applications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = ["native-screenshot"]
+native-screenshot = ["dep:gpui-mcp-capture"]
+test-support = []
+
+[dependencies]
+async-channel.workspace = true
+directories.workspace = true
+gpui.workspace = true
+gpui-mcp-capture = { path = "../gpui-mcp-capture", optional = true }
+gpui-mcp-protocol = { path = "../gpui-mcp-protocol" }
+interprocess.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+widestring.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+tempfile = "3.23.0"
+tokio.workspace = true
+
+[lints]
+workspace = true

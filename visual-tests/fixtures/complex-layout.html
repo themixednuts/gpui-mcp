@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>GPUI complex layout parity fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      html { width: 640px; height: 480px; margin: 0; }
+      body {
+        display: flex;
+        flex-direction: column;
+        width: 640px;
+        height: 480px;
+        margin: 0;
+        padding: 24px;
+        gap: 14px;
+        background-color: #10141c;
+        color: #e8eef7;
+        font-family: system-ui;
+        font-size: 14px;
+        line-height: 18px;
+      }
+      header {
+        display: flex;
+        flex-direction: row;
+        width: 592px;
+        height: 52px;
+        align-items: center;
+        justify-content: space-between;
+      }
+      #heading { display: flex; flex-direction: column; gap: 2px; }
+      h1 { margin: 0; font-size: 22px; font-weight: 700; line-height: 28px; color: #ffffff; }
+      p { margin: 0; font-size: 12px; line-height: 18px; color: #9dabc1; }
+      #badge {
+        display: flex;
+        width: 102px;
+        height: 30px;
+        align-items: center;
+        justify-content: center;
+        background-color: #162238;
+        border-width: 1px;
+        border-style: solid;
+        border-color: #38537d;
+        border-radius: 15px;
+        color: #9ec3ff;
+        font-size: 12px;
+      }
+      main { display: flex; flex-direction: row; width: 592px; height: 366px; gap: 12px; }
+      aside {
+        display: flex;
+        flex-direction: column;
+        width: 148px;
+        height: 366px;
+        padding: 12px;
+        gap: 10px;
+        background-color: #141c29;
+        border-width: 1px;
+        border-style: solid;
+        border-color: #29364a;
+        border-radius: 10px;
+      }
+      .nav-item {
+        display: flex;
+        width: 122px;
+        height: 36px;
+        padding: 8px;
+        align-items: center;
+        background-color: #1a2434;
+        border-radius: 6px;
+        color: #c9d5e7;
+      }
+      .nav-item.selected { background-color: #264068; color: #ffffff; }
+      #content { display: flex; flex-direction: column; width: 432px; height: 366px; gap: 12px; }
+      #metrics {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        width: 432px;
+        height: 104px;
+        gap: 8px;
+      }
+      .metric {
+        display: flex;
+        flex-direction: column;
+        height: 104px;
+        padding: 12px;
+        gap: 8px;
+        background-color: #182233;
+        border-width: 1px;
+        border-style: solid;
+        border-color: #2f4058;
+        border-radius: 8px;
+      }
+      .metric strong { font-size: 20px; font-weight: 700; line-height: 24px; color: #ffffff; }
+      #lower { display: flex; flex-direction: row; width: 432px; height: 250px; gap: 12px; }
+      .panel {
+        display: flex;
+        flex-direction: column;
+        width: 210px;
+        height: 250px;
+        padding: 12px;
+        gap: 10px;
+        background-color: #141c29;
+        border-width: 1px;
+        border-style: solid;
+        border-color: #29364a;
+        border-radius: 10px;
+      }
+      h2 { margin: 0; color: #f7faff; font-size: 15px; font-weight: 700; line-height: 20px; }
+      #nested-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        width: 184px;
+        height: 174px;
+        gap: 8px;
+      }
+      .tile {
+        display: flex;
+        flex-direction: column;
+        height: 83px;
+        padding: 10px;
+        gap: 5px;
+        background-color: #1d293b;
+        border-radius: 7px;
+      }
+      .tile strong { color: #8fb7ff; font-size: 14px; font-weight: 700; }
+      #activity { display: flex; flex-direction: column; width: 184px; gap: 8px; }
+      .activity-row {
+        display: flex;
+        flex-direction: row;
+        width: 184px;
+        height: 48px;
+        padding: 8px;
+        gap: 8px;
+        align-items: center;
+        background-color: #1a2434;
+        border-radius: 6px;
+      }
+      .dot { width: 10px; height: 10px; border-radius: 5px; background-color: #45d39a; }
+      .activity-copy { display: flex; flex-direction: column; gap: 1px; }
+      .activity-copy span { color: #dce6f5; font-size: 12px; line-height: 16px; }
+      .activity-copy small { color: #8290a6; font-size: 11px; line-height: 14px; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div id="heading"><h1>Layout laboratory</h1><p>Nested flex and equal-track grid in one deterministic frame.</p></div>
+      <div id="badge">Complex UI</div>
+    </header>
+    <main>
+      <aside>
+        <div class="nav-item selected">Overview</div>
+        <div class="nav-item">Components</div>
+        <div class="nav-item">Tokens</div>
+        <div class="nav-item">Activity</div>
+      </aside>
+      <section id="content">
+        <div id="metrics">
+          <div class="metric"><span>Nodes</span><strong>128</strong><p>12 nested</p></div>
+          <div class="metric"><span>Frames</span><strong>60</strong><p>stable fps</p></div>
+          <div class="metric"><span>Parity</span><strong>99%</strong><p>measured</p></div>
+        </div>
+        <div id="lower">
+          <section class="panel">
+            <h2>Nested grid</h2>
+            <div id="nested-grid">
+              <div class="tile"><strong>A1</strong><span>Header</span></div>
+              <div class="tile"><strong>A2</strong><span>Toolbar</span></div>
+              <div class="tile"><strong>B1</strong><span>Canvas</span></div>
+              <div class="tile"><strong>B2</strong><span>Inspector</span></div>
+            </div>
+          </section>
+          <section class="panel">
+            <h2>Nested flex</h2>
+            <div id="activity">
+              <div class="activity-row"><div class="dot"></div><div class="activity-copy"><span>Parsed HTML</span><small>target neutral</small></div></div>
+              <div class="activity-row"><div class="dot"></div><div class="activity-copy"><span>Resolved CSS</span><small>typed subset</small></div></div>
+              <div class="activity-row"><div class="dot"></div><div class="activity-copy"><span>Painted GPUI</span><small>native frame</small></div></div>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
