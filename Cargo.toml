@@ -28,7 +28,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 directories = "6.0.0"
 gpui = "0.2.2"
 gpui-component = "0.5.1"
-htmlswap = { git = "https://github.com/themixednuts/htmlswap", rev = "e8a2f65b00d1df473ac5eaf6a53204732197d272" }
+htmlswap = { git = "https://github.com/themixednuts/htmlswap", rev = "7b6bd0f0c73cef241819c707615684fd2c066341" }
 image = { version = "0.25.10", default-features = false, features = ["png", "gif"] }
 interprocess = { version = "2.4.2", features = ["tokio"] }
 notify = "8.2.0"
