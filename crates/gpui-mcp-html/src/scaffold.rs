@@ -11,23 +11,22 @@ const GPUI_MCP_REPOSITORY: &str = "https://github.com/themixednuts/gpui-mcp";
 
 /// Inputs for a new standalone GPUI HTML project.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProjectOptions {
+pub struct ProjectSpec {
     name: String,
     destination: PathBuf,
     dependencies: ProjectDependencies,
-    window_decorations: OutputWindowDecorations,
+    window_decorations: Decorations,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ProjectDependencies {
-    #[default]
-    PublicRepository,
+    PublicRepository { revision: Option<String> },
     LocalWorkspace(PathBuf),
 }
 
 /// Cross-platform window decoration policy used by generated GPUI applications.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum OutputWindowDecorations {
+pub enum Decorations {
     /// Ask Windows, macOS, and the Linux compositor/window manager for native decorations.
     #[default]
     Native,
@@ -35,10 +34,10 @@ pub enum OutputWindowDecorations {
     Custom,
 }
 
-impl OutputWindowDecorations {
+impl Decorations {
     /// Generate the complete GPUI window-options module consumed by scaffolded applications.
     #[must_use]
-    pub fn rust_module_source(self) -> String {
+    pub fn module_source(self) -> String {
         let (transparent, linux) = match self {
             Self::Native => (false, "Server"),
             Self::Custom => (true, "Client"),
@@ -63,15 +62,15 @@ pub fn output_window_options(bounds: Bounds<Pixels>) -> WindowOptions {{
     }
 }
 
-impl ProjectOptions {
+impl ProjectSpec {
     /// Describe a new project using the public `gpui-mcp` repository.
     #[must_use]
     pub fn new(name: impl Into<String>, destination: impl Into<PathBuf>) -> Self {
         Self {
             name: name.into(),
             destination: destination.into(),
-            dependencies: ProjectDependencies::PublicRepository,
-            window_decorations: OutputWindowDecorations::Native,
+            dependencies: ProjectDependencies::PublicRepository { revision: None },
+            window_decorations: Decorations::Native,
         }
     }
 
@@ -80,14 +79,23 @@ impl ProjectOptions {
     /// This is useful for offline development and for testing unpublished
     /// changes. The generated manifest records the canonical checkout path.
     #[must_use]
-    pub fn with_local_workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
+    pub fn workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
         self.dependencies = ProjectDependencies::LocalWorkspace(workspace.into());
+        self
+    }
+
+    /// Pin the generated project to one exact public repository commit.
+    #[must_use]
+    pub fn git_revision(mut self, revision: impl Into<String>) -> Self {
+        self.dependencies = ProjectDependencies::PublicRepository {
+            revision: Some(revision.into()),
+        };
         self
     }
 
     /// Select the generated OS-window decoration policy.
     #[must_use]
-    pub fn with_window_decorations(mut self, decorations: OutputWindowDecorations) -> Self {
+    pub fn decorations(mut self, decorations: Decorations) -> Self {
         self.window_decorations = decorations;
         self
     }
@@ -112,7 +120,7 @@ impl ProjectOptions {
 /// The destination must not exist and the package name must be safe for Cargo
 /// and MCP discovery. An explicitly selected local workspace must contain the
 /// integration crates and the vendored GPUI patch.
-pub fn scaffold_project(options: &ProjectOptions) -> Result<PathBuf, ScaffoldError> {
+pub fn generate(options: &ProjectSpec) -> Result<PathBuf, ScaffoldError> {
     validate_package_name(&options.name)?;
     if options.destination.exists() {
         return Err(ScaffoldError::DestinationExists {
@@ -120,7 +128,14 @@ pub fn scaffold_project(options: &ProjectOptions) -> Result<PathBuf, ScaffoldErr
         });
     }
     let dependencies = match &options.dependencies {
-        ProjectDependencies::PublicRepository => ManifestDependencies::PublicRepository,
+        ProjectDependencies::PublicRepository { revision } => {
+            if let Some(revision) = revision {
+                validate_repository_revision(revision)?;
+            }
+            ManifestDependencies::PublicRepository {
+                revision: revision.as_deref(),
+            }
+        }
         ProjectDependencies::LocalWorkspace(path) => {
             let workspace = path
                 .canonicalize()
@@ -158,7 +173,7 @@ pub fn scaffold_project(options: &ProjectOptions) -> Result<PathBuf, ScaffoldErr
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
     let staging = parent.join(format!(
-        ".{file_name}.gpui-mcp-scaffold-{}-{nonce}",
+        ".{file_name}.gpui-mcp-generate-{}-{nonce}",
         std::process::id()
     ));
     let mut guard = StagingGuard::new(staging.clone());
@@ -186,7 +201,7 @@ fn create_project_files(
     root: &Path,
     name: &str,
     dependencies: &ManifestDependencies,
-    window_decorations: OutputWindowDecorations,
+    window_decorations: Decorations,
 ) -> Result<(), ScaffoldError> {
     let src = root.join("src");
     let ui = root.join("ui");
@@ -217,10 +232,7 @@ fn create_project_files(
     let files = [
         (root.join("Cargo.toml"), cargo_manifest(name, dependencies)),
         (src.join("main.rs"), main_rs(name, &title)),
-        (
-            src.join("window.rs"),
-            window_decorations.rust_module_source(),
-        ),
+        (src.join("window.rs"), window_decorations.module_source()),
         (ui.join("app.html"), app_html(&title)),
         (ui.join("app.css"), APP_CSS.to_owned()),
         (ui.join("app.bindings.ron"), bindings),
@@ -235,23 +247,29 @@ fn create_project_files(
     Ok(())
 }
 
-enum ManifestDependencies {
-    PublicRepository,
+enum ManifestDependencies<'a> {
+    PublicRepository { revision: Option<&'a str> },
     LocalWorkspace(String),
 }
 
-fn cargo_manifest(name: &str, dependencies: &ManifestDependencies) -> String {
+fn cargo_manifest(name: &str, dependencies: &ManifestDependencies<'_>) -> String {
     let dependencies = match dependencies {
-        ManifestDependencies::PublicRepository => format!(
-            r#"gpui = "0.2.2"
-gpui-mcp = {{ git = "{GPUI_MCP_REPOSITORY}", branch = "main" }}
-gpui-mcp-html = {{ git = "{GPUI_MCP_REPOSITORY}", branch = "main", features = ["dev-watch"] }}
+        ManifestDependencies::PublicRepository { revision } => {
+            let selector = revision.map_or_else(
+                || "branch = \"main\"".to_owned(),
+                |revision| format!("rev = \"{revision}\""),
+            );
+            format!(
+                r#"gpui = "=0.2.2"
+gpui-mcp = {{ git = "{GPUI_MCP_REPOSITORY}", {selector} }}
+gpui-mcp-html = {{ git = "{GPUI_MCP_REPOSITORY}", {selector}, features = ["dev-watch"] }}
 
 [patch.crates-io]
-gpui = {{ git = "{GPUI_MCP_REPOSITORY}", branch = "main" }}"#
-        ),
+gpui = {{ git = "{GPUI_MCP_REPOSITORY}", {selector} }}"#
+            )
+        }
         ManifestDependencies::LocalWorkspace(root) => format!(
-            r#"gpui = "0.2.2"
+            r#"gpui = "=0.2.2"
 gpui-mcp = {{ path = "{root}/crates/gpui-mcp" }}
 gpui-mcp-html = {{ path = "{root}/crates/gpui-mcp-html", features = ["dev-watch"] }}
 
@@ -282,9 +300,10 @@ use std::time::Duration;
 use gpui::{{
     App, AppContext, Application, Bounds, Context, IntoElement, Render, Timer, Window, px, size,
 }};
-use gpui_mcp::{{ActionOutcome, BridgeConfig, BridgeHandle}};
+use gpui_mcp::{{AppId, BridgeConfig, BridgeHandle}};
 use gpui_mcp_html::{{
-    HandlerId, HookRegistry, LiveHtmlSession, ProjectPaths, ProjectSnapshot, ProjectWatcher,
+    HandlerId, HookOutcome, HookRegistry, LiveHtmlSession, ProjectPaths, ProjectSnapshot,
+    ProjectWatcher,
 }};
 
 const APP_ID: &str = "{app_id}";
@@ -309,7 +328,7 @@ impl AppView {{
         }};
         let Some(change) = change else {{ return; }};
         let source = match ProjectSnapshot::load(self.watcher.paths()) {{
-            Ok(snapshot) => snapshot.into_live_document_source(),
+            Ok(snapshot) => snapshot.into_document(),
             Err(error) => {{
                 eprintln!("could not read changed project: {{error}}");
                 return;
@@ -333,29 +352,29 @@ impl Render for AppView {{
     }}
 }}
 
-fn build_live(window: &Window, cx: &App) -> Result<AppView, String> {{
+fn build_live(window: &mut Window, cx: &App) -> Result<AppView, String> {{
     let bridge = BridgeHandle::install(
         window,
         cx,
-        BridgeConfig::new(APP_ID, TITLE).enable_live_document(),
+        BridgeConfig::new(AppId::new(APP_ID).map_err(|error| error.to_string())?, TITLE),
     )
     .map_err(|error| error.to_string())?;
     let paths = ProjectPaths::open(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
         .map_err(|error| error.to_string())?;
     let source = ProjectSnapshot::load(&paths)
         .map_err(|error| error.to_string())?
-        .into_live_document_source();
+        .into_document();
     let mut hooks = HookRegistry::new();
     hooks
         .register_event(HandlerId::new("save_document"), |event, _, _| {{
             eprintln!("{{}} clicked", event.element_id().as_str());
-            ActionOutcome::Handled
+            HookOutcome::Handled
         }})
         .map_err(|error| error.to_string())?;
     let session = LiveHtmlSession::compile(source, bridge.automation(), hooks)
         .map_err(|error| error.to_string())?;
     session
-        .register_mcp_preview(&bridge)
+        .serve_mcp(&bridge)
         .map_err(|error| error.to_string())?;
     let watcher = ProjectWatcher::new(paths).map_err(|error| error.to_string())?;
     Ok(AppView {{ session, watcher, _bridge: bridge }})
@@ -373,7 +392,6 @@ fn main() {{
                     eprintln!("could not initialize application: {{error}}");
                     std::process::exit(1);
                 }});
-                eprintln!("GPUI MCP endpoint: {{}}", app._bridge.endpoint_path().display());
                 let view = cx.new(|_| app);
                 let weak_view = view.downgrade();
                 window
@@ -469,6 +487,14 @@ fn validate_package_name(name: &str) -> Result<(), ScaffoldError> {
     }
 }
 
+fn validate_repository_revision(revision: &str) -> Result<(), ScaffoldError> {
+    if matches!(revision.len(), 40 | 64) && revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(ScaffoldError::InvalidRepositoryRevision)
+    }
+}
+
 fn validate_workspace(workspace: &Path) -> Result<(), ScaffoldError> {
     for manifest in [
         workspace.join("crates/gpui-mcp/Cargo.toml"),
@@ -542,6 +568,9 @@ pub enum ScaffoldError {
         /// Rejected package name.
         name: String,
     },
+    /// A public repository revision must be a full SHA-1 or SHA-256 object ID.
+    #[error("gpui-mcp repository revision must be a 40- or 64-character hexadecimal commit ID")]
+    InvalidRepositoryRevision,
     /// Scaffolding never overwrites an existing path.
     #[error("destination already exists: {path}", path = .path.display())]
     DestinationExists {
@@ -593,13 +622,13 @@ pub enum ScaffoldError {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutputWindowDecorations, ProjectOptions, scaffold_project};
+    use super::{Decorations, ProjectSpec, generate};
 
     #[test]
     fn scaffold_writes_pure_html_ron_and_rust_project() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
         let destination = temporary.path().join("sample-app");
-        let output = scaffold_project(&ProjectOptions::new("sample-app", &destination))?;
+        let output = generate(&ProjectSpec::new("sample-app", &destination))?;
 
         assert_eq!(output, destination);
         assert!(destination.join("Cargo.toml").is_file());
@@ -610,12 +639,13 @@ mod tests {
         let manifest = std::fs::read_to_string(destination.join("Cargo.toml"))?;
         assert!(manifest.contains("[workspace]"));
         assert!(manifest.contains("features = [\"dev-watch\"]"));
+        assert!(manifest.contains("gpui = \"=0.2.2\""));
         assert!(manifest.contains("https://github.com/themixednuts/gpui-mcp"));
         assert!(manifest.contains("[patch.crates-io]"));
         assert!(!manifest.contains("path ="));
         let main = std::fs::read_to_string(destination.join("src/main.rs"))?;
         assert!(main.contains("ProjectWatcher"));
-        assert!(main.contains("enable_live_document"));
+        assert!(main.contains("serve_mcp"));
         assert!(main.contains("NativeRoot::new"));
         assert!(main.contains("window::output_window_options(bounds)"));
         let window = std::fs::read_to_string(destination.join("src/window.rs"))?;
@@ -631,9 +661,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
         let destination = temporary.path().join("custom-window");
-        scaffold_project(
-            &ProjectOptions::new("custom-window", &destination)
-                .with_window_decorations(OutputWindowDecorations::Custom),
+        generate(
+            &ProjectSpec::new("custom-window", &destination).decorations(Decorations::Custom),
         )?;
 
         let window = std::fs::read_to_string(destination.join("src/window.rs"))?;
@@ -647,14 +676,43 @@ mod tests {
         let temporary = tempfile::tempdir()?;
         let destination = temporary.path().join("offline-app");
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        scaffold_project(
-            &ProjectOptions::new("offline-app", &destination).with_local_workspace(workspace),
-        )?;
+        generate(&ProjectSpec::new("offline-app", &destination).workspace(workspace))?;
 
         let manifest = std::fs::read_to_string(destination.join("Cargo.toml"))?;
+        assert!(manifest.contains("gpui = \"=0.2.2\""));
         assert!(manifest.contains("path ="));
         assert!(manifest.contains("vendor/gpui"));
         assert!(!manifest.contains("git ="));
+        Ok(())
+    }
+
+    #[test]
+    fn public_repository_can_be_pinned_to_an_exact_commit() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = tempfile::tempdir()?;
+        let destination = temporary.path().join("pinned-app");
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        generate(&ProjectSpec::new("pinned-app", &destination).git_revision(revision))?;
+
+        let manifest = std::fs::read_to_string(destination.join("Cargo.toml"))?;
+        assert!(manifest.contains(&format!("rev = \"{revision}\"")));
+        assert!(!manifest.contains("branch = \"main\""));
+        Ok(())
+    }
+
+    #[test]
+    fn public_repository_revision_rejects_non_commit_references()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let destination = temporary.path().join("unpinned-app");
+        let result = generate(
+            &ProjectSpec::new("unpinned-app", destination).git_revision("main\"\nmalicious = true"),
+        );
+
+        assert!(matches!(
+            result,
+            Err(super::ScaffoldError::InvalidRepositoryRevision)
+        ));
         Ok(())
     }
 }

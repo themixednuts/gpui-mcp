@@ -33,7 +33,8 @@
 
 use crate::{
     App, ArenaBox, AvailableSpace, Bounds, Context, DispatchNodeId, ELEMENT_ARENA, ElementId,
-    FocusHandle, InspectorElementId, LayoutId, Pixels, Point, Size, Style, Window,
+    FocusHandle, InspectorElementId, LayoutId, Pixels, Point, SemanticAction, Semantics, Size,
+    Style, Window,
     util::FluentBuilder,
 };
 use derive_more::{Deref, DerefMut};
@@ -67,6 +68,24 @@ pub trait Element: 'static + IntoElement {
     /// Source location where this element was constructed, used to disambiguate elements in the
     /// inspector and navigate to their source code.
     fn source_location(&self) -> Option<&'static panic::Location<'static>>;
+
+    /// Return semantic meaning and interactions for this rendered element.
+    ///
+    /// The default emits no semantic node. Interactive GPUI elements derive
+    /// this information from their stable element ID and registered behavior.
+    fn semantics(&self, _window: &Window, _cx: &App) -> Option<(Semantics, Vec<SemanticAction>)> {
+        None
+    }
+
+    /// Return text that contributes to the nearest semantic ancestor's name.
+    fn semantic_text(&self) -> Option<&str> {
+        None
+    }
+
+    /// Return the focus handle owned by this semantic element, when present.
+    fn semantic_focus_handle(&self) -> Option<FocusHandle> {
+        None
+    }
 
     /// Before an element can be painted, we need to know where it's going to be and how big it is.
     /// Use this method to request a layout from Taffy and initialize the element's state.
@@ -417,6 +436,21 @@ impl<E: Element> Drawable<E> {
 
                 let bounds = window.layout_bounds(layout_id);
                 let node_id = window.next_frame.dispatch_tree.push_node();
+                let entered_semantics = if window.next_frame.semantics.is_enabled() {
+                    let semantics = self.element.semantics(window, cx);
+                    let entered = window.next_frame.semantics.enter(
+                        global_id.as_ref(),
+                        semantics,
+                        self.element.semantic_focus_handle(),
+                        bounds,
+                    );
+                    if let Some(text) = self.element.semantic_text() {
+                        window.next_frame.semantics.add_text(text);
+                    }
+                    entered
+                } else {
+                    false
+                };
                 let prepaint = self.element.prepaint(
                     global_id.as_ref(),
                     inspector_id.as_ref(),
@@ -425,6 +459,7 @@ impl<E: Element> Drawable<E> {
                     window,
                     cx,
                 );
+                window.next_frame.semantics.exit(entered_semantics);
                 window.next_frame.dispatch_tree.pop_node();
 
                 if global_id.is_some() {

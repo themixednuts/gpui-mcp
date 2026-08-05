@@ -1,35 +1,51 @@
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, Cursor, Seek, SeekFrom, Write as _};
+use std::io::{self, Seek, SeekFrom, Write as _};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use base64::Engine as _;
 use bytes::Bytes;
-use gpui_mcp_protocol::Screenshot;
-use image::{ImageFormat, ImageReader, Limits, RgbaImage};
+use image::RgbaImage;
 use mp4::{AvcConfig, FourCC, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig};
 use openh264::{
     OpenH264API,
-    encoder::{Encoder, EncoderConfig, FrameType, RateControlMode, UsageType},
-    formats::{RgbaSliceU8, YUVBuffer},
+    encoder::{
+        Complexity, Encoder, EncoderConfig, FrameRate, FrameType, RateControlMode, UsageType,
+    },
+    formats::{RgbSliceU8, YUVBuffer},
 };
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempPath};
 
-#[cfg(test)]
-pub(crate) const DEFAULT_FRAME_DELAY_MS: u32 = 100;
-pub(crate) const MIN_FRAME_DELAY_MS: u32 = 20;
-pub(crate) const MAX_FRAME_DELAY_MS: u32 = 10_000;
-pub(crate) const MAX_RECORDING_FRAMES: usize = 120;
-const MAX_CAPTURE_FAILURES: u8 = 3;
+pub(crate) const MAX_RECORDING_FRAMES: usize = 30 * 120;
 const MAX_ARTIFACT_NAME_BYTES: usize = 128;
 const MAX_RECORDING_FRAME_DIMENSION: u32 = 4_096;
 const MAX_RECORDING_FRAME_PIXELS: u64 = 16 * 1024 * 1024;
-const MAX_RECORDING_FRAME_BASE64_BYTES: u64 = 24 * 1024 * 1024;
-const MAX_RECORDING_FRAME_PNG_BYTES: usize = 16 * 1024 * 1024;
-const MAX_RECORDING_BASE64_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_RECORDING_DECODED_PIXELS: u64 = 256 * 1024 * 1024;
-const MAX_RECORDING_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_RECORDING_OUTPUT_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FrameTiming {
+    frames_per_second: u8,
+}
+
+impl FrameTiming {
+    pub(crate) fn frames_per_second(value: u8) -> Result<Self, String> {
+        if (1..=30).contains(&value) {
+            Ok(Self {
+                frames_per_second: value,
+            })
+        } else {
+            Err("frames_per_second must be between 1 and 30".to_owned())
+        }
+    }
+
+    pub(crate) const fn configured_frames_per_second(self) -> u8 {
+        self.frames_per_second
+    }
+
+    const fn timescale(self) -> u32 {
+        self.frames_per_second as u32
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ArtifactStore {
@@ -68,7 +84,6 @@ impl ArtifactStore {
                 ));
             }
         }
-
         let metadata = fs::symlink_metadata(directory).map_err(|error| {
             format!(
                 "could not inspect recording artifact directory {}: {error}",
@@ -98,461 +113,252 @@ impl ArtifactStore {
         self.directory.as_path()
     }
 
-    fn encode_mp4(
-        &self,
-        frames: &[Screenshot],
-        artifact_name: &str,
-        delay_ms: u32,
-        overwrite: bool,
-    ) -> Result<RecordingArtifact, String> {
+    fn prepare(&self, artifact_name: &str, overwrite: bool) -> Result<PreparedArtifact, String> {
         validate_artifact_name(artifact_name)?;
-        validate_frame_delay(delay_ms)?;
-        if frames.is_empty() {
-            return Err("no frames were captured for this recording".to_owned());
-        }
-        if frames.len() > MAX_RECORDING_FRAMES {
-            return Err(format!(
-                "recording exceeds the {MAX_RECORDING_FRAMES}-frame safety bound"
-            ));
-        }
-
-        let (dimensions, _base64_bytes, _decoded_pixels) = inspect_frames(frames)?;
-        let (video_width, video_height) = padded_video_dimensions(dimensions)?;
-
         let final_path = self.directory.join(artifact_name);
         validate_existing_artifact(&final_path, overwrite)?;
-        let mut temporary = NamedTempFile::new_in(self.directory()).map_err(|error| {
+        let temporary = NamedTempFile::new_in(self.directory()).map_err(|error| {
             format!(
                 "could not create a temporary recording artifact in {}: {error}",
                 self.directory().display()
             )
         })?;
-
-        let encoded_bytes = {
-            encode_h264_mp4(
-                temporary.as_file_mut(),
-                frames,
-                dimensions,
-                (video_width, video_height),
-                delay_ms,
-            )?
-        };
-        install_artifact(
-            temporary,
-            &final_path,
-            self.directory(),
-            artifact_name,
-            encoded_bytes,
+        let (file, temporary_path) = temporary.into_parts();
+        Ok(PreparedArtifact {
+            file,
+            temporary_path,
+            final_path,
             overwrite,
-        )?;
-
-        Ok(RecordingArtifact {
-            path: final_path,
-            frame_count: frames.len(),
-            delay_ms,
-            bytes: encoded_bytes,
-            width: video_width,
-            height: video_height,
-            dropped_frames: 0,
         })
     }
 }
 
-fn install_artifact(
-    temporary: NamedTempFile,
-    final_path: &Path,
-    directory: &Path,
-    artifact_name: &str,
-    encoded_bytes: u64,
+struct PreparedArtifact {
+    file: fs::File,
+    temporary_path: TempPath,
+    final_path: PathBuf,
     overwrite: bool,
-) -> Result<(), String> {
-    #[cfg(not(unix))]
-    let _ = directory;
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|error| format!("could not synchronize MP4 data: {error}"))?;
-    let metadata = temporary
-        .as_file()
-        .metadata()
-        .map_err(|error| format!("could not inspect temporary recording artifact: {error}"))?;
-    if !metadata.is_file()
-        || metadata.len() > MAX_RECORDING_OUTPUT_BYTES
-        || metadata.len() != encoded_bytes
-    {
-        return Err("temporary recording artifact has an invalid size or type".to_owned());
-    }
-
-    // Keep every fallible validation before the atomic install. Once persist succeeds the
-    // artifact is committed, so returning an error would incorrectly restore frames for a retry
-    // even though the destination already contains the completed recording.
-    drop(
-        if overwrite {
-            temporary.persist(final_path)
-        } else {
-            temporary.persist_noclobber(final_path)
-        }
-        .map_err(|error| {
-            if !overwrite && error.error.kind() == io::ErrorKind::AlreadyExists {
-                format!(
-                    "recording artifact {artifact_name:?} already exists; pass overwrite=true to replace a regular file"
-                )
-            } else {
-                format!(
-                    "could not atomically install recording artifact {artifact_name:?}: {}",
-                    error.error
-                )
-            }
-        })?,
-    );
-    #[cfg(unix)]
-    if let Err(error) = sync_parent_directory(directory) {
-        tracing::warn!(
-            %error,
-            artifact = %final_path.display(),
-            "could not synchronize committed recording artifact directory"
-        );
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
-pub(crate) struct RecordingState {
-    last_session_id: u64,
-    phase: RecordingPhase,
-}
-
-impl Default for RecordingState {
-    fn default() -> Self {
-        Self {
-            last_session_id: 0,
-            phase: RecordingPhase::Idle,
-        }
-    }
-}
-
-#[derive(Debug)]
-enum RecordingPhase {
-    Idle,
-    Recording(RecordingSession),
-    Encoding { session_id: u64 },
-}
-
-#[derive(Debug)]
-struct RecordingSession {
-    session_id: u64,
-    frames: Vec<Screenshot>,
-    base64_bytes: u64,
-    decoded_pixels: u64,
-    dimensions: Option<(u32, u32)>,
-    capture_in_flight: bool,
-    pointer_overlay: bool,
-    frame_duration_ms: u32,
-    dropped_frames: u32,
-    last_capture_error: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CapturePermit {
-    session_id: u64,
-    pointer_overlay: bool,
-}
-
-pub(crate) struct CaptureLease {
-    state: Arc<Mutex<RecordingState>>,
-    permit: Option<CapturePermit>,
-}
-
-impl CaptureLease {
-    pub(crate) fn begin(state: Arc<Mutex<RecordingState>>) -> Result<Self, String> {
-        let permit = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .begin_capture()?;
-        Ok(Self {
-            state,
-            permit: Some(permit),
-        })
-    }
-
-    pub(crate) fn complete(mut self, screenshot: Screenshot) -> Result<CaptureOutcome, String> {
-        let permit = self
-            .permit
-            .ok_or_else(|| "recording capture state was already finalized".to_owned())?;
-        let outcome = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .complete_capture(permit, screenshot);
-        self.permit = None;
-        outcome
-    }
-
-    #[must_use]
-    pub(crate) fn includes_pointer_overlay(&self) -> bool {
-        self.permit.is_some_and(|permit| permit.pointer_overlay)
-    }
-}
-
-impl Drop for CaptureLease {
-    fn drop(&mut self) {
-        let Some(permit) = self.permit.take() else {
-            return;
-        };
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .abort_capture(permit);
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CaptureOutcome {
-    pub(crate) session_id: u64,
-    pub(crate) frame_count: usize,
-    pub(crate) base64_bytes: u64,
-    pub(crate) decoded_pixels: u64,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-}
-
-#[derive(Debug)]
-pub(crate) struct EncodingJob {
-    session: RecordingSession,
-}
-
-impl EncodingJob {
-    pub(crate) fn session_id(&self) -> u64 {
-        self.session.session_id
-    }
-
-    pub(crate) fn frame_duration_ms(&self) -> u32 {
-        self.session.frame_duration_ms
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecordingArtifact {
     pub(crate) path: PathBuf,
     pub(crate) frame_count: usize,
-    pub(crate) delay_ms: u32,
+    pub(crate) timeline_frames: u64,
+    pub(crate) timing: FrameTiming,
+    pub(crate) duration_ms: u64,
     pub(crate) bytes: u64,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) dropped_frames: u32,
 }
 
-impl RecordingState {
-    pub(crate) const fn is_idle(&self) -> bool {
-        matches!(self.phase, RecordingPhase::Idle)
+/// Incremental H.264/MP4 writer used by the live capture worker.
+///
+/// Frames are converted and written immediately. No PNGs, base64 payloads, or decoded
+/// frame history are retained while recording.
+pub(crate) struct LiveRecorder {
+    encoder: Encoder,
+    rgb: Vec<u8>,
+    yuv: YUVBuffer,
+    writer: Option<Mp4Writer<BoundedSeekWriter<fs::File>>>,
+    temporary_path: Option<TempPath>,
+    final_path: PathBuf,
+    overwrite: bool,
+    source_dimensions: (u32, u32),
+    video_dimensions: (u32, u32),
+    timing: FrameTiming,
+    frame_count: usize,
+    timeline_ticks: u64,
+    dropped_frames: u32,
+}
+
+impl LiveRecorder {
+    pub(crate) fn start(
+        store: &ArtifactStore,
+        artifact_name: &str,
+        overwrite: bool,
+        timing: FrameTiming,
+        first_frame: RgbaImage,
+    ) -> Result<Self, String> {
+        let source_dimensions = validate_rgba_frame(&first_frame, None)?;
+        let video_dimensions = padded_video_dimensions(source_dimensions)?;
+        let prepared = store.prepare(artifact_name, overwrite)?;
+        let config = EncoderConfig::new()
+            .usage_type(UsageType::ScreenContentRealTime)
+            .complexity(Complexity::Low)
+            .max_frame_rate(FrameRate::from_hz(f32::from(
+                timing.configured_frames_per_second(),
+            )))
+            .rate_control_mode(RateControlMode::Off)
+            .adaptive_quantization(false)
+            .background_detection(false)
+            .skip_frames(false);
+        let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
+            .map_err(|error| format!("could not initialize H.264 video encoder: {error}"))?;
+        let first_frame = pad_frame(first_frame, video_dimensions);
+        let (mut rgb, mut yuv) = conversion_buffers(video_dimensions)?;
+        let first_sample = encode_h264_frame(
+            &mut encoder,
+            &first_frame,
+            video_dimensions,
+            &mut rgb,
+            &mut yuv,
+        )?;
+        let avc = avc_config(&first_sample, video_dimensions)?;
+        let bounded = BoundedSeekWriter::new(prepared.file, MAX_RECORDING_OUTPUT_BYTES)
+            .map_err(|error| format!("could not initialize MP4 output: {error}"))?;
+        let config = Mp4Config {
+            major_brand: FourCC::from(*b"isom"),
+            minor_version: 512,
+            compatible_brands: vec![
+                FourCC::from(*b"isom"),
+                FourCC::from(*b"iso2"),
+                FourCC::from(*b"avc1"),
+                FourCC::from(*b"mp41"),
+            ],
+            timescale: timing.timescale(),
+        };
+        let mut writer = Mp4Writer::write_start(bounded, &config)
+            .map_err(|error| format!("could not initialize MP4 video container: {error}"))?;
+        let mut track = TrackConfig::from(avc);
+        track.timescale = timing.timescale();
+        writer
+            .add_track(&track)
+            .map_err(|error| format!("could not add H.264 video track: {error}"))?;
+        write_h264_sample(&mut writer, first_sample, 0, 1)?;
+
+        Ok(Self {
+            encoder,
+            rgb,
+            yuv,
+            writer: Some(writer),
+            temporary_path: Some(prepared.temporary_path),
+            final_path: prepared.final_path,
+            overwrite: prepared.overwrite,
+            source_dimensions,
+            video_dimensions,
+            timing,
+            frame_count: 1,
+            timeline_ticks: 1,
+            dropped_frames: 0,
+        })
     }
 
     #[cfg(test)]
-    pub(crate) fn start(&mut self) -> Result<u64, String> {
-        self.start_with_config(true, DEFAULT_FRAME_DELAY_MS)
+    fn push(&mut self, frame: RgbaImage) -> Result<(), String> {
+        self.push_for(frame, 1)
     }
 
-    pub(crate) fn start_with_config(
-        &mut self,
-        pointer_overlay: bool,
-        frame_duration_ms: u32,
-    ) -> Result<u64, String> {
-        validate_frame_delay(frame_duration_ms)?;
-        match self.phase {
-            RecordingPhase::Idle => {}
-            RecordingPhase::Recording(_) => {
-                return Err("a recording session is already active".to_owned());
-            }
-            RecordingPhase::Encoding { .. } => {
-                return Err("recording encoding is still in progress".to_owned());
-            }
+    pub(crate) fn push_for(&mut self, frame: RgbaImage, duration_ticks: u32) -> Result<(), String> {
+        if duration_ticks == 0 {
+            return Err("recording sample duration must be positive".to_owned());
         }
-        let session_id = self
-            .last_session_id
-            .checked_add(1)
-            .ok_or_else(|| "recording session identifier capacity was exhausted".to_owned())?;
-        self.last_session_id = session_id;
-        self.phase = RecordingPhase::Recording(RecordingSession {
-            session_id,
-            frames: Vec::with_capacity(MAX_RECORDING_FRAMES.min(16)),
-            base64_bytes: 0,
-            decoded_pixels: 0,
-            dimensions: None,
-            capture_in_flight: false,
-            pointer_overlay,
-            frame_duration_ms,
-            dropped_frames: 0,
-            last_capture_error: None,
-        });
-        Ok(session_id)
-    }
-
-    pub(crate) fn note_continuous_capture_failure(
-        &mut self,
-        session_id: u64,
-        error: String,
-    ) -> bool {
-        let RecordingPhase::Recording(session) = &mut self.phase else {
-            return false;
-        };
-        if session.session_id != session_id {
-            return false;
-        }
-        session.dropped_frames = session.dropped_frames.saturating_add(1);
-        session.last_capture_error = Some(error);
-        session.dropped_frames < u32::from(MAX_CAPTURE_FAILURES)
-    }
-
-    pub(crate) fn begin_capture(&mut self) -> Result<CapturePermit, String> {
-        let RecordingPhase::Recording(session) = &mut self.phase else {
-            return Err(match self.phase {
-                RecordingPhase::Idle => {
-                    "no active recording; call start_video_recording first".to_owned()
-                }
-                RecordingPhase::Encoding { .. } => {
-                    "recording encoding is in progress; no frame can be captured".to_owned()
-                }
-                RecordingPhase::Recording(_) => "recording state is unavailable".to_owned(),
-            });
-        };
-        if session.capture_in_flight {
-            return Err("a recording frame capture is already in progress".to_owned());
-        }
-        if session.frames.len() >= MAX_RECORDING_FRAMES {
+        if self.is_full() {
             return Err(format!(
-                "recording frame capacity ({MAX_RECORDING_FRAMES}) has been reached"
+                "recording reached the {} second safety limit",
+                MAX_RECORDING_FRAMES / 30
             ));
         }
-        if session.base64_bytes >= MAX_RECORDING_BASE64_BYTES {
-            return Err("recording stored-base64 capacity has been reached".to_owned());
-        }
-        if session.decoded_pixels >= MAX_RECORDING_DECODED_PIXELS {
-            return Err("recording decoded-pixel capacity has been reached".to_owned());
-        }
-        session.capture_in_flight = true;
-        Ok(CapturePermit {
-            session_id: session.session_id,
-            pointer_overlay: session.pointer_overlay,
-        })
-    }
-
-    pub(crate) fn abort_capture(&mut self, permit: CapturePermit) {
-        if let RecordingPhase::Recording(session) = &mut self.phase
-            && session.session_id == permit.session_id
-        {
-            session.capture_in_flight = false;
-        }
-    }
-
-    pub(crate) fn complete_capture(
-        &mut self,
-        permit: CapturePermit,
-        screenshot: Screenshot,
-    ) -> Result<CaptureOutcome, String> {
-        let RecordingPhase::Recording(session) = &mut self.phase else {
-            return Err("the recording session changed while its frame was captured".to_owned());
-        };
-        if session.session_id != permit.session_id || !session.capture_in_flight {
-            return Err("the recording session changed while its frame was captured".to_owned());
-        }
-        session.capture_in_flight = false;
-        let usage = validate_frame(&screenshot, session.dimensions)?;
-        let base64_bytes = checked_total(
-            session.base64_bytes,
-            usage.base64_bytes,
-            MAX_RECORDING_BASE64_BYTES,
-            "stored base64 data",
+        validate_rgba_frame(&frame, Some(self.source_dimensions))?;
+        let frame = pad_frame(frame, self.video_dimensions);
+        let sample = encode_h264_frame(
+            &mut self.encoder,
+            &frame,
+            self.video_dimensions,
+            &mut self.rgb,
+            &mut self.yuv,
         )?;
-        let decoded_pixels = checked_total(
-            session.decoded_pixels,
-            usage.pixels,
-            MAX_RECORDING_DECODED_PIXELS,
-            "decoded pixels",
-        )?;
-        session.base64_bytes = base64_bytes;
-        session.decoded_pixels = decoded_pixels;
-        session.dimensions.get_or_insert(usage.dimensions);
-        session.frames.push(screenshot);
-        Ok(CaptureOutcome {
-            session_id: session.session_id,
-            frame_count: session.frames.len(),
-            base64_bytes,
-            decoded_pixels,
-            width: usage.dimensions.0,
-            height: usage.dimensions.1,
-        })
-    }
-
-    pub(crate) fn begin_encoding(&mut self) -> Result<EncodingJob, String> {
-        let phase = std::mem::replace(&mut self.phase, RecordingPhase::Idle);
-        match phase {
-            RecordingPhase::Idle => {
-                Err("no active recording; call start_video_recording first".to_owned())
-            }
-            RecordingPhase::Encoding { session_id } => {
-                self.phase = RecordingPhase::Encoding { session_id };
-                Err("recording encoding is already in progress".to_owned())
-            }
-            RecordingPhase::Recording(session) if session.capture_in_flight => {
-                self.phase = RecordingPhase::Recording(session);
-                Err("a recording frame capture is still in progress".to_owned())
-            }
-            RecordingPhase::Recording(session) if session.frames.is_empty() => {
-                let message = session.last_capture_error.as_ref().map_or_else(
-                    || "no video frames were captured for this recording".to_owned(),
-                    |error| format!("no video frames were captured; latest capture error: {error}"),
-                );
-                self.phase = RecordingPhase::Recording(session);
-                Err(message)
-            }
-            RecordingPhase::Recording(session) => {
-                let session_id = session.session_id;
-                self.phase = RecordingPhase::Encoding { session_id };
-                Ok(EncodingJob { session })
-            }
+        let start_time = self.timeline_ticks;
+        let maximum_ticks = u64::from(self.timing.frames_per_second) * 120;
+        let duration_ticks =
+            u32::try_from(u64::from(duration_ticks).min(maximum_ticks.saturating_sub(start_time)))
+                .map_err(|_| "video sample duration overflowed".to_owned())?;
+        if duration_ticks == 0 {
+            return Err("recording reached the 120 second safety limit".to_owned());
         }
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| "recording writer was already finalized".to_owned())?;
+        write_h264_sample(writer, sample, start_time, duration_ticks)?;
+        self.frame_count += 1;
+        self.timeline_ticks = self
+            .timeline_ticks
+            .checked_add(u64::from(duration_ticks))
+            .ok_or_else(|| "video timeline overflowed".to_owned())?;
+        Ok(())
     }
 
-    fn finish_encoding(&mut self, session_id: u64) -> bool {
-        if matches!(
-            self.phase,
-            RecordingPhase::Encoding {
-                session_id: current
-            } if current == session_id
-        ) {
-            self.phase = RecordingPhase::Idle;
-            true
+    pub(crate) fn record_drop(&mut self) {
+        self.dropped_frames = self.dropped_frames.saturating_add(1);
+    }
+
+    pub(crate) fn is_full(&self) -> bool {
+        self.timeline_ticks >= u64::from(self.timing.frames_per_second) * 120
+    }
+
+    pub(crate) fn finish(mut self) -> Result<RecordingArtifact, String> {
+        let mut writer = self
+            .writer
+            .take()
+            .ok_or_else(|| "recording writer was already finalized".to_owned())?;
+        writer
+            .write_end()
+            .map_err(|error| format!("could not finalize MP4 video container: {error}"))?;
+        let mut output = writer.into_writer();
+        output
+            .flush()
+            .map_err(|error| format!("could not flush MP4 video data: {error}"))?;
+        output
+            .inner
+            .sync_all()
+            .map_err(|error| format!("could not synchronize MP4 data: {error}"))?;
+        let bytes = output.bytes_written();
+        if bytes == 0 || bytes > MAX_RECORDING_OUTPUT_BYTES {
+            return Err("temporary recording artifact has an invalid size".to_owned());
+        }
+        drop(output.inner);
+
+        let temporary_path = self
+            .temporary_path
+            .take()
+            .ok_or_else(|| "recording temporary path was already finalized".to_owned())?;
+        if self.overwrite {
+            temporary_path.persist(&self.final_path)
         } else {
-            false
+            temporary_path.persist_noclobber(&self.final_path)
         }
-    }
+        .map_err(|error| {
+            format!(
+                "could not atomically install recording artifact {}: {error}",
+                self.final_path.display()
+            )
+        })?;
 
-    fn restore_encoding(&mut self, mut session: RecordingSession) {
-        if matches!(
-            self.phase,
-            RecordingPhase::Encoding {
-                session_id: current
-            } if current == session.session_id
-        ) {
-            session.capture_in_flight = false;
-            self.phase = RecordingPhase::Recording(session);
+        #[cfg(unix)]
+        if let Some(directory) = self.final_path.parent()
+            && let Err(error) = sync_parent_directory(directory)
+        {
+            tracing::warn!(%error, "could not synchronize recording artifact directory");
         }
-    }
-}
 
-pub(crate) fn run_encoding_job(
-    state: Arc<Mutex<RecordingState>>,
-    store: &ArtifactStore,
-    job: EncodingJob,
-    artifact_name: &str,
-    delay_ms: u32,
-    overwrite: bool,
-) -> Result<RecordingArtifact, String> {
-    let mut guard = EncodingGuard::new(state, job);
-    let mut artifact = store.encode_mp4(guard.frames(), artifact_name, delay_ms, overwrite)?;
-    artifact.dropped_frames = guard.dropped_frames();
-    guard.commit()?;
-    Ok(artifact)
+        Ok(RecordingArtifact {
+            path: self.final_path,
+            frame_count: self.frame_count,
+            timeline_frames: self.timeline_ticks,
+            timing: self.timing,
+            duration_ms: self
+                .timeline_ticks
+                .checked_mul(1_000)
+                .and_then(|duration| duration.checked_div(u64::from(self.timing.frames_per_second)))
+                .ok_or_else(|| "video duration overflowed".to_owned())?,
+            bytes,
+            width: self.video_dimensions.0,
+            height: self.video_dimensions.1,
+            dropped_frames: self.dropped_frames,
+        })
+    }
 }
 
 pub(crate) fn validate_artifact_name(name: &str) -> Result<(), String> {
@@ -590,262 +396,52 @@ pub(crate) fn validate_artifact_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn validate_frame_delay(delay_ms: u32) -> Result<(), String> {
-    if (MIN_FRAME_DELAY_MS..=MAX_FRAME_DELAY_MS).contains(&delay_ms) {
-        Ok(())
-    } else {
-        Err(format!(
-            "frame_duration_ms must be between {MIN_FRAME_DELAY_MS} and {MAX_FRAME_DELAY_MS}"
-        ))
-    }
-}
-
-struct EncodingGuard {
-    state: Arc<Mutex<RecordingState>>,
-    job: Option<EncodingJob>,
-}
-
-impl EncodingGuard {
-    fn new(state: Arc<Mutex<RecordingState>>, job: EncodingJob) -> Self {
-        Self {
-            state,
-            job: Some(job),
-        }
-    }
-
-    fn frames(&self) -> &[Screenshot] {
-        self.job
-            .as_ref()
-            .map_or(&[], |job| job.session.frames.as_slice())
-    }
-
-    fn dropped_frames(&self) -> u32 {
-        self.job
-            .as_ref()
-            .map_or(0, |job| job.session.dropped_frames)
-    }
-
-    fn commit(&mut self) -> Result<(), String> {
-        let Some(job) = self.job.as_ref() else {
-            return Err("recording encoding state was already finalized".to_owned());
-        };
-        let session_id = job.session.session_id;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state.finish_encoding(session_id) {
-            return Err("recording encoding state changed unexpectedly".to_owned());
-        }
-        drop(state);
-        self.job = None;
-        Ok(())
-    }
-}
-
-impl Drop for EncodingGuard {
-    fn drop(&mut self) {
-        let Some(job) = self.job.take() else {
-            return;
-        };
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .restore_encoding(job.session);
-    }
-}
-
-#[derive(Clone, Copy)]
-struct FrameUsage {
-    dimensions: (u32, u32),
-    pixels: u64,
-    base64_bytes: u64,
-}
-
-fn validate_frame(
-    screenshot: &Screenshot,
-    expected_dimensions: Option<(u32, u32)>,
-) -> Result<FrameUsage, String> {
-    if screenshot.mime_type != "image/png" {
-        return Err("recording frames must be PNG screenshots".to_owned());
-    }
-    if screenshot.width == 0
-        || screenshot.height == 0
-        || screenshot.width > MAX_RECORDING_FRAME_DIMENSION
-        || screenshot.height > MAX_RECORDING_FRAME_DIMENSION
+fn validate_rgba_frame(
+    frame: &RgbaImage,
+    expected: Option<(u32, u32)>,
+) -> Result<(u32, u32), String> {
+    let dimensions = frame.dimensions();
+    if dimensions.0 == 0
+        || dimensions.1 == 0
+        || dimensions.0 > MAX_RECORDING_FRAME_DIMENSION
+        || dimensions.1 > MAX_RECORDING_FRAME_DIMENSION
+        || u64::from(dimensions.0) * u64::from(dimensions.1) > MAX_RECORDING_FRAME_PIXELS
     {
+        return Err("recording frame dimensions exceed the safety bound".to_owned());
+    }
+    if expected.is_some_and(|expected| expected != dimensions) {
         return Err(format!(
-            "recording frame dimensions must be between 1 and {MAX_RECORDING_FRAME_DIMENSION} pixels per axis"
+            "recording frame dimensions {}x{} changed during capture",
+            dimensions.0, dimensions.1
         ));
     }
-    let dimensions = (screenshot.width, screenshot.height);
-    if expected_dimensions.is_some_and(|expected| expected != dimensions) {
-        return Err(format!(
-            "recording frame dimensions {}x{} do not match the first frame",
-            screenshot.width, screenshot.height
-        ));
-    }
-    let pixels = u64::from(screenshot.width)
-        .checked_mul(u64::from(screenshot.height))
-        .ok_or_else(|| "recording frame pixel count overflowed".to_owned())?;
-    if pixels > MAX_RECORDING_FRAME_PIXELS {
-        return Err("recording frame exceeds the per-frame pixel safety bound".to_owned());
-    }
-    let base64_bytes = u64::try_from(screenshot.base64_data.len())
-        .map_err(|_| "recording frame base64 size overflowed".to_owned())?;
-    if base64_bytes == 0 || base64_bytes > MAX_RECORDING_FRAME_BASE64_BYTES {
-        return Err("recording frame exceeds the per-frame base64 safety bound".to_owned());
-    }
-    Ok(FrameUsage {
-        dimensions,
-        pixels,
-        base64_bytes,
-    })
-}
-
-fn decode_frame(
-    screenshot: &Screenshot,
-    expected_dimensions: (u32, u32),
-) -> Result<RgbaImage, String> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&screenshot.base64_data)
-        .map_err(|_| "stored screenshot base64 is invalid".to_owned())?;
-    if bytes.len() > MAX_RECORDING_FRAME_PNG_BYTES {
-        return Err("decoded screenshot PNG exceeds the safety bound".to_owned());
-    }
-    let mut limits = Limits::default();
-    limits.max_image_width = Some(MAX_RECORDING_FRAME_DIMENSION);
-    limits.max_image_height = Some(MAX_RECORDING_FRAME_DIMENSION);
-    limits.max_alloc = Some(MAX_RECORDING_FRAME_PIXELS.saturating_mul(4));
-    let mut reader = ImageReader::with_format(Cursor::new(bytes), ImageFormat::Png);
-    reader.limits(limits);
-    let image = reader
-        .decode()
-        .map_err(|_| "stored screenshot PNG is invalid".to_owned())?
-        .into_rgba8();
-    if image.dimensions() != expected_dimensions
-        || image.dimensions() != (screenshot.width, screenshot.height)
-    {
-        return Err("stored screenshot dimensions do not match their metadata".to_owned());
-    }
-    Ok(image)
-}
-
-fn inspect_frames(frames: &[Screenshot]) -> Result<((u32, u32), u64, u64), String> {
-    let mut expected_dimensions = None;
-    let mut base64_bytes = 0_u64;
-    let mut decoded_pixels = 0_u64;
-    for screenshot in frames {
-        let usage = validate_frame(screenshot, expected_dimensions)?;
-        expected_dimensions.get_or_insert(usage.dimensions);
-        base64_bytes = checked_total(
-            base64_bytes,
-            usage.base64_bytes,
-            MAX_RECORDING_BASE64_BYTES,
-            "stored base64 data",
-        )?;
-        decoded_pixels = checked_total(
-            decoded_pixels,
-            usage.pixels,
-            MAX_RECORDING_DECODED_PIXELS,
-            "decoded pixels",
-        )?;
-    }
-    let dimensions = expected_dimensions
-        .ok_or_else(|| "no frames were captured for this recording".to_owned())?;
-    Ok((dimensions, base64_bytes, decoded_pixels))
+    Ok(dimensions)
 }
 
 fn padded_video_dimensions(dimensions: (u32, u32)) -> Result<(u32, u32), String> {
     let width = dimensions
         .0
         .checked_add(dimensions.0 % 2)
-        .ok_or_else(|| "video width overflowed".to_owned())?;
+        .ok_or_else(|| "video width overflowed".to_owned())?
+        .max(16);
     let height = dimensions
         .1
         .checked_add(dimensions.1 % 2)
-        .ok_or_else(|| "video height overflowed".to_owned())?;
-    // H.264's 4:2:0 input needs even dimensions and OpenH264 rejects dimensions below 16.
-    // Padding is internal to the MP4; the captured screenshot dimensions remain unchanged.
-    let width = width.max(16);
-    let height = height.max(16);
+        .ok_or_else(|| "video height overflowed".to_owned())?
+        .max(16);
     if width > u32::from(u16::MAX) || height > u32::from(u16::MAX) {
         return Err("video dimensions exceed the MP4 H.264 limit".to_owned());
     }
     Ok((width, height))
 }
 
-fn encode_h264_mp4(
-    output: &mut fs::File,
-    frames: &[Screenshot],
-    screenshot_dimensions: (u32, u32),
-    video_dimensions: (u32, u32),
-    frame_delay_ms: u32,
-) -> Result<u64, String> {
-    let config = EncoderConfig::new()
-        .usage_type(UsageType::ScreenContentRealTime)
-        .rate_control_mode(RateControlMode::Off)
-        .adaptive_quantization(false)
-        .background_detection(false)
-        .skip_frames(false);
-    let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
-        .map_err(|error| format!("could not initialize H.264 video encoder: {error}"))?;
-
-    let first = rgba_for_video(&frames[0], screenshot_dimensions, video_dimensions)?;
-    let first_sample = encode_h264_frame(&mut encoder, &first, video_dimensions)?;
-    let avc = avc_config(&first_sample, video_dimensions)?;
-
-    let writer = BoundedSeekWriter::new(output, MAX_RECORDING_OUTPUT_BYTES)
-        .map_err(|error| format!("could not initialize MP4 output: {error}"))?;
-    let config = Mp4Config {
-        major_brand: FourCC::from(*b"isom"),
-        minor_version: 512,
-        compatible_brands: vec![
-            FourCC::from(*b"isom"),
-            FourCC::from(*b"iso2"),
-            FourCC::from(*b"avc1"),
-            FourCC::from(*b"mp41"),
-        ],
-        timescale: 1_000,
-    };
-    let mut writer = Mp4Writer::write_start(writer, &config)
-        .map_err(|error| format!("could not initialize MP4 video container: {error}"))?;
-    writer
-        .add_track(&TrackConfig::from(avc))
-        .map_err(|error| format!("could not add H.264 video track: {error}"))?;
-    write_h264_sample(&mut writer, first_sample, 0, frame_delay_ms)?;
-
-    for (index, screenshot) in frames.iter().enumerate().skip(1) {
-        let rgba = rgba_for_video(screenshot, screenshot_dimensions, video_dimensions)?;
-        let sample = encode_h264_frame(&mut encoder, &rgba, video_dimensions)?;
-        let start_time = u64::try_from(index)
-            .ok()
-            .and_then(|index| index.checked_mul(u64::from(frame_delay_ms)))
-            .ok_or_else(|| "video timestamp overflowed".to_owned())?;
-        write_h264_sample(&mut writer, sample, start_time, frame_delay_ms)?;
+fn pad_frame(frame: RgbaImage, dimensions: (u32, u32)) -> RgbaImage {
+    if frame.dimensions() == dimensions {
+        return frame;
     }
-    writer
-        .write_end()
-        .map_err(|error| format!("could not finalize MP4 video container: {error}"))?;
-    let mut writer = writer.into_writer();
-    writer
-        .flush()
-        .map_err(|error| format!("could not flush MP4 video data: {error}"))?;
-    Ok(writer.bytes_written())
-}
-
-fn rgba_for_video(
-    screenshot: &Screenshot,
-    screenshot_dimensions: (u32, u32),
-    video_dimensions: (u32, u32),
-) -> Result<RgbaImage, String> {
-    let image = decode_frame(screenshot, screenshot_dimensions)?;
-    if screenshot_dimensions == video_dimensions {
-        return Ok(image);
-    }
-    let mut padded = RgbaImage::new(video_dimensions.0, video_dimensions.1);
-    image::imageops::replace(&mut padded, &image, 0, 0);
-    Ok(padded)
+    let mut padded = RgbaImage::new(dimensions.0, dimensions.1);
+    image::imageops::replace(&mut padded, &frame, 0, 0);
+    padded
 }
 
 struct H264Sample {
@@ -858,15 +454,17 @@ fn encode_h264_frame(
     encoder: &mut Encoder,
     rgba: &RgbaImage,
     dimensions: (u32, u32),
+    rgb: &mut [u8],
+    yuv: &mut YUVBuffer,
 ) -> Result<H264Sample, String> {
     let width = usize::try_from(dimensions.0)
         .map_err(|_| "video width does not fit the encoder".to_owned())?;
     let height = usize::try_from(dimensions.1)
         .map_err(|_| "video height does not fit the encoder".to_owned())?;
-    let source = RgbaSliceU8::new(rgba.as_raw(), (width, height));
-    let yuv = YUVBuffer::from_rgb_source(source);
+    rgba_to_rgb(rgba.as_raw(), rgb)?;
+    yuv.read_rgb8(RgbSliceU8::new(rgb, (width, height)));
     let stream = encoder
-        .encode(&yuv)
+        .encode(yuv)
         .map_err(|error| format!("could not encode H.264 video frame: {error}"))?;
     let sync = stream.frame_type() == FrameType::IDR;
     let nals = split_annex_b_nals(&stream.to_vec())?;
@@ -889,6 +487,33 @@ fn encode_h264_frame(
         nals,
         sync,
     })
+}
+
+fn conversion_buffers(dimensions: (u32, u32)) -> Result<(Vec<u8>, YUVBuffer), String> {
+    let width = usize::try_from(dimensions.0)
+        .map_err(|_| "video width does not fit the color converter".to_owned())?;
+    let height = usize::try_from(dimensions.1)
+        .map_err(|_| "video height does not fit the color converter".to_owned())?;
+    let pixels = width
+        .checked_mul(height)
+        .ok_or_else(|| "video color buffer dimensions overflowed".to_owned())?;
+    let rgb_len = pixels
+        .checked_mul(3)
+        .ok_or_else(|| "video RGB buffer size overflowed".to_owned())?;
+    Ok((vec![0; rgb_len], YUVBuffer::new(width, height)))
+}
+
+fn rgba_to_rgb(rgba: &[u8], rgb: &mut [u8]) -> Result<(), String> {
+    if !rgba.len().is_multiple_of(4)
+        || !rgb.len().is_multiple_of(3)
+        || rgba.len() / 4 != rgb.len() / 3
+    {
+        return Err("video RGBA and RGB conversion buffers do not match".to_owned());
+    }
+    for (source, destination) in rgba.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
+        destination.copy_from_slice(&source[..3]);
+    }
+    Ok(())
 }
 
 fn avc_config(sample: &H264Sample, dimensions: (u32, u32)) -> Result<AvcConfig, String> {
@@ -915,7 +540,7 @@ fn avc_config(sample: &H264Sample, dimensions: (u32, u32)) -> Result<AvcConfig, 
 }
 
 fn write_h264_sample(
-    writer: &mut Mp4Writer<BoundedSeekWriter<&mut fs::File>>,
+    writer: &mut Mp4Writer<BoundedSeekWriter<fs::File>>,
     sample: H264Sample,
     start_time: u64,
     duration: u32,
@@ -955,19 +580,6 @@ fn split_annex_b_nals(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         return Err("H.264 encoder returned no NAL units".to_owned());
     }
     Ok(nals)
-}
-
-fn checked_total(current: u64, added: u64, limit: u64, resource: &str) -> Result<u64, String> {
-    let total = current
-        .checked_add(added)
-        .ok_or_else(|| format!("recording {resource} total overflowed"))?;
-    if total > limit {
-        Err(format!(
-            "recording exceeds the aggregate {resource} safety bound"
-        ))
-    } else {
-        Ok(total)
-    }
 }
 
 fn validate_existing_artifact(path: &Path, overwrite: bool) -> Result<(), String> {
@@ -1025,35 +637,13 @@ impl<W: Seek> BoundedSeekWriter<W> {
     const fn bytes_written(&self) -> u64 {
         self.high_water_mark
     }
-}
 
-impl<W: io::Write + Seek> io::Write for BoundedSeekWriter<W> {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.ensure_space(buffer.len())?;
-        let written = self.inner.write(buffer)?;
-        self.advance(written)?;
-        Ok(written)
-    }
-
-    fn write_all(&mut self, buffer: &[u8]) -> io::Result<()> {
-        self.ensure_space(buffer.len())?;
-        self.inner.write_all(buffer)?;
-        self.advance(buffer.len())?;
-        Ok(())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-impl<W: Seek> BoundedSeekWriter<W> {
     fn ensure_space(&self, length: usize) -> io::Result<()> {
         let length = u64::try_from(length)
             .map_err(|_| io::Error::other("recording output size overflowed"))?;
         if self.position.saturating_add(length) > self.limit {
             Err(io::Error::other(
-                "recording output exceeds the 32 MiB safety bound",
+                "recording output exceeds the 256 MiB safety bound",
             ))
         } else {
             Ok(())
@@ -1072,12 +662,31 @@ impl<W: Seek> BoundedSeekWriter<W> {
     }
 }
 
+impl<W: io::Write + Seek> io::Write for BoundedSeekWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.ensure_space(buffer.len())?;
+        let written = self.inner.write(buffer)?;
+        self.advance(written)?;
+        Ok(written)
+    }
+
+    fn write_all(&mut self, buffer: &[u8]) -> io::Result<()> {
+        self.ensure_space(buffer.len())?;
+        self.inner.write_all(buffer)?;
+        self.advance(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 impl<W: Seek> Seek for BoundedSeekWriter<W> {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
         let position = self.inner.seek(position)?;
         if position > self.limit {
             return Err(io::Error::other(
-                "recording output exceeds the 32 MiB safety bound",
+                "recording output exceeds the 256 MiB safety bound",
             ));
         }
         self.position = position;
@@ -1113,449 +722,63 @@ fn sync_parent_directory(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::{Cursor, Write as _};
-    use std::sync::{Arc, Mutex};
 
-    use base64::Engine as _;
-    use gpui_mcp_protocol::Screenshot;
-    use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+    use image::{Rgba, RgbaImage};
     use mp4::{MediaType, read_mp4};
-    use openh264::{decoder::Decoder, formats::YUVSource};
     use tempfile::tempdir;
 
-    use super::{
-        ArtifactStore, BoundedSeekWriter, CaptureLease, CapturePermit, DEFAULT_FRAME_DELAY_MS,
-        MAX_RECORDING_BASE64_BYTES, MAX_RECORDING_FRAMES, RecordingPhase, RecordingSession,
-        RecordingState, checked_total, run_encoding_job, validate_artifact_name,
-        validate_frame_delay,
-    };
-
-    fn screenshot(width: u32, height: u32, color: [u8; 4]) -> Result<Screenshot, String> {
-        let mut image = RgbaImage::new(width, height);
-        for pixel in image.pixels_mut() {
-            *pixel = Rgba(color);
-        }
-        let mut bytes = Cursor::new(Vec::new());
-        DynamicImage::ImageRgba8(image)
-            .write_to(&mut bytes, ImageFormat::Png)
-            .map_err(|error| error.to_string())?;
-        Ok(Screenshot {
-            mime_type: "image/png".to_owned(),
-            base64_data: base64::engine::general_purpose::STANDARD.encode(bytes.into_inner()),
-            width,
-            height,
-        })
-    }
-
-    fn capture_one(state: &mut RecordingState, frame: Screenshot) -> Result<(), String> {
-        let permit = state.begin_capture()?;
-        state.complete_capture(permit, frame)?;
-        Ok(())
-    }
+    use super::{ArtifactStore, FrameTiming, LiveRecorder, rgba_to_rgb, validate_artifact_name};
 
     #[test]
-    fn lifecycle_rejects_duplicate_transitions_and_increments_sessions() -> Result<(), String> {
-        let mut state = RecordingState::default();
-        let first = state.start()?;
-        assert_eq!(first, 1);
-        assert!(state.start().is_err());
-        assert!(state.begin_encoding().is_err());
-        capture_one(&mut state, screenshot(4, 3, [1, 2, 3, 255])?)?;
-        let job = state.begin_encoding()?;
-        assert_eq!(job.session_id(), first);
-        assert!(state.start().is_err());
-        assert!(state.begin_encoding().is_err());
-        assert!(state.finish_encoding(first));
-        assert!(state.begin_encoding().is_err());
-        assert_eq!(state.start()?, 2);
-        Ok(())
-    }
-
-    #[test]
-    fn completed_capture_is_bound_to_its_original_session() -> Result<(), String> {
-        let mut state = RecordingState::default();
-        let first = state.start()?;
-        let permit = state.begin_capture()?;
-        state.phase = RecordingPhase::Idle;
-        let second = state.start()?;
-        assert!(second > first);
-        assert!(
-            state
-                .complete_capture(permit, screenshot(2, 2, [0, 0, 0, 255])?)
-                .is_err()
-        );
-        let RecordingPhase::Recording(session) = &state.phase else {
-            return Err("test recording session was not active".to_owned());
-        };
-        assert_eq!(session.session_id, second);
-        assert!(session.frames.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn dropped_capture_lease_releases_only_its_original_session() -> Result<(), String> {
-        let state = Arc::new(Mutex::new(RecordingState::default()));
-        state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .start()?;
-        let stale_lease = CaptureLease::begin(state.clone())?;
-        assert!(CaptureLease::begin(state.clone()).is_err());
-
-        let current_permit = {
-            let mut locked = state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            locked.phase = RecordingPhase::Idle;
-            locked.start()?;
-            locked.begin_capture()?
-        };
-        drop(stale_lease);
-
-        let mut locked = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(locked.begin_capture().is_err());
-        locked.abort_capture(current_permit);
-        assert!(locked.begin_capture().is_ok());
-        Ok(())
-    }
-
-    #[test]
-    fn capture_preflight_rejects_capacity_before_capture() -> Result<(), String> {
-        let mut state = RecordingState::default();
-        let session_id = state.start()?;
-        let RecordingPhase::Recording(session) = &mut state.phase else {
-            return Err("test recording session was not active".to_owned());
-        };
-        session.frames.resize(
-            MAX_RECORDING_FRAMES,
-            Screenshot {
-                mime_type: "image/png".to_owned(),
-                base64_data: "AA==".to_owned(),
-                width: 1,
-                height: 1,
-            },
-        );
-        assert!(state.begin_capture().is_err());
-        assert_eq!(session_id, 1);
-        Ok(())
-    }
-
-    #[test]
-    fn mismatched_dimensions_are_rejected_without_losing_the_session() -> Result<(), String> {
-        let mut state = RecordingState::default();
-        state.start()?;
-        capture_one(&mut state, screenshot(4, 3, [1, 2, 3, 255])?)?;
-        let permit = state.begin_capture()?;
-        assert!(
-            state
-                .complete_capture(permit, screenshot(5, 3, [4, 5, 6, 255])?)
-                .is_err()
-        );
-        capture_one(&mut state, screenshot(4, 3, [7, 8, 9, 255])?)?;
-        let RecordingPhase::Recording(session) = &state.phase else {
-            return Err("test recording session was not active".to_owned());
-        };
-        assert_eq!(session.frames.len(), 2);
-        Ok(())
-    }
-
-    #[test]
-    fn aggregate_and_output_caps_fail_before_exceeding_the_bound() -> Result<(), String> {
-        assert!(
-            checked_total(
-                MAX_RECORDING_BASE64_BYTES - 1,
-                1,
-                MAX_RECORDING_BASE64_BYTES,
-                "base64"
-            )
-            .is_ok()
-        );
-        assert!(
-            checked_total(
-                MAX_RECORDING_BASE64_BYTES,
-                1,
-                MAX_RECORDING_BASE64_BYTES,
-                "base64"
-            )
-            .is_err()
-        );
-
-        let mut writer = BoundedSeekWriter::new(Cursor::new(Vec::new()), 4)
-            .map_err(|error| error.to_string())?;
-        writer
-            .write_all(&[1, 2, 3, 4])
-            .map_err(|error| error.to_string())?;
-        assert!(writer.write_all(&[5]).is_err());
-        assert_eq!(writer.bytes_written(), 4);
-        Ok(())
-    }
-
-    #[test]
-    fn frame_delay_is_validated_instead_of_clamped() {
-        assert!(validate_frame_delay(19).is_err());
-        assert!(validate_frame_delay(20).is_ok());
-        assert!(validate_frame_delay(DEFAULT_FRAME_DELAY_MS).is_ok());
-        assert!(validate_frame_delay(10_000).is_ok());
-        assert!(validate_frame_delay(10_001).is_err());
-    }
-
-    #[test]
-    fn artifact_name_policy_rejects_paths_and_device_names() {
+    fn artifact_names_are_portable_single_mp4_filenames() {
+        assert!(validate_artifact_name("demo.mp4").is_ok());
         for invalid in [
-            "",
-            ".mp4",
-            "../recording.mp4",
-            "sub/recording.mp4",
-            "sub\\recording.mp4",
-            "/recording.mp4",
-            "recording.MP4",
-            "con.mp4",
-            "LPT1.test.mp4",
-            " recording.mp4",
-            "recording?.mp4",
+            "../demo.mp4",
+            "demo.MP4",
+            ".demo.mp4",
+            "CON.mp4",
+            "demo/png",
         ] {
             assert!(
                 validate_artifact_name(invalid).is_err(),
-                "{invalid:?} should be rejected"
-            );
-        }
-        for valid in ["recording.mp4", "run-01.mp4", "capture.v2_test.mp4"] {
-            assert!(
-                validate_artifact_name(valid).is_ok(),
-                "{valid:?} should be accepted"
+                "accepted {invalid:?}"
             );
         }
     }
 
     #[test]
-    fn mp4_artifact_contains_a_h264_video_track() -> Result<(), String> {
-        let directory = tempdir().map_err(|error| error.to_string())?;
-        let store = ArtifactStore::open(directory.path().join("artifacts"))?;
-        let frames = vec![
-            screenshot(6, 4, [200, 40, 40, 255])?,
-            screenshot(6, 4, [40, 200, 40, 255])?,
-            screenshot(6, 4, [40, 40, 200, 255])?,
-        ];
-        let artifact = store.encode_mp4(&frames, "events.mp4", 100, false)?;
-        assert_eq!(artifact.frame_count, 3);
-        assert_eq!(artifact.delay_ms, 100);
-        assert_eq!((artifact.width, artifact.height), (16, 16));
-        assert!(artifact.bytes > 32);
+    fn strips_alpha_into_the_reused_encoder_buffer() -> Result<(), String> {
+        let rgba = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut rgb = [0; 6];
 
-        let mut video =
-            read_mp4(fs::File::open(&artifact.path).map_err(|error| error.to_string())?)
-                .map_err(|error| error.to_string())?;
-        assert_eq!(video.tracks().len(), 1);
-        assert_eq!(video.duration().as_millis(), 300);
-        let (track_id, sequence_parameter_set, picture_parameter_set) = {
-            let track = video
-                .tracks()
-                .values()
-                .next()
-                .ok_or_else(|| "MP4 did not contain a video track".to_owned())?;
-            assert_eq!(
-                track.media_type().map_err(|error| error.to_string())?,
-                MediaType::H264
-            );
-            assert_eq!(track.sample_count(), 3);
-            (
-                track.track_id(),
-                track
-                    .sequence_parameter_set()
-                    .map_err(|error| error.to_string())?
-                    .to_vec(),
-                track
-                    .picture_parameter_set()
-                    .map_err(|error| error.to_string())?
-                    .to_vec(),
-            )
-        };
-        let first_sample = video
-            .read_sample(track_id, 1)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "MP4 did not contain the first H.264 sample".to_owned())?;
-        assert!(!first_sample.bytes.is_empty());
-        let mut h264_packet = Vec::new();
-        append_annex_b_nal(&mut h264_packet, &sequence_parameter_set);
-        append_annex_b_nal(&mut h264_packet, &picture_parameter_set);
-        append_mp4_sample_as_annex_b(&mut h264_packet, &first_sample.bytes)?;
-        let mut decoder = Decoder::new().map_err(|error| error.to_string())?;
-        let decoded_frame = decoder
-            .decode(&h264_packet)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "H.264 MP4 sample could not be decoded".to_owned())?;
-        assert_eq!(decoded_frame.dimensions(), (16, 16));
+        rgba_to_rgb(&rgba, &mut rgb)?;
+
+        assert_eq!(rgb, [1, 2, 3, 5, 6, 7]);
+        assert!(rgba_to_rgb(&rgba, &mut [0; 3]).is_err());
         Ok(())
     }
 
-    fn append_annex_b_nal(output: &mut Vec<u8>, nal: &[u8]) {
-        output.extend_from_slice(&[0, 0, 0, 1]);
-        output.extend_from_slice(nal);
-    }
-
-    fn append_mp4_sample_as_annex_b(output: &mut Vec<u8>, sample: &[u8]) -> Result<(), String> {
-        let mut remaining = sample;
-        while !remaining.is_empty() {
-            let Some(length_bytes) = remaining.get(..4) else {
-                return Err("MP4 H.264 sample contains a truncated NAL length".to_owned());
-            };
-            let length = u32::from_be_bytes(
-                length_bytes
-                    .try_into()
-                    .map_err(|_| "MP4 H.264 sample contains an invalid NAL length".to_owned())?,
-            );
-            let length = usize::try_from(length)
-                .map_err(|_| "MP4 H.264 NAL length does not fit memory".to_owned())?;
-            remaining = &remaining[4..];
-            let Some((nal, tail)) = remaining.split_at_checked(length) else {
-                return Err("MP4 H.264 sample contains a truncated NAL".to_owned());
-            };
-            append_annex_b_nal(output, nal);
-            remaining = tail;
+    #[test]
+    fn live_recorder_writes_frames_incrementally() -> Result<(), String> {
+        let directory = tempdir().map_err(|error| error.to_string())?;
+        let store = ArtifactStore::open(directory.path().join("artifacts"))?;
+        let timing = FrameTiming::frames_per_second(30)?;
+        let first = RgbaImage::from_pixel(32, 24, Rgba([18, 24, 34, 255]));
+        let mut recorder = LiveRecorder::start(&store, "live.mp4", false, timing, first)?;
+        for red in [40, 80, 120, 160] {
+            recorder.push(RgbaImage::from_pixel(32, 24, Rgba([red, 28, 48, 255])))?;
         }
-        Ok(())
-    }
-
-    #[test]
-    fn existing_artifact_requires_explicit_overwrite() -> Result<(), String> {
-        let directory = tempdir().map_err(|error| error.to_string())?;
-        let store = ArtifactStore::open(directory.path().join("artifacts"))?;
-        let frames = [screenshot(2, 2, [1, 1, 1, 255])?];
-        store.encode_mp4(&frames, "replace.mp4", 100, false)?;
-        assert!(
-            store
-                .encode_mp4(&frames, "replace.mp4", 100, false)
-                .is_err()
-        );
-        store.encode_mp4(&frames, "replace.mp4", 100, true)?;
-        Ok(())
-    }
-
-    #[test]
-    fn non_regular_output_failure_restores_frames_for_retry() -> Result<(), String> {
-        let directory = tempdir().map_err(|error| error.to_string())?;
-        let store = ArtifactStore::open(directory.path().join("artifacts"))?;
-        fs::create_dir(store.directory().join("retry.mp4")).map_err(|error| error.to_string())?;
-        let state = Arc::new(Mutex::new(RecordingState::default()));
-        let first_session = {
-            let mut locked = state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let session = locked.start()?;
-            capture_one(&mut locked, screenshot(3, 2, [9, 8, 7, 255])?)?;
-            session
-        };
-        let job = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .begin_encoding()?;
-        assert!(run_encoding_job(state.clone(), &store, job, "retry.mp4", 100, false).is_err());
-        fs::remove_dir(store.directory().join("retry.mp4")).map_err(|error| error.to_string())?;
-        let retry = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .begin_encoding()?;
-        assert_eq!(retry.session_id(), first_session);
-        let artifact = run_encoding_job(state.clone(), &store, retry, "retry.mp4", 100, false)?;
-        assert_eq!(artifact.frame_count, 1);
-        assert!(
-            state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .begin_encoding()
-                .is_err()
-        );
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn overwrite_rejects_symlink_targets() -> Result<(), String> {
-        use std::os::unix::fs::symlink;
-
-        let directory = tempdir().map_err(|error| error.to_string())?;
-        let store = ArtifactStore::open(directory.path().join("artifacts"))?;
-        let target = directory.path().join("outside.mp4");
-        fs::write(&target, b"outside").map_err(|error| error.to_string())?;
-        symlink(&target, store.directory().join("linked.mp4"))
-            .map_err(|error| error.to_string())?;
-        let frames = [screenshot(2, 2, [1, 2, 3, 255])?];
-        assert!(store.encode_mp4(&frames, "linked.mp4", 100, true).is_err());
-        assert_eq!(
-            fs::read(&target).map_err(|error| error.to_string())?,
-            b"outside"
-        );
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn overwrite_rejects_symlink_targets_when_windows_allows_test_symlinks() -> Result<(), String> {
-        use std::os::windows::fs::symlink_file;
-
-        let directory = tempdir().map_err(|error| error.to_string())?;
-        let store = ArtifactStore::open(directory.path().join("artifacts"))?;
-        let target = directory.path().join("outside.mp4");
-        fs::write(&target, b"outside").map_err(|error| error.to_string())?;
-        if let Err(error) = symlink_file(&target, store.directory().join("linked.mp4")) {
-            if error.raw_os_error() == Some(1_314) {
-                return Ok(());
-            }
-            return Err(error.to_string());
-        }
-        let frames = [screenshot(2, 2, [1, 2, 3, 255])?];
-        assert!(store.encode_mp4(&frames, "linked.mp4", 100, true).is_err());
-        assert_eq!(
-            fs::read(&target).map_err(|error| error.to_string())?,
-            b"outside"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn encoding_job_restores_on_drop() -> Result<(), String> {
-        let mut state = RecordingState::default();
-        let session_id = state.start()?;
-        capture_one(&mut state, screenshot(2, 2, [1, 2, 3, 255])?)?;
-        let job = state.begin_encoding()?;
-        assert_eq!(job.session_id(), session_id);
-        state.restore_encoding(job.session);
-        let RecordingPhase::Recording(RecordingSession { frames, .. }) = &state.phase else {
-            return Err("recording frames were not restored".to_owned());
-        };
-        assert_eq!(frames.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn stale_capture_permit_does_not_match_another_session() {
-        let permit = CapturePermit {
-            session_id: 7,
-            pointer_overlay: true,
-        };
-        assert_ne!(
-            permit,
-            CapturePermit {
-                session_id: 8,
-                pointer_overlay: true,
-            }
-        );
-    }
-
-    #[test]
-    fn continuous_capture_stops_after_bounded_failures() -> Result<(), String> {
-        let mut state = RecordingState::default();
-        let session_id = state.start_with_config(true, 100)?;
-
-        assert!(state.note_continuous_capture_failure(session_id, "first failure".to_owned()));
-        assert!(state.note_continuous_capture_failure(session_id, "second failure".to_owned()));
-        assert!(!state.note_continuous_capture_failure(session_id, "third failure".to_owned()));
-        assert!(matches!(
-            state.begin_encoding(),
-            Err(error) if error.contains("third failure")
-        ));
+        let artifact = recorder.finish()?;
+        assert_eq!(artifact.frame_count, 5);
+        assert_eq!(artifact.duration_ms, 166);
+        let file = fs::File::open(&artifact.path).map_err(|error| error.to_string())?;
+        let mp4 = read_mp4(file).map_err(|error| error.to_string())?;
+        let track = mp4
+            .tracks()
+            .values()
+            .find(|track| matches!(track.media_type(), Ok(MediaType::H264)))
+            .ok_or_else(|| "missing H.264 track".to_owned())?;
+        assert_eq!(track.sample_count(), 5);
         Ok(())
     }
 }

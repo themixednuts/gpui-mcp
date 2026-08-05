@@ -1147,6 +1147,10 @@ impl X11WindowStatePtr {
 }
 
 impl PlatformWindow for X11Window {
+    fn native_window_id(&self) -> Option<u32> {
+        Some(self.0.x_window)
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.0.state.borrow().bounds
     }

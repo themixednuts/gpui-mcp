@@ -9,15 +9,12 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["native-screenshot"]
-native-screenshot = ["dep:gpui-mcp-capture"]
+default = []
 test-support = []
 
 [dependencies]
 async-channel.workspace = true
-directories.workspace = true
 gpui.workspace = true
-gpui-mcp-capture = { path = "../gpui-mcp-capture", optional = true }
 gpui-mcp-protocol = { path = "../gpui-mcp-protocol" }
 interprocess.workspace = true
 rand.workspace = true

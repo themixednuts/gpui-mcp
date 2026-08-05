@@ -951,6 +951,11 @@ impl Drop for MacWindow {
 }
 
 impl PlatformWindow for MacWindow {
+    fn native_window_id(&self) -> Option<u32> {
+        let window_number = unsafe { self.0.lock().native_window.windowNumber() };
+        u32::try_from(window_number).ok()
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.0.as_ref().lock().bounds()
     }

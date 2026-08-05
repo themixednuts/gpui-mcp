@@ -1,8 +1,8 @@
 use crate::{
     App, Bounds, Element, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Pixels, Point, Radians, SharedString, Size,
-    StyleRefinement, Styled, TransformationMatrix, Window, geometry::Negate as _, point, px,
-    radians, size,
+    Interactivity, InteractivitySemanticsExt, IntoElement, LayoutId, Pixels, Point, Radians,
+    SemanticAction, SemanticRole, Semantics, SharedString, Size, StyleRefinement, Styled,
+    TransformationMatrix, Window, geometry::Negate as _, point, px, radians, size,
 };
 use util::ResultExt;
 
@@ -48,6 +48,14 @@ impl Element for Svg {
 
     fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
         self.interactivity.source_location()
+    }
+
+    fn semantics(&self, window: &Window, _cx: &App) -> Option<(Semantics, Vec<SemanticAction>)> {
+        self.interactivity.semantic_node(window, SemanticRole::Image)
+    }
+
+    fn semantic_focus_handle(&self) -> Option<crate::FocusHandle> {
+        self.interactivity.tracked_focus_handle.clone()
     }
 
     fn request_layout(

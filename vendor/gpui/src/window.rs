@@ -11,8 +11,9 @@ use crate::{
     MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PromptButton, PromptLevel, Quad,
     Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
-    SharedString, Size, StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
+    FrameObserver, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+    ScaledPixels, Scene, SemanticCheckpoint, SemanticFrame, SemanticNodeId, Shadow, SharedString, Size,
+    StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement,
     TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
@@ -147,6 +148,10 @@ impl WindowInvalidator {
 
     pub fn not_drawing(&self) -> bool {
         self.inner.borrow().draw_phase == DrawPhase::None
+    }
+
+    pub fn is_prepainting(&self) -> bool {
+        self.inner.borrow().draw_phase == DrawPhase::Prepaint
     }
 
     #[track_caller]
@@ -656,6 +661,7 @@ pub(crate) struct DeferredDraw {
     current_view: EntityId,
     priority: usize,
     parent_node: DispatchNodeId,
+    semantic_parent: Option<SemanticNodeId>,
     element_id_stack: SmallVec<[ElementId; 32]>,
     text_style_stack: Vec<TextStyleRefinement>,
     element: Option<AnyElement>,
@@ -685,6 +691,7 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
+    pub(crate) semantics: SemanticFrame,
 }
 
 #[derive(Clone, Default)]
@@ -695,6 +702,7 @@ pub(crate) struct PrepaintStateIndex {
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
     line_layout_index: LineLayoutIndex,
+    semantics_checkpoint: SemanticCheckpoint,
 }
 
 #[derive(Clone, Default)]
@@ -734,6 +742,7 @@ impl Frame {
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
+            semantics: SemanticFrame::default(),
         }
     }
 
@@ -750,6 +759,7 @@ impl Frame {
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
+        self.semantics.begin(false);
         self.focus = None;
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -847,6 +857,7 @@ pub struct Window {
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
+    frame_observers: Vec<Weak<dyn FrameObserver>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
@@ -1227,6 +1238,7 @@ impl Window {
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
+            frame_observers: Vec::new(),
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
@@ -1364,6 +1376,14 @@ impl Window {
     /// Obtain a handle to the window that belongs to this context.
     pub fn window_handle(&self) -> AnyWindowHandle {
         self.handle
+    }
+
+    /// Returns the operating system's stable identifier for this native window.
+    ///
+    /// The identifier is opaque, valid only for this window's lifetime, and may
+    /// be unavailable on platforms without a system window identifier.
+    pub fn native_window_id(&self) -> Option<u32> {
+        self.platform_window.native_window_id()
     }
 
     /// Mark the window as dirty, scheduling it to be redrawn on the next frame.
@@ -1648,6 +1668,52 @@ impl Window {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
     }
 
+    /// Observe rendered-frame semantics and paint a final frame overlay.
+    ///
+    /// The window retains a weak reference. Retain the supplied [`Arc`] for as
+    /// long as observation should continue. Registering the same observer more
+    /// than once has no effect.
+    pub fn observe_frames<O>(&mut self, observer: &Arc<O>)
+    where
+        O: FrameObserver,
+    {
+        let observer: Arc<dyn FrameObserver> = observer.clone();
+        let observers = self.frame_observers();
+        if observers
+            .iter()
+            .any(|registered| Arc::ptr_eq(registered, &observer))
+        {
+            return;
+        }
+        self.frame_observers.push(Arc::downgrade(&observer));
+        if self.invalidator.is_prepainting() {
+            self.next_frame.semantics.enable();
+            observer.frame_started(self);
+        }
+    }
+
+    /// Move focus to the semantic element with the given stable rendered ID.
+    ///
+    /// Returns `false` when the current frame has no matching focusable element.
+    pub fn focus_semantic_element(&mut self, id: &str) -> bool {
+        let Some(handle) = self.rendered_frame.semantics.focus_handle(id) else {
+            return false;
+        };
+        self.focus(&handle);
+        true
+    }
+
+    fn frame_observers(&mut self) -> Vec<Arc<dyn FrameObserver>> {
+        let observers = self
+            .frame_observers
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        self.frame_observers
+            .retain(|observer| observer.strong_count() > 0);
+        observers
+    }
+
     /// Schedule a frame to be drawn on the next animation frame.
     ///
     /// This is useful for elements that need to animate continuously, such as a video player or an animated GIF.
@@ -1920,6 +1986,11 @@ impl Window {
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
         self.requested_autoscroll = None;
+        let frame_observers = self.frame_observers();
+        self.next_frame.semantics.begin(!frame_observers.is_empty());
+        for observer in &frame_observers {
+            observer.frame_started(self);
+        }
 
         // Restore the previously-used input handler.
         if let Some(input_handler) = self.platform_window.take_input_handler() {
@@ -2067,6 +2138,13 @@ impl Window {
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
+        self.next_frame.semantics.finish();
+        let frame_observers = self.frame_observers();
+        for observer in &frame_observers {
+            observer.semantics_updated(&self.next_frame.semantics);
+            observer.paint_started();
+        }
+
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
@@ -2082,6 +2160,11 @@ impl Window {
             drag_element.paint(self, cx);
         } else if let Some(mut tooltip_element) = tooltip_element {
             tooltip_element.paint(self, cx);
+        }
+
+        for observer in &frame_observers {
+            observer.paint_overlay(self, cx);
+            observer.frame_finished();
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -2170,6 +2253,10 @@ impl Window {
             self.next_frame
                 .dispatch_tree
                 .set_active_node(deferred_draw.parent_node);
+            let pushed_semantic_parent = self
+                .next_frame
+                .semantics
+                .push_parent(deferred_draw.semantic_parent.clone());
 
             let prepaint_start = self.prepaint_index();
             if let Some(element) = deferred_draw.element.as_mut() {
@@ -2182,6 +2269,7 @@ impl Window {
                 self.reuse_prepaint(deferred_draw.prepaint_range.clone());
             }
             let prepaint_end = self.prepaint_index();
+            self.next_frame.semantics.exit(pushed_semantic_parent);
             deferred_draw.prepaint_range = prepaint_start..prepaint_end;
         }
         assert_eq!(
@@ -2229,10 +2317,16 @@ impl Window {
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             line_layout_index: self.text_system.layout_index(),
+            semantics_checkpoint: self.next_frame.semantics.checkpoint(),
         }
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+        self.next_frame.semantics.reuse(
+            &self.rendered_frame.semantics,
+            &range.start.semantics_checkpoint,
+            &range.end.semantics_checkpoint,
+        );
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
@@ -2270,6 +2364,7 @@ impl Window {
                 .map(|deferred_draw| DeferredDraw {
                     current_view: deferred_draw.current_view,
                     parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
+                    semantic_parent: deferred_draw.semantic_parent.clone(),
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
                     priority: deferred_draw.priority,
@@ -2474,6 +2569,9 @@ impl Window {
             self.next_frame
                 .accessed_element_states
                 .truncate(index.accessed_element_states_index);
+            self.next_frame
+                .semantics
+                .restore(&index.semantics_checkpoint);
             self.text_system.truncate_layouts(index.line_layout_index);
         }
         result
@@ -2767,6 +2865,7 @@ impl Window {
         self.next_frame.deferred_draws.push(DeferredDraw {
             current_view: self.current_view(),
             parent_node,
+            semantic_parent: self.next_frame.semantics.current_parent(),
             element_id_stack: self.element_id_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
             priority,
@@ -3414,6 +3513,30 @@ impl Window {
                 .input_handlers
                 .push(Some(PlatformInputHandler::new(cx, Box::new(input_handler))));
         }
+    }
+
+    /// Insert text through the focused element's active input handler.
+    ///
+    /// Returns `false` when the current frame has no active text input handler.
+    pub fn insert_input_text(&mut self, text: &str, cx: &mut App) -> bool {
+        let Some(mut input_handler) = self.platform_window.take_input_handler() else {
+            return false;
+        };
+        input_handler.dispatch_input(text, self, cx);
+        self.platform_window.set_input_handler(input_handler);
+        true
+    }
+
+    /// Replace the focused element's complete document through its active input handler.
+    ///
+    /// Returns `false` when the active handler cannot provide its document range.
+    pub fn replace_input_text(&mut self, text: &str, cx: &mut App) -> bool {
+        let Some(mut input_handler) = self.platform_window.take_input_handler() else {
+            return false;
+        };
+        let replaced = input_handler.replace_all_text(text, self, cx);
+        self.platform_window.set_input_handler(input_handler);
+        replaced
     }
 
     /// Register a mouse event listener on the window for the next frame. The type of event

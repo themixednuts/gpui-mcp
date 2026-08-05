@@ -21,9 +21,9 @@ use crate::{
     Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext,
     KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent,
     MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Overflow,
-    ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
-    size,
+    InteractivitySemanticsExt, ParentElement, Pixels, Point, Render, ScrollWheelEvent,
+    SemanticAction, SemanticRole, Semantics, SharedString, Size, Style, StyleRefinement, Styled,
+    Task, TooltipId, Visibility, Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use refineable::Refineable;
@@ -1310,6 +1310,15 @@ impl Element for Div {
         self.interactivity.source_location()
     }
 
+    fn semantics(&self, window: &Window, _cx: &App) -> Option<(Semantics, Vec<SemanticAction>)> {
+        self.interactivity
+            .semantic_node(window, SemanticRole::Generic)
+    }
+
+    fn semantic_focus_handle(&self) -> Option<FocusHandle> {
+        self.interactivity.tracked_focus_handle.clone()
+    }
+
     #[stacksafe]
     fn request_layout(
         &mut self,
@@ -1478,6 +1487,7 @@ impl IntoElement for Div {
 pub struct Interactivity {
     /// The element ID of the element. In id is required to support a stateful subset of the interactivity such as on_click.
     pub element_id: Option<ElementId>,
+    pub(crate) semantics: Semantics,
     /// Whether the element was clicked. This will only be present after layout.
     pub active: Option<bool>,
     /// Whether the element was hovered. This will only be present after paint if an hitbox
@@ -2942,6 +2952,18 @@ where
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
         self.element.source_location()
+    }
+
+    fn semantics(&self, window: &Window, cx: &App) -> Option<(Semantics, Vec<SemanticAction>)> {
+        self.element.semantics(window, cx)
+    }
+
+    fn semantic_text(&self) -> Option<&str> {
+        self.element.semantic_text()
+    }
+
+    fn semantic_focus_handle(&self) -> Option<FocusHandle> {
+        self.element.semantic_focus_handle()
     }
 
     fn request_layout(

@@ -4,13 +4,17 @@
 //! logical GPUI pixels relative to the target window.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
+use std::str::FromStr;
 
+use directories::BaseDirs;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Current wire protocol version.
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 12;
 /// Maximum accepted request frame, including its four-byte length prefix.
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// Maximum accepted response frame. Screenshots are base64 encoded inside it.
@@ -47,6 +51,178 @@ pub const MAX_APPLICATION_COMMANDS: usize = 64;
 pub const MAX_APPLICATION_COMMAND_SCHEMA_BYTES: usize = 32 * 1024;
 /// Maximum serialized output bytes returned by one command.
 pub const MAX_APPLICATION_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
+/// Maximum key events accepted in one foreground input operation.
+pub const MAX_KEY_SEQUENCE: usize = 1_024;
+
+/// A syntactically valid application identifier used for local discovery.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct AppId(String);
+
+impl AppId {
+    /// Parse an application identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidAppId`] unless `value` contains 1–64 ASCII letters,
+    /// digits, dots, underscores, or hyphens.
+    pub fn new(value: impl Into<String>) -> Result<Self, InvalidAppId> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(InvalidAppId);
+        }
+        Ok(Self(value))
+    }
+
+    /// Return the validated identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AppId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AppId {
+    type Err = InvalidAppId;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for AppId {
+    type Error = InvalidAppId;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for AppId {
+    type Error = InvalidAppId;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for AppId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// An invalid application identifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("application ID must contain 1-64 ASCII letters, digits, '.', '_' or '-'")]
+pub struct InvalidAppId;
+
+macro_rules! nonzero_id {
+    ($name:ident, $integer:ty, $nonzero:ty, $description:literal) => {
+        #[doc = $description]
+        #[derive(
+            Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+        )]
+        #[serde(transparent)]
+        pub struct $name($nonzero);
+
+        impl $name {
+            /// Smallest valid identifier value.
+            pub const MIN: Self = Self(<$nonzero>::MIN);
+
+            #[doc = concat!("Construct a nonzero ", $description, ".")]
+            #[must_use]
+            pub const fn new(value: $integer) -> Option<Self> {
+                match <$nonzero>::new(value) {
+                    Some(value) => Some(Self(value)),
+                    None => None,
+                }
+            }
+
+            /// Return the underlying nonzero integer.
+            #[must_use]
+            pub const fn get(self) -> $integer {
+                self.0.get()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(formatter)
+            }
+        }
+
+        impl fmt::LowerHex for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::LowerHex::fmt(&self.0.get(), formatter)
+            }
+        }
+    };
+}
+
+nonzero_id!(
+    ProcessId,
+    u32,
+    NonZeroU32,
+    "operating-system process identifier"
+);
+nonzero_id!(
+    InstanceId,
+    u64,
+    NonZeroU64,
+    "bridge-lifetime instance identifier"
+);
+nonzero_id!(
+    NativeWindowId,
+    u32,
+    NonZeroU32,
+    "operating-system window identifier"
+);
+nonzero_id!(RequestId, u64, NonZeroU64, "wire request identifier");
+
+/// Resolve the private cross-process runtime root used by every workspace binary.
+///
+/// Linux uses the owner-scoped XDG runtime directory. Windows and macOS use
+/// their platform-local application-data directory.
+///
+/// # Errors
+///
+/// Returns [`RuntimePathError`] when the operating system does not expose the
+/// required owner-scoped directory. No temporary-directory fallback is used.
+pub fn runtime_root() -> Result<PathBuf, RuntimePathError> {
+    let base = BaseDirs::new().ok_or(RuntimePathError::Unavailable)?;
+    #[cfg(target_os = "linux")]
+    let root = base
+        .runtime_dir()
+        .ok_or(RuntimePathError::Unavailable)?
+        .to_path_buf();
+    #[cfg(not(target_os = "linux"))]
+    let root = base.data_local_dir().to_path_buf();
+    Ok(root.join("gpui-mcp"))
+}
+
+/// The operating system did not expose a secure runtime location.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum RuntimePathError {
+    /// No owner-scoped runtime/application-data directory was available.
+    #[error("the operating system did not expose an owner-scoped runtime directory")]
+    Unavailable,
+}
 
 /// A point in logical window pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -269,7 +445,7 @@ impl Default for NodeState {
     }
 }
 
-/// One annotated element in the latest GPUI frame.
+/// One semantic element in the latest rendered GPUI frame.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct UiNode {
     /// Stable application-provided identifier.
@@ -299,7 +475,7 @@ pub struct UiNode {
     pub metadata: BTreeMap<String, String>,
 }
 
-/// A stable snapshot of the latest annotated GPUI frame.
+/// A stable snapshot of the latest rendered GPUI frame.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct UiTree {
     /// Monotonically increasing frame generation.
@@ -353,10 +529,10 @@ pub enum MouseButton {
     Middle,
 }
 
-/// Delta carried by a synthetic native scroll-wheel event.
+/// Delta carried by a synthetic GPUI scroll-wheel event.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "unit", rename_all = "snake_case")]
-pub enum NativeScrollDelta {
+pub enum PointerScrollDelta {
     /// Exact logical-pixel delta.
     Pixels {
         /// Horizontal logical-pixel delta.
@@ -373,18 +549,18 @@ pub enum NativeScrollDelta {
     },
 }
 
-/// One synthetic platform event dispatched through GPUI's native pointer pipeline.
+/// One synthetic platform event dispatched through GPUI's pointer pipeline.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum NativeInputCommand {
-    /// Move the native pointer state to a window-relative logical point.
+pub enum PointerCommand {
+    /// Move GPUI's pointer state to a window-relative logical point.
     MouseMove {
         /// Target point.
         point: Point,
         /// Button held during the move, when this is part of a drag.
         pressed_button: Option<MouseButton>,
     },
-    /// Press a native mouse button at a window-relative logical point.
+    /// Press a mouse button at a window-relative logical point.
     MouseDown {
         /// Target point.
         point: Point,
@@ -393,7 +569,7 @@ pub enum NativeInputCommand {
         /// Click count from one through three.
         click_count: u8,
     },
-    /// Release a native mouse button at a window-relative logical point.
+    /// Release a mouse button at a window-relative logical point.
     MouseUp {
         /// Target point.
         point: Point,
@@ -402,48 +578,30 @@ pub enum NativeInputCommand {
         /// Click count from one through three.
         click_count: u8,
     },
-    /// Dispatch a native scroll-wheel event at a window-relative logical point.
+    /// Dispatch a scroll-wheel event at a window-relative logical point.
     ScrollWheel {
-        /// Pointer position used for native hit testing.
+        /// Pointer position used for GPUI hit testing.
         point: Point,
         /// Pixel or line delta passed to GPUI.
-        delta: NativeScrollDelta,
+        delta: PointerScrollDelta,
     },
 }
 
-/// Semantic input command dispatched on the GPUI foreground executor.
+/// Keyboard input dispatched on the GPUI foreground executor.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InputCommand {
-    /// Click a window-relative point.
-    Click {
-        /// Target point.
-        point: Point,
-        /// Pointer button.
-        button: MouseButton,
-        /// One for click, two for double-click.
-        count: u8,
-    },
-    /// Hover a window-relative point.
-    Hover {
-        /// Target point.
-        point: Point,
-    },
-    /// Drag between two points.
-    Drag {
-        /// Start point.
-        from: Point,
-        /// End point.
-        to: Point,
-        /// Number of interpolation steps, from 1 through 120.
-        steps: u8,
-    },
     /// Dispatch one GPUI keystroke string.
     Key {
         /// GPUI keystroke syntax, such as `ctrl-a` or `enter`.
         keystroke: String,
     },
-    /// Insert text using GPUI key events.
+    /// Dispatch a bounded sequence of GPUI keystrokes in one UI-thread operation.
+    KeySequence {
+        /// GPUI keystroke strings in dispatch order.
+        keystrokes: Vec<String>,
+    },
+    /// Insert text through the active GPUI input handler.
     TypeText {
         /// Text to type.
         text: String,
@@ -452,85 +610,6 @@ pub enum InputCommand {
     ReplaceText {
         /// Text to insert.
         text: String,
-    },
-    /// Scroll at a point by a logical-pixel delta.
-    Scroll {
-        /// Pointer position used for hit testing.
-        point: Point,
-        /// Horizontal pixel delta.
-        delta_x: f32,
-        /// Vertical pixel delta.
-        delta_y: f32,
-    },
-}
-
-/// Exact semantic action invoked against one stable node identifier.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SemanticAction {
-    /// Click or activate the node.
-    Click {
-        /// Requested pointer button.
-        button: MouseButton,
-        /// Click count from one through three.
-        count: u8,
-    },
-    /// Move keyboard focus to the node.
-    Focus,
-    /// Notify the node of semantic hover.
-    Hover,
-    /// Drag from the node to a window-relative destination.
-    Drag {
-        /// Window-relative destination.
-        to: Point,
-        /// Requested interpolation steps from one through 120.
-        steps: u8,
-    },
-    /// Scroll the node by logical-pixel deltas.
-    Scroll {
-        /// Horizontal logical-pixel delta.
-        delta_x: f32,
-        /// Vertical logical-pixel delta.
-        delta_y: f32,
-    },
-    /// Replace editable text through application logic.
-    SetText {
-        /// Replacement UTF-8 text.
-        text: String,
-    },
-    /// Replace a value through application logic.
-    SetValue {
-        /// Replacement display value.
-        value: String,
-    },
-}
-
-impl SemanticAction {
-    /// Return the capability that a target node must advertise.
-    #[must_use]
-    pub const fn required_node_action(&self) -> NodeAction {
-        match self {
-            Self::Click { .. } => NodeAction::Click,
-            Self::Focus => NodeAction::Focus,
-            Self::Hover => NodeAction::Hover,
-            Self::Drag { .. } => NodeAction::Drag,
-            Self::Scroll { .. } => NodeAction::Scroll,
-            Self::SetText { .. } => NodeAction::SetText,
-            Self::SetValue { .. } => NodeAction::SetValue,
-        }
-    }
-}
-
-/// Application-reported result of a semantic action handler.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum ActionOutcome {
-    /// The application accepted and handled the action.
-    Handled,
-    /// The application deliberately declined the action.
-    Rejected {
-        /// Bounded, non-sensitive explanation.
-        reason: String,
     },
 }
 
@@ -594,6 +673,27 @@ pub struct FrameStats {
     /// This is not rendering capacity for an event-driven UI: an idle application intentionally
     /// has a low value because it does not continuously request frames.
     pub estimated_fps: f64,
+}
+
+/// Current GPUI client-area geometry needed to map logical regions into a native window capture.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowGeometry {
+    /// Drawable client area in global logical display coordinates.
+    pub content_bounds: Rect,
+    /// Physical pixels per logical display pixel for this window.
+    pub scale_factor: f32,
+}
+
+impl WindowGeometry {
+    /// Return whether the geometry can safely be used for capture mapping.
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        self.content_bounds.is_valid()
+            && self.content_bounds.width > 0.0
+            && self.content_bounds.height > 0.0
+            && self.scale_factor.is_finite()
+            && self.scale_factor > 0.0
+    }
 }
 
 /// A PNG screenshot returned without touching the filesystem.
@@ -769,7 +869,7 @@ pub struct EndpointDescriptor {
     /// Wire protocol version.
     pub protocol_version: u16,
     /// Validated application identifier.
-    pub app_id: String,
+    pub app_id: AppId,
     /// Human-readable application name.
     pub app_name: String,
     /// Random, non-secret identifier for this bridge lifetime.
@@ -777,15 +877,18 @@ pub struct EndpointDescriptor {
     /// Unlike `app_id`, this distinguishes concurrently running windows of the
     /// same application. It is safe to expose to MCP clients and must never be
     /// used as an authentication credential.
-    pub instance_id: u64,
+    pub instance_id: InstanceId,
     /// Process identifier that owns the endpoint.
-    pub pid: u32,
+    pub pid: ProcessId,
     /// Owner-restricted local socket or named-pipe endpoint.
     pub endpoint: LocalEndpoint,
     /// Random per-process bearer secret.
     pub token: String,
-    /// Exact native title used for screenshot window matching.
-    pub window_title: String,
+    /// Stable operating-system window identifier used for native capture.
+    ///
+    /// This is absent only when the active platform cannot expose an identifier;
+    /// in that case the screenshot capability must also be absent.
+    pub native_window_id: Option<NativeWindowId>,
     /// Supported operations.
     pub capabilities: Capabilities,
 }
@@ -812,7 +915,7 @@ pub struct WireRequest {
     /// Must equal [`PROTOCOL_VERSION`].
     pub protocol_version: u16,
     /// Caller-selected nonzero correlation identifier.
-    pub request_id: u64,
+    pub request_id: RequestId,
     /// Endpoint bearer secret.
     pub token: String,
     /// Requested operation.
@@ -827,24 +930,20 @@ pub enum Operation {
     Ping,
     /// Return the latest semantic tree.
     GetTree,
-    /// Dispatch semantic input on the UI thread.
+    /// Dispatch keyboard input on the UI thread.
     Input {
-        /// Semantic input command.
+        /// Keyboard input command.
         command: InputCommand,
     },
-    /// Dispatch one synthetic platform event through GPUI's native input pipeline.
-    NativeInput {
-        /// Native platform event command.
-        command: NativeInputCommand,
+    /// Dispatch one synthetic platform event through GPUI's pointer pipeline.
+    PointerInput {
+        /// Pointer event command.
+        command: PointerCommand,
     },
-    /// Invoke one exact, generation-checked semantic node handler.
-    Invoke {
-        /// Stable target node identifier.
+    /// Move focus to one focusable element from the current semantic frame.
+    Focus {
+        /// Stable semantic node identifier.
         node_id: String,
-        /// Tree generation used to select the node.
-        expected_generation: u64,
-        /// Semantic action to invoke.
-        action: SemanticAction,
     },
     /// Wait without polling until a newer semantic tree is published.
     WaitForTree {
@@ -863,11 +962,8 @@ pub enum Operation {
     /// Request a new GPUI frame and return the last completed-frame token observed before the
     /// refresh was scheduled.
     Refresh,
-    /// Capture a screenshot.
-    Screenshot {
-        /// Screenshot target.
-        target: ScreenshotTarget,
-    },
+    /// Return current GPUI client-area geometry for native region capture.
+    GetWindowGeometry,
     /// Replace the current highlight set.
     SetHighlights {
         /// Bounded highlight list.
@@ -922,9 +1018,9 @@ pub enum BridgeResult {
     /// Liveness information.
     Pong {
         /// Application identifier.
-        app_id: String,
+        app_id: AppId,
         /// Owning process identifier.
-        pid: u32,
+        pid: ProcessId,
         /// Protocol version.
         protocol_version: u16,
     },
@@ -932,10 +1028,8 @@ pub enum BridgeResult {
     Tree(UiTree),
     /// Operation completed without a richer result.
     Ack,
-    /// Result returned by an exact semantic handler.
-    Action(ActionOutcome),
-    /// Captured PNG.
-    Screenshot(Screenshot),
+    /// Current GPUI client-area geometry.
+    WindowGeometry(WindowGeometry),
     /// Frame timing statistics.
     FrameStats(FrameStats),
     /// Current window-relative logical pointer position.
@@ -968,12 +1062,8 @@ pub enum ErrorCode {
     InvalidRequest,
     /// A requested semantic node was not present.
     NotFound,
-    /// The target semantic tree changed after the caller selected it.
-    StaleGeneration,
     /// The live document changed after the caller selected its base revision.
     StaleRevision,
-    /// The application rejected an otherwise valid semantic action.
-    Rejected,
     /// The operation is not available in this build or environment.
     Unsupported,
     /// The bridge is at its configured capacity.
@@ -1010,7 +1100,7 @@ pub struct WireResponse {
     /// Protocol version used by the bridge.
     pub protocol_version: u16,
     /// Request correlation identifier.
-    pub request_id: u64,
+    pub request_id: RequestId,
     /// Successful result, mutually exclusive with `error`.
     pub result: Option<BridgeResult>,
     /// Sanitized error, mutually exclusive with `result`.
@@ -1020,7 +1110,7 @@ pub struct WireResponse {
 impl WireResponse {
     /// Construct a successful response.
     #[must_use]
-    pub fn success(request_id: u64, result: BridgeResult) -> Self {
+    pub fn success(request_id: RequestId, result: BridgeResult) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
             request_id,
@@ -1031,7 +1121,7 @@ impl WireResponse {
 
     /// Construct an error response.
     #[must_use]
-    pub fn failure(request_id: u64, error: BridgeError) -> Self {
+    pub fn failure(request_id: RequestId, error: BridgeError) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
             request_id,
@@ -1043,7 +1133,10 @@ impl WireResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{Point, Rect, WireResponse};
+    use super::{
+        AppId, Capabilities, EndpointDescriptor, InstanceId, LocalEndpoint, NativeWindowId,
+        PROTOCOL_VERSION, Point, ProcessId, Rect, RequestId, WireResponse,
+    };
 
     #[test]
     fn rectangle_validation_rejects_non_finite_and_negative_values() {
@@ -1077,14 +1170,15 @@ mod tests {
     }
 
     #[test]
-    fn response_has_exactly_one_outcome() {
+    fn response_has_exactly_one_outcome() -> Result<(), &'static str> {
         let response = WireResponse::failure(
-            42,
+            RequestId::new(42).ok_or("request ID must be nonzero")?,
             super::BridgeError::new(super::ErrorCode::NotFound, "missing"),
         );
-        assert_eq!(response.request_id, 42);
+        assert_eq!(response.request_id.get(), 42);
         assert!(response.result.is_none());
         assert!(response.error.is_some());
+        Ok(())
     }
 
     #[test]
@@ -1097,5 +1191,43 @@ mod tests {
             }
             .is_valid()
         );
+    }
+
+    #[test]
+    fn endpoint_identity_round_trips_exactly() -> Result<(), Box<dyn std::error::Error>> {
+        let descriptor = EndpointDescriptor {
+            protocol_version: PROTOCOL_VERSION,
+            app_id: AppId::new("app")?,
+            app_name: "App".to_owned(),
+            instance_id: InstanceId::new(1).ok_or("instance ID must be nonzero")?,
+            pid: ProcessId::new(2).ok_or("process ID must be nonzero")?,
+            endpoint: LocalEndpoint::Namespaced {
+                name: "test".to_owned(),
+            },
+            token: "secret".to_owned(),
+            native_window_id: NativeWindowId::new(3),
+            capabilities: Capabilities::default(),
+        };
+        let value = serde_json::to_value(&descriptor)?;
+        let parsed: EndpointDescriptor = serde_json::from_value(value)?;
+
+        assert_eq!(parsed, descriptor);
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_identity_rejects_zero_ids() {
+        let value = serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "app_id": "app",
+            "app_name": "App",
+            "instance_id": 0,
+            "pid": 2,
+            "endpoint": { "kind": "namespaced", "name": "test" },
+            "token": "secret",
+            "native_window_id": 3,
+            "capabilities": { "available": [] }
+        });
+        assert!(serde_json::from_value::<EndpointDescriptor>(value).is_err());
     }
 }

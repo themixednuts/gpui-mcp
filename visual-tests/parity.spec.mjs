@@ -67,8 +67,13 @@ async function waitForReady(child, diagnostics) {
   child.stdout.setEncoding('utf8');
   for await (const chunk of child.stdout) {
     output += chunk;
-    if (output.split(/\r?\n/u).some((line) => line.startsWith('READY '))) {
-      return;
+    const ready = output.split(/\r?\n/u).find((line) => line.startsWith('READY '));
+    if (ready) {
+      const [, pid, windowId] = ready.split(' ');
+      if (!/^\d+$/u.test(pid) || !/^\d+$/u.test(windowId)) {
+        throw new Error(`invalid GPUI readiness record: ${ready}`);
+      }
+      return { pid, windowId };
     }
   }
   const errorOutput = diagnostics().trim();
@@ -258,13 +263,15 @@ for (const testCase of cases) {
     });
 
     try {
-      await waitForReady(fixture, () => stderr);
+      const ready = await waitForReady(fixture, () => stderr);
       execFileSync(
         executable,
         [
           'capture',
           '--pid',
-          String(fixture.pid),
+          ready.pid,
+          '--window-id',
+          ready.windowId,
           '--output',
           gpuiPath,
           '--raw-output',

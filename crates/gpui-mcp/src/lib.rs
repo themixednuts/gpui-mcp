@@ -1,47 +1,41 @@
 //! Hardened, cross-platform MCP automation for GPUI applications.
 //!
-//! Install [`BridgeHandle`] for a window, retain the handle for that window's
-//! lifetime, and annotate the rendered element tree with [`McpElementExt`]. All
-//! control stays on owner-restricted native local IPC and authenticated requests are dispatched through
-//! GPUI's foreground executor.
+//! Install [`BridgeHandle`] for a window and retain it for that window's
+//! lifetime. GPUI emits semantics automatically from stable element IDs,
+//! registered interaction behavior, and optional semantic extension traits.
+//! Control stays on owner-restricted native local IPC and authenticated
+//! requests are dispatched through GPUI's foreground executor.
 
-mod capture;
-mod element;
 mod input;
+mod observer;
 mod registry;
 mod service;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use element::{McpElementExt, NodeEvent, NodeSpec, SemanticElement};
-pub use gpui_mcp_protocol::{
-    ActionOutcome, ApplicationCommandDescriptor, ApplicationCommandResult, BridgeError,
-    ContextResource, ContextResourceDescriptor, ErrorCode, LiveDocument, LiveDocumentDiagnostic,
-    LiveDocumentPreview, LiveDocumentSource, LogEntry, MAX_LABEL_BYTES,
-    MAX_LIVE_DOCUMENT_DIAGNOSTICS, MAX_LIVE_DOCUMENT_SOURCE_BYTES, MAX_TEXT_BYTES, NodeAction,
-    NodeState, Point, Rect, Role, TextInfo, TextRange, UiNode, UiTree, ValueInfo,
-};
-// `MouseButton` is a field of the public `NodeEvent::Click`, so applications
-// matching on click buttons need it unconditionally.
 pub use gpui_mcp_protocol::MouseButton;
-#[cfg(feature = "test-support")]
-pub use gpui_mcp_protocol::SemanticAction;
+pub use gpui_mcp_protocol::{
+    AppId, ApplicationCommandDescriptor, ApplicationCommandResult, BridgeError, ContextResource,
+    ContextResourceDescriptor, ErrorCode, InstanceId, LiveDocument, LiveDocumentDiagnostic,
+    LiveDocumentPreview, LiveDocumentSource, LogEntry, MAX_LABEL_BYTES,
+    MAX_LIVE_DOCUMENT_DIAGNOSTICS, MAX_LIVE_DOCUMENT_SOURCE_BYTES, MAX_TEXT_BYTES, NativeWindowId,
+    NodeAction, NodeState, Point, ProcessId, Rect, RequestId, Role, TextInfo, TextRange, UiNode,
+    UiTree, ValueInfo,
+};
 pub use service::{
-    ApplicationCommandHostError, ApplicationCommandRequest, ApplicationCommandResponse,
-    BridgeConfig, BridgeHandle, ContextResourceHostError, ContextResourceRequest,
-    ContextResourceResponse, LiveDocumentHostError, LiveDocumentRequest, LiveDocumentResponse,
-    StartError,
+    ApplicationCommandRequest, ApplicationCommandResponse, BridgeConfig, BridgeConfigError,
+    BridgeHandle, ContextResourceRequest, ContextResourceResponse, HostError, LiveDocumentRequest,
+    LiveDocumentResponse, StartError,
 };
 
+use observer::BridgeObserver;
 use registry::SharedState;
 
-static NEXT_ISOLATED_INSTANCE_ID: AtomicU64 = AtomicU64::new(1 << 63);
-
-/// Cloneable application-side handle used when annotating elements and publishing logs.
+/// Cloneable application-side handle for semantic snapshots and diagnostic logs.
 #[derive(Clone)]
 pub struct Automation {
     pub(crate) state: Arc<SharedState>,
+    observer: Arc<BridgeObserver>,
 }
 
 impl Automation {
@@ -52,9 +46,20 @@ impl Automation {
     /// background thread is created.
     #[must_use]
     pub fn isolated() -> Self {
-        Self {
-            state: SharedState::new(NEXT_ISOLATED_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)),
-        }
+        Self::new(SharedState::new())
+    }
+
+    fn new(state: Arc<SharedState>) -> Self {
+        let observer = BridgeObserver::new(&state);
+        Self { state, observer }
+    }
+
+    /// Attach automatic semantic observation to a window.
+    ///
+    /// Calling this more than once for the same automation and window is a no-op.
+    pub fn attach(&self, window: &mut gpui::Window) {
+        window.observe_frames(&self.observer);
+        window.refresh();
     }
 
     /// Create isolated in-process automation without IPC for GPUI runtime tests.
@@ -85,10 +90,10 @@ impl Automation {
     /// Return the count of the most recently completed root-paint frame.
     ///
     /// This is available only to deterministic runtime tests. A frame is not
-    /// counted until the annotated root has finished painting.
+    /// counted until the observed window has finished painting.
     #[cfg(feature = "test-support")]
     #[must_use]
-    pub fn completed_test_frame_count(&self) -> u64 {
+    pub fn completed_frames(&self) -> u64 {
         self.state.frame_stats().frame_count
     }
 
@@ -104,24 +109,5 @@ impl Automation {
     #[must_use]
     pub fn logs(&self, limit: u16, min_level: Option<&str>) -> Vec<LogEntry> {
         self.state.logs(limit, min_level)
-    }
-
-    /// Dispatch one semantic action directly through the GPUI foreground test context.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same stale-generation, missing-node, unsupported-action, or
-    /// handler failure exposed by the production bridge.
-    #[cfg(feature = "test-support")]
-    pub fn dispatch_test_action(
-        &self,
-        node_id: &str,
-        expected_generation: u64,
-        action: &SemanticAction,
-        window: &mut gpui::Window,
-        cx: &mut gpui::App,
-    ) -> Result<ActionOutcome, BridgeError> {
-        self.state
-            .dispatch_action(node_id, expected_generation, action, window, cx)
     }
 }

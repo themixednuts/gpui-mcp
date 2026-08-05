@@ -9,12 +9,13 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["cli", "json", "ron"]
-cli = ["dep:clap", "ron"]
-dev-watch = ["dep:notify", "ron"]
+default = ["runtime", "json", "ron"]
+runtime = ["dep:gpui", "dep:gpui-component", "dep:gpui-mcp", "dep:htmlswap"]
+dev-watch = ["runtime", "dep:notify", "ron"]
 json = ["dep:serde_json"]
 ron = ["dep:ron"]
 visual-parity = [
+    "runtime",
     "dep:anyhow",
     "dep:clap",
     "dep:gpui-mcp-capture",
@@ -25,22 +26,17 @@ visual-parity = [
 [dependencies]
 anyhow = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
-gpui.workspace = true
-gpui-component.workspace = true
-gpui-mcp = { path = "../gpui-mcp", default-features = false }
+gpui = { workspace = true, optional = true }
+gpui-component = { workspace = true, optional = true }
+gpui-mcp = { path = "../gpui-mcp", default-features = false, optional = true }
 gpui-mcp-capture = { path = "../gpui-mcp-capture", optional = true }
-htmlswap.workspace = true
+htmlswap = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }
 ron = { workspace = true, optional = true }
 serde.workspace = true
 serde_json = { workspace = true, optional = true }
 thiserror.workspace = true
-
-[[bin]]
-name = "gpui-mcp"
-path = "src/bin/gpui-mcp.rs"
-required-features = ["cli"]
 
 [[bin]]
 name = "gpui-mcp-html-visual"

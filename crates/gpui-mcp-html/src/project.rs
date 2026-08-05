@@ -157,7 +157,7 @@ impl ProjectSnapshot {
 
     /// Convert this disk snapshot to the same complete bundle used by MCP preview.
     #[must_use]
-    pub fn into_live_document_source(self) -> LiveDocumentSource {
+    pub fn into_document(self) -> LiveDocumentSource {
         LiveDocumentSource {
             html: self.html,
             css: self.css,

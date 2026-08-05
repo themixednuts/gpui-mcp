@@ -2,147 +2,106 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Runtime Studio</title>
+  <title>Ember</title>
 </head>
 <body id="app">
-  <header id="top-header">
-    <div id="brand">
-      <div id="brand-mark"><span></span><span></span></div>
-      <div id="brand-copy">
-        <h1>Runtime Studio</h1>
-        <p>Pure HTML compiled into a native GPUI application</p>
-      </div>
-    </div>
-    <div id="runtime-badge"><span id="live-dot"></span><strong>LIVE GPUI</strong></div>
+  <header id="titlebar">
+    <div id="traffic-lights"><span></span><span></span><span></span></div>
+    <div id="project-switcher"><strong>ember</strong><span>/</span><span>gpui-mcp</span><small>⌄</small></div>
+    <nav id="window-tools">
+      <button id="toggle-explorer" class="icon-button" type="button" title="Toggle Explorer">▧</button>
+      <button id="toggle-panel" class="icon-button" type="button" title="Toggle Panel">▤</button>
+    </nav>
   </header>
 
-  <main id="shell">
-    <aside id="sidebar">
-      <p class="eyebrow">WORKSPACE</p>
-      <nav id="navigation">
-        <div class="nav-item active"><span class="nav-glyph"></span><strong>Overview</strong></div>
-        <div class="nav-item"><span class="nav-glyph"></span><span>Components</span></div>
-        <div class="nav-item"><span class="nav-glyph"></span><span>Bindings</span></div>
-        <div class="nav-item"><span class="nav-glyph"></span><span>Automation</span></div>
+  <main id="workbench">
+    <aside id="activity-bar">
+      <button class="activity active" type="button" title="Explorer">⌑</button>
+      <button class="activity" type="button" title="Search">⌕</button>
+      <button class="activity" type="button" title="Source Control">⑂</button>
+      <button class="activity" type="button" title="Extensions">⊞</button>
+      <div class="activity-spacer"></div>
+      <button class="activity" type="button" title="Account">◎</button>
+      <button class="activity" type="button" title="Settings">⚙</button>
+    </aside>
+
+    <aside id="explorer">
+      <div class="pane-heading"><span>PROJECT</span><button type="button" title="New file">＋</button></div>
+      <div id="project-root"><span class="chevron">⌄</span><strong>ember</strong></div>
+      <nav id="file-tree">
+        <details id="src-folder" class="folder" open>
+          <summary id="src-folder-summary"><span class="chevron">⌄</span><span>src</span></summary>
+          <div class="folder-children">
+            <button id="file-main" class="file active" type="button"><span class="rust-icon">R</span><span>main.rs</span><small>M</small></button>
+            <button id="file-theme" class="file" type="button"><span class="rust-icon">R</span><span>theme.rs</span></button>
+          </div>
+        </details>
+        <details id="assets-folder" class="folder">
+          <summary id="assets-folder-summary"><span class="chevron">›</span><span>assets</span></summary>
+          <div class="folder-children"><button class="file" type="button"><span class="css-icon">C</span><span>icons.css</span></button></div>
+        </details>
+        <button id="file-readme" class="file root-file" type="button"><span class="md-icon">M</span><span>README.md</span></button>
+        <button class="file root-file" type="button"><span class="toml-icon">T</span><span>Cargo.toml</span></button>
       </nav>
-      <div id="sidebar-card">
-        <strong>MCP connected</strong>
-        <p>Semantic actions are available for every instrumented element.</p>
+      <div id="outline-section">
+        <div class="section-title"><span>OUTLINE</span><small>⌃</small></div>
+        <div class="symbol-row"><span class="symbol">S</span><span>Workspace</span></div>
+        <div class="symbol-row nested"><span class="symbol method">ƒ</span><span>render</span></div>
       </div>
     </aside>
 
-    <section id="workspace">
-      <div id="toolbar">
-        <div id="toolbar-copy">
-          <h2>Application pipeline</h2>
-          <p>Rendered at runtime from app.html and app.css</p>
+    <section id="editor-workspace">
+      <div id="tabs">
+        <button class="editor-tab active" type="button"><span class="rust-icon">R</span><strong id="active-file-tab">main.rs</strong><small>×</small></button>
+        <button id="new-tab" class="tab-add" type="button">＋</button>
+        <div class="tab-spacer"></div>
+        <button class="tab-tool" type="button" title="Split editor">▥</button>
+      </div>
+      <div id="breadcrumbs"><span>ember</span><small>›</small><span>src</span><small>›</small><strong id="active-file-crumb">main.rs</strong><small>›</small><span>Workspace</span></div>
+
+      <div id="editor-surface">
+        <div id="line-numbers">
+          <span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span><span>9</span><span>10</span><span>11</span><span>12</span><span>13</span><span>14</span><span>15</span><span>16</span><span>17</span><span>18</span>
         </div>
-        <div id="toolbar-actions">
-          <button id="reset-build" type="button">Reset</button>
-          <button id="run-build" type="button">Run build</button>
-        </div>
+        <textarea id="code-editor" spellcheck="false" aria-label="Rust editor"></textarea>
+        <aside id="minimap"><span class="map-a"></span><span class="map-b"></span><span class="map-c"></span><span class="map-d"></span></aside>
       </div>
 
-      <section id="metrics">
-        <article class="metric-card">
-          <span class="metric-label">HTML nodes</span>
-          <strong>86</strong>
-          <p>Pure document</p>
-        </article>
-        <article class="metric-card">
-          <span class="metric-label">Components</span>
-          <strong>24</strong>
-          <p>Native elements</p>
-        </article>
-        <article class="metric-card">
-          <span class="metric-label">Bindings</span>
-          <strong>4</strong>
-          <p>Validated hooks</p>
-        </article>
-        <article class="metric-card accent-card">
-          <span class="metric-label">Builds</span>
-          <strong id="build-count">12</strong>
-          <p>This session</p>
-        </article>
+      <section id="bottom-panel">
+        <div id="panel-tabs">
+          <button class="panel-tab active" type="button">TERMINAL</button>
+          <button class="panel-tab" type="button">PROBLEMS <small>0</small></button>
+          <button class="panel-tab" type="button">OUTPUT</button>
+          <div class="panel-spacer"></div>
+          <button id="clear-terminal" class="panel-action" type="button" title="Clear">⌫</button>
+          <button class="panel-action" type="button" title="New terminal">＋</button>
+          <button id="close-panel" class="panel-action" type="button" title="Close panel">×</button>
+        </div>
+        <div id="terminal">
+          <div><span class="prompt">➜</span><span class="path">ember</span><span class="branch">git:(main)</span><span>cargo run</span></div>
+          <div class="terminal-muted">Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.41s</div>
+          <div class="terminal-success">Running `target/debug/ember`</div>
+          <div><span class="prompt">➜</span><span class="path">ember</span><span class="caret">▋</span></div>
+        </div>
       </section>
-
-      <div id="lower-grid">
-        <section id="pipeline-panel" class="panel">
-          <div class="panel-heading">
-            <div>
-              <h2>Live render pipeline</h2>
-              <p>Every stage stays typed and inspectable</p>
-            </div>
-            <span class="healthy-pill">Healthy</span>
-          </div>
-
-          <div id="stages">
-            <article class="stage-card">
-              <div class="stage-number">01</div>
-              <strong>Parse HTML</strong>
-              <p>Standards-based DOM</p>
-              <span class="stage-status">Complete</span>
-            </article>
-            <article class="stage-card">
-              <div class="stage-number">02</div>
-              <strong>Resolve styles</strong>
-              <p>Target-neutral plan</p>
-              <span class="stage-status">Complete</span>
-            </article>
-            <article class="stage-card">
-              <div class="stage-number">03</div>
-              <strong>Paint GPUI</strong>
-              <p>Native GPU frame</p>
-              <span class="stage-status">Complete</span>
-            </article>
-          </div>
-
-          <div id="activity-feed">
-            <div class="activity-row">
-              <span class="activity-dot blue"></span>
-              <div><strong>Semantic tree published</strong><p>MCP can inspect and control this window</p></div>
-              <small>now</small>
-            </div>
-            <div class="activity-row">
-              <span class="activity-dot green"></span>
-              <div><strong>Visual parity checked</strong><p>Chromium and GPUI remain within gate</p></div>
-              <small>13s</small>
-            </div>
-          </div>
-        </section>
-
-        <aside id="inspector" class="panel">
-          <div class="panel-heading compact">
-            <div><h2>Runtime inspector</h2><p>Interactive native state</p></div>
-          </div>
-
-          <details id="runtime-menu">
-            <summary><span>Runtime actions</span><strong>Open</strong></summary>
-            <div id="action-menu">
-              <div class="menu-item">Inspect</div>
-              <div class="menu-item">Focus</div>
-              <div class="menu-item">Capture</div>
-              <div class="menu-item">Compare</div>
-            </div>
-          </details>
-
-          <div id="runtime-status">
-            <span class="status-icon"></span>
-            <div>
-              <strong>Runtime status</strong>
-              <p id="status-message">Ready - document compiled into native GPUI elements.</p>
-            </div>
-          </div>
-
-          <div id="document-shape">
-            <p class="eyebrow">DOCUMENT SHAPE</p>
-            <div class="shape-row"><span>app.html</span><strong>Structure</strong></div>
-            <div class="shape-row"><span>app.css</span><strong>Visuals</strong></div>
-            <div class="shape-row"><span>bindings.ron</span><strong>Behavior</strong></div>
-          </div>
-        </aside>
-      </div>
     </section>
   </main>
+
+  <footer id="statusbar">
+    <div class="status-left"><button type="button"><span>⑂</span><span>main*</span></button><button type="button"><span>✓</span><span>0</span></button><button type="button"><span>△</span><span>0</span></button></div>
+    <div id="mcp-status"><span class="live-dot"></span><span id="status-message">GPUI MCP connected · ready</span></div>
+    <div class="status-right"><button id="run-project" type="button"><span>▶</span><span>Run</span></button><button type="button">Ln 1, Col 1</button><button type="button">Spaces: 4</button><button type="button">Rust</button></div>
+  </footer>
+
+  <details id="command-menu">
+    <summary id="command-trigger">•••</summary>
+    <div id="command-popover">
+      <p class="menu-label">APPEARANCE</p>
+      <button id="theme-midnight" type="button"><span>Midnight</span><small>Current</small></button>
+      <button id="theme-ayu" type="button"><span>Ayu Mirage</span><small>Theme</small></button>
+      <div class="menu-separator"></div>
+      <button id="command-palette" type="button"><span>Command Palette</span><small>Ctrl Shift P</small></button>
+    </div>
+  </details>
 </body>
 </html>

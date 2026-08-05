@@ -1,40 +1,25 @@
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui_mcp_protocol::{
-    ActionOutcome, BridgeError, ErrorCode, FrameStats, Highlight, InputCommand, LogEntry,
-    MAX_ID_BYTES, MAX_LABEL_BYTES, MAX_METADATA_FIELDS, MAX_METADATA_KEY_BYTES,
-    MAX_METADATA_VALUE_BYTES, MAX_TEXT_BYTES, MAX_TREE_NODES, NodeAction, Point, Rect,
-    SemanticAction, SemanticDiagnostic, SemanticDiagnosticCode, UiNode, UiTree,
+    BridgeError, ErrorCode, FrameStats, Highlight, LogEntry, MAX_ID_BYTES, MAX_LABEL_BYTES,
+    MAX_METADATA_FIELDS, MAX_METADATA_KEY_BYTES, MAX_METADATA_VALUE_BYTES, MAX_TEXT_BYTES,
+    MAX_TREE_NODES, Rect, SemanticDiagnostic, SemanticDiagnosticCode, UiNode, UiTree,
+    WindowGeometry,
 };
 use tokio::sync::watch;
 use tokio::time::timeout;
 
-use crate::element::{NodeEvent, NodeHandler};
-
 const MAX_TIMING_SAMPLES: usize = 240;
 const MAX_DIAGNOSTICS: usize = 128;
-const MAX_ACTION_REASON_BYTES: usize = 512;
-
-#[cfg(feature = "native-screenshot")]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct WindowGeometry {
-    pub(crate) content_bounds: Rect,
-    pub(crate) scale_factor: f32,
-}
-
-thread_local! {
-    static PARENT_STACK: RefCell<Vec<(u64, String)>> = const { RefCell::new(Vec::new()) };
-    static HANDLERS: RefCell<BTreeMap<(u64, String), NodeHandler>> = const { RefCell::new(BTreeMap::new()) };
-}
 
 #[derive(Debug, Default)]
 struct PendingFrame {
     active: bool,
     nodes: BTreeMap<String, UiNode>,
     order: Vec<String>,
+    invalid_ids: BTreeSet<String>,
     diagnostics: Vec<SemanticDiagnostic>,
 }
 
@@ -65,34 +50,28 @@ impl Default for TimingState {
 
 #[derive(Debug)]
 pub(crate) struct SharedState {
-    pub(crate) instance_id: u64,
     tree: RwLock<UiTree>,
     pending: Mutex<PendingFrame>,
-    hit_order: RwLock<BTreeMap<String, usize>>,
     highlights: RwLock<Vec<Highlight>>,
     timings: Mutex<TimingState>,
     logs: Mutex<VecDeque<LogEntry>>,
     generation: watch::Sender<u64>,
     completed_frame: watch::Sender<FrameStats>,
-    #[cfg(feature = "native-screenshot")]
     window_geometry: RwLock<Option<WindowGeometry>>,
 }
 
 impl SharedState {
-    pub(crate) fn new(instance_id: u64) -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         let (generation, _) = watch::channel(0);
         let (completed_frame, _) = watch::channel(FrameStats::default());
         Arc::new(Self {
-            instance_id,
             tree: RwLock::new(UiTree::default()),
             pending: Mutex::new(PendingFrame::default()),
-            hit_order: RwLock::new(BTreeMap::new()),
             highlights: RwLock::new(Vec::new()),
             timings: Mutex::new(TimingState::default()),
             logs: Mutex::new(VecDeque::with_capacity(512)),
             generation,
             completed_frame,
-            #[cfg(feature = "native-screenshot")]
             window_geometry: RwLock::new(None),
         })
     }
@@ -123,6 +102,7 @@ impl SharedState {
         pending.active = true;
         pending.nodes.clear();
         pending.order.clear();
+        pending.invalid_ids.clear();
         pending.diagnostics.clear();
         if previous_was_incomplete {
             push_diagnostic(
@@ -132,12 +112,6 @@ impl SharedState {
                 "the previous semantic frame did not reach root paint",
             );
         }
-        PARENT_STACK.with(|stack| stack.borrow_mut().retain(|(id, _)| *id != self.instance_id));
-        HANDLERS.with(|handlers| {
-            handlers
-                .borrow_mut()
-                .retain(|(instance_id, _), _| *instance_id != self.instance_id);
-        });
     }
 
     pub(crate) fn finish_prepaint(&self) {
@@ -179,21 +153,20 @@ impl SharedState {
         self.completed_frame.send_replace(stats);
     }
 
-    #[cfg(feature = "native-screenshot")]
     pub(crate) fn set_window_geometry(&self, content_bounds: Rect, scale_factor: f32) {
-        if !content_bounds.is_valid() || !scale_factor.is_finite() || scale_factor <= 0.0 {
+        let geometry = WindowGeometry {
+            content_bounds,
+            scale_factor,
+        };
+        if !geometry.is_valid() {
             return;
         }
         *self
             .window_geometry
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(WindowGeometry {
-            content_bounds,
-            scale_factor,
-        });
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(geometry);
     }
 
-    #[cfg(feature = "native-screenshot")]
     pub(crate) fn window_geometry(&self) -> Option<WindowGeometry> {
         *self
             .window_geometry
@@ -201,18 +174,7 @@ impl SharedState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub(crate) fn record(&self, mut node: UiNode) -> bool {
-        let inferred_parent = PARENT_STACK.with(|stack| {
-            stack
-                .borrow()
-                .iter()
-                .rev()
-                .find(|(id, _)| *id == self.instance_id)
-                .map(|(_, node_id)| node_id.clone())
-        });
-        if node.parent.is_none() {
-            node.parent = inferred_parent;
-        }
+    fn record(&self, mut node: UiNode) -> bool {
         node.children.clear();
 
         let mut pending = self
@@ -232,12 +194,17 @@ impl SharedState {
             );
             return false;
         }
-        if pending.nodes.contains_key(&node.id) {
+        if pending.invalid_ids.contains(&node.id) {
+            return false;
+        }
+        if pending.nodes.remove(&node.id).is_some() {
+            pending.order.retain(|id| id != &node.id);
+            pending.invalid_ids.insert(node.id.clone());
             push_diagnostic(
                 &mut pending,
                 SemanticDiagnosticCode::DuplicateId,
                 Some(node.id),
-                "duplicate semantic node identifier was omitted",
+                "every node with this duplicate semantic identifier was omitted",
             );
             return false;
         }
@@ -255,27 +222,12 @@ impl SharedState {
         true
     }
 
-    pub(crate) fn push_parent(&self, id: &str) {
-        PARENT_STACK.with(|stack| {
-            stack.borrow_mut().push((self.instance_id, id.to_owned()));
-        });
-    }
-
-    pub(crate) fn record_handler(&self, node_id: String, handler: NodeHandler) {
-        HANDLERS.with(|handlers| {
-            handlers
-                .borrow_mut()
-                .insert((self.instance_id, node_id), handler);
-        });
-    }
-
-    pub(crate) fn pop_parent(&self) {
-        PARENT_STACK.with(|stack| {
-            let mut stack = stack.borrow_mut();
-            if let Some(index) = stack.iter().rposition(|(id, _)| *id == self.instance_id) {
-                stack.remove(index);
-            }
-        });
+    pub(crate) fn publish_frame(&self, nodes: impl IntoIterator<Item = UiNode>) {
+        for node in nodes {
+            self.record(node);
+        }
+        self.finish_prepaint();
+        self.finish_frame();
     }
 
     pub(crate) fn finish_frame(&self) {
@@ -288,10 +240,11 @@ impl SharedState {
         }
         pending.active = false;
 
-        break_parent_cycles(&mut pending);
+        discard_invalid_relationships(&mut pending);
         let roots = build_relationships(&mut pending);
         let nodes = std::mem::take(&mut pending.nodes);
-        let order = std::mem::take(&mut pending.order);
+        pending.order.clear();
+        pending.invalid_ids.clear();
         let diagnostics = std::mem::take(&mut pending.diagnostics);
         drop(pending);
 
@@ -309,14 +262,6 @@ impl SharedState {
         let generation = tree.generation;
         drop(tree);
 
-        *self
-            .hit_order
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = order
-            .into_iter()
-            .enumerate()
-            .map(|(index, id)| (id, index))
-            .collect();
         if changed {
             self.generation.send_replace(generation);
         }
@@ -388,108 +333,6 @@ impl SharedState {
         timeout(wait, changed)
             .await
             .map_err(|_| BridgeError::new(ErrorCode::Timeout, "frame wait timed out"))?
-    }
-
-    pub(crate) fn dispatch_action(
-        &self,
-        node_id: &str,
-        expected_generation: u64,
-        action: &SemanticAction,
-        window: &mut gpui::Window,
-        cx: &mut gpui::App,
-    ) -> Result<ActionOutcome, BridgeError> {
-        let tree = self
-            .tree
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if tree.generation != expected_generation {
-            return Err(BridgeError::new(
-                ErrorCode::StaleGeneration,
-                "semantic tree changed after the element was selected",
-            ));
-        }
-        let node = tree
-            .nodes
-            .get(node_id)
-            .ok_or_else(|| BridgeError::new(ErrorCode::NotFound, "semantic node was not found"))?;
-        if !node.state.visible || !node.state.enabled {
-            return Err(BridgeError::new(
-                ErrorCode::Rejected,
-                "semantic node is not visible and enabled",
-            ));
-        }
-        let required = action.required_node_action();
-        if !node.actions.contains(&required) {
-            return Err(BridgeError::new(
-                ErrorCode::Unsupported,
-                "semantic node does not advertise the requested action",
-            ));
-        }
-        let bounds = node.bounds;
-        drop(tree);
-
-        let handler = HANDLERS.with(|handlers| {
-            handlers
-                .borrow()
-                .get(&(self.instance_id, node_id.to_owned()))
-                .cloned()
-        });
-        let Some(handler) = handler else {
-            return Err(BridgeError::new(
-                ErrorCode::NotFound,
-                "semantic action handler is not available in the current frame",
-            ));
-        };
-        let event = semantic_event(action, bounds)?;
-        dispatch_drag_moves(&event, &handler, window, cx);
-        Ok(sanitize_outcome(handler(&event, window, cx)))
-    }
-
-    pub(crate) fn dispatch_pointer(
-        &self,
-        command: &InputCommand,
-        window: &mut gpui::Window,
-        cx: &mut gpui::App,
-    ) -> Result<ActionOutcome, BridgeError> {
-        let (point, event, required) = coordinate_event(command)?;
-        let tree = self.tree();
-        let order = self
-            .hit_order
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let node_id = tree
-            .nodes
-            .values()
-            .filter(|node| node.state.visible && node.state.enabled)
-            .filter(|node| node.actions.contains(&required))
-            .filter_map(|node| node.bounds.map(|bounds| (node, bounds)))
-            .filter(|(_, bounds)| bounds.contains(point))
-            .filter(|(node, _)| {
-                HANDLERS.with(|handlers| {
-                    handlers
-                        .borrow()
-                        .contains_key(&(self.instance_id, node.id.clone()))
-                })
-            })
-            .max_by_key(|(node, _)| order.get(&node.id).copied().unwrap_or_default())
-            .map(|(node, _)| node.id.clone())
-            .ok_or_else(|| {
-                BridgeError::new(
-                    ErrorCode::Unsupported,
-                    "no enabled annotated handler accepts that coordinate action",
-                )
-            })?;
-        drop(order);
-        let handler =
-            HANDLERS.with(|handlers| handlers.borrow().get(&(self.instance_id, node_id)).cloned());
-        let Some(handler) = handler else {
-            return Err(BridgeError::new(
-                ErrorCode::NotFound,
-                "annotated action handler expired before dispatch",
-            ));
-        };
-        dispatch_drag_moves(&event, &handler, window, cx);
-        Ok(sanitize_outcome(handler(&event, window, cx)))
     }
 
     pub(crate) fn set_highlights(&self, highlights: Vec<Highlight>) {
@@ -669,23 +512,36 @@ fn push_diagnostic(
     }
 }
 
-fn break_parent_cycles(pending: &mut PendingFrame) {
+fn discard_invalid_relationships(pending: &mut PendingFrame) {
+    let mut invalid = std::mem::take(&mut pending.invalid_ids);
+    discard_missing_parents(pending, &mut invalid);
+
     for start in pending.order.clone() {
-        let mut seen = BTreeSet::new();
-        let mut current = start.clone();
+        if invalid.contains(&start) {
+            continue;
+        }
+        let mut path: Vec<String> = Vec::new();
+        let mut positions: BTreeMap<String, usize> = BTreeMap::new();
+        let mut current = start;
         loop {
-            if !seen.insert(current.clone()) {
-                if let Some(node) = pending.nodes.get_mut(&start) {
-                    node.parent = None;
-                }
-                push_diagnostic(
-                    pending,
-                    SemanticDiagnosticCode::ParentCycle,
-                    Some(start),
-                    "semantic parent cycle was broken at this node",
-                );
+            if invalid.contains(&current) {
                 break;
             }
+            if let Some(cycle_start) = positions.get(&current).copied() {
+                for id in &path[cycle_start..] {
+                    if invalid.insert(id.clone()) {
+                        push_diagnostic(
+                            pending,
+                            SemanticDiagnosticCode::ParentCycle,
+                            Some(id.clone()),
+                            "semantic node in a parent cycle was omitted",
+                        );
+                    }
+                }
+                break;
+            }
+            positions.insert(current.clone(), path.len());
+            path.push(current.clone());
             let Some(parent) = pending
                 .nodes
                 .get(&current)
@@ -693,10 +549,39 @@ fn break_parent_cycles(pending: &mut PendingFrame) {
             else {
                 break;
             };
-            if !pending.nodes.contains_key(&parent) {
-                break;
-            }
             current = parent;
+        }
+    }
+
+    discard_missing_parents(pending, &mut invalid);
+    pending.nodes.retain(|id, _| !invalid.contains(id));
+    pending.order.retain(|id| !invalid.contains(id));
+}
+
+fn discard_missing_parents(pending: &mut PendingFrame, invalid: &mut BTreeSet<String>) {
+    loop {
+        let missing = pending
+            .order
+            .iter()
+            .filter(|id| !invalid.contains(*id))
+            .filter(|id| {
+                pending.nodes[*id].parent.as_ref().is_some_and(|parent| {
+                    invalid.contains(parent) || !pending.nodes.contains_key(parent)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            break;
+        }
+        for id in missing {
+            invalid.insert(id.clone());
+            push_diagnostic(
+                pending,
+                SemanticDiagnosticCode::MissingParent,
+                Some(id),
+                "semantic node whose parent was unavailable was omitted",
+            );
         }
     }
 }
@@ -717,144 +602,12 @@ fn build_relationships(pending: &mut PendingFrame) -> Vec<String> {
         if let Some(parent) = parent {
             if let Some(parent_node) = pending.nodes.get_mut(&parent) {
                 parent_node.children.push(child);
-            } else {
-                if let Some(node) = pending.nodes.get_mut(&child) {
-                    node.parent = None;
-                }
-                push_diagnostic(
-                    pending,
-                    SemanticDiagnosticCode::MissingParent,
-                    Some(child.clone()),
-                    "semantic parent was not present; node was promoted to a root",
-                );
-                roots.push(child);
             }
         } else {
             roots.push(child);
         }
     }
     roots
-}
-
-/// Deliver interpolated [`NodeEvent::DragMove`] events preceding a semantic drag's
-/// final [`NodeEvent::Drag`], one per step in `1..steps`. A no-op for non-drag events
-/// and when `steps <= 1`, so single-step drags remain fully backward compatible.
-fn dispatch_drag_moves(
-    event: &NodeEvent,
-    handler: &NodeHandler,
-    window: &mut gpui::Window,
-    cx: &mut gpui::App,
-) {
-    let NodeEvent::Drag { from, to, steps } = *event else {
-        return;
-    };
-    for i in 1..steps {
-        let progress = f32::from(i) / f32::from(steps);
-        let at = interpolate(from, to, progress);
-        handler(&NodeEvent::DragMove { at, progress }, window, cx);
-    }
-}
-
-/// Linearly interpolate between two points by `fraction`, typically `0.0..=1.0`.
-fn interpolate(from: Point, to: Point, fraction: f32) -> Point {
-    Point {
-        x: from.x + (to.x - from.x) * fraction,
-        y: from.y + (to.y - from.y) * fraction,
-    }
-}
-
-fn semantic_event(action: &SemanticAction, bounds: Option<Rect>) -> Result<NodeEvent, BridgeError> {
-    let center = || {
-        bounds.map(Rect::center).ok_or_else(|| {
-            BridgeError::new(ErrorCode::Rejected, "semantic node has no current bounds")
-        })
-    };
-    match action {
-        SemanticAction::Click { button, count } => Ok(NodeEvent::Click {
-            button: *button,
-            count: *count,
-        }),
-        SemanticAction::Focus => Ok(NodeEvent::Focus),
-        SemanticAction::Hover => Ok(NodeEvent::Hover { point: center()? }),
-        SemanticAction::Drag { to, steps } => Ok(NodeEvent::Drag {
-            from: center()?,
-            to: *to,
-            steps: *steps,
-        }),
-        SemanticAction::Scroll { delta_x, delta_y } => Ok(NodeEvent::Scroll {
-            delta_x: *delta_x,
-            delta_y: *delta_y,
-        }),
-        SemanticAction::SetText { text } => Ok(NodeEvent::SetText { text: text.clone() }),
-        SemanticAction::SetValue { value } => Ok(NodeEvent::SetValue {
-            value: value.clone(),
-        }),
-    }
-}
-
-fn coordinate_event(
-    command: &InputCommand,
-) -> Result<(gpui_mcp_protocol::Point, NodeEvent, NodeAction), BridgeError> {
-    match command {
-        InputCommand::Click {
-            point,
-            button,
-            count,
-        } => Ok((
-            *point,
-            NodeEvent::Click {
-                button: *button,
-                count: *count,
-            },
-            NodeAction::Click,
-        )),
-        InputCommand::Hover { point } => Ok((
-            *point,
-            NodeEvent::Hover { point: *point },
-            NodeAction::Hover,
-        )),
-        InputCommand::Drag { from, to, steps } => Ok((
-            *from,
-            NodeEvent::Drag {
-                from: *from,
-                to: *to,
-                steps: *steps,
-            },
-            NodeAction::Drag,
-        )),
-        InputCommand::Scroll {
-            point,
-            delta_x,
-            delta_y,
-        } => Ok((
-            *point,
-            NodeEvent::Scroll {
-                delta_x: *delta_x,
-                delta_y: *delta_y,
-            },
-            NodeAction::Scroll,
-        )),
-        InputCommand::Key { .. }
-        | InputCommand::TypeText { .. }
-        | InputCommand::ReplaceText { .. } => Err(BridgeError::new(
-            ErrorCode::Internal,
-            "keyboard input was routed as coordinate input",
-        )),
-    }
-}
-
-fn sanitize_outcome(outcome: ActionOutcome) -> ActionOutcome {
-    match outcome {
-        ActionOutcome::Handled => ActionOutcome::Handled,
-        ActionOutcome::Rejected { reason } => {
-            let mut reason = reason.replace(['\r', '\n'], " ");
-            reason.truncate(reason.floor_char_boundary(MAX_ACTION_REASON_BYTES));
-            if reason.is_empty() {
-                "application rejected the semantic action".clone_into(&mut reason);
-            }
-            ActionOutcome::Rejected { reason }
-        }
-    }
 }
 
 fn push_sample(samples: &mut VecDeque<Duration>, sample: Duration) {
@@ -933,9 +686,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    use gpui_mcp_protocol::{NodeState, Point, Role, SemanticDiagnosticCode, UiNode};
+    use gpui_mcp_protocol::{NodeState, Role, SemanticDiagnosticCode, UiNode};
 
-    use super::{SharedState, interpolate};
+    use super::SharedState;
 
     fn node(id: &str, parent: Option<&str>) -> UiNode {
         UiNode {
@@ -955,25 +708,15 @@ mod tests {
     }
 
     #[test]
-    fn interpolate_reaches_both_endpoints_and_the_midpoint() {
-        let from = Point { x: 10.0, y: 20.0 };
-        let to = Point { x: 30.0, y: 60.0 };
-
-        assert_eq!(interpolate(from, to, 0.0), from);
-        assert_eq!(interpolate(from, to, 1.0), to);
-        assert_eq!(interpolate(from, to, 0.5), Point { x: 20.0, y: 40.0 });
-    }
-
-    #[test]
     fn duplicate_ids_are_omitted_and_reported() {
-        let state = SharedState::new(1);
+        let state = SharedState::new();
         state.begin_frame();
         assert!(state.record(node("same", None)));
         assert!(!state.record(node("same", None)));
         state.finish_frame();
 
         let tree = state.tree();
-        assert_eq!(tree.nodes.len(), 1);
+        assert!(tree.nodes.is_empty());
         assert!(tree.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == SemanticDiagnosticCode::DuplicateId
                 && diagnostic.node_id.as_deref() == Some("same")
@@ -981,8 +724,8 @@ mod tests {
     }
 
     #[test]
-    fn missing_parents_and_cycles_are_repaired_deterministically() {
-        let state = SharedState::new(2);
+    fn missing_parents_and_cycles_are_rejected_without_rewriting_the_graph() {
+        let state = SharedState::new();
         state.begin_frame();
         assert!(state.record(node("missing", Some("absent"))));
         assert!(state.record(node("a", Some("b"))));
@@ -990,8 +733,8 @@ mod tests {
         state.finish_frame();
 
         let tree = state.tree();
-        assert!(tree.roots.contains(&"missing".to_owned()));
-        assert!(tree.nodes["missing"].parent.is_none());
+        assert!(tree.nodes.is_empty());
+        assert!(tree.roots.is_empty());
         assert!(
             tree.diagnostics
                 .iter()
@@ -1002,12 +745,11 @@ mod tests {
                 .iter()
                 .any(|diagnostic| { diagnostic.code == SemanticDiagnosticCode::ParentCycle })
         );
-        assert!(tree.roots.iter().any(|root| root == "a" || root == "b"));
     }
 
     #[test]
     fn unchanged_semantics_do_not_advance_generation() {
-        let state = SharedState::new(3);
+        let state = SharedState::new();
         for _ in 0..2 {
             state.begin_frame();
             assert!(state.record(node("stable", None)));
@@ -1018,7 +760,7 @@ mod tests {
 
     #[tokio::test]
     async fn tree_wait_wakes_when_a_new_generation_is_published() -> Result<(), String> {
-        let state = SharedState::new(4);
+        let state = SharedState::new();
         let waiter_state = state.clone();
         let waiter =
             tokio::spawn(
@@ -1041,7 +783,7 @@ mod tests {
 
     #[tokio::test]
     async fn frame_wait_wakes_after_unchanged_semantics_finish_paint() -> Result<(), String> {
-        let state = SharedState::new(5);
+        let state = SharedState::new();
         state.begin_frame();
         assert!(state.record(node("stable", None)));
         state.finish_frame();
@@ -1073,7 +815,7 @@ mod tests {
 
     #[tokio::test]
     async fn frame_wait_never_returns_a_started_but_incomplete_frame() -> Result<(), String> {
-        let state = SharedState::new(6);
+        let state = SharedState::new();
         state.begin_frame();
         assert!(state.record(node("stable", None)));
         state.finish_frame();

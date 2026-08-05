@@ -1,106 +1,110 @@
 use std::time::Duration;
 
-use gpui_mcp_capture::{CaptureOptions, capture_window_with_options};
-use gpui_mcp_protocol::{Capability, Screenshot, ScreenshotTarget, UiTree};
+use gpui_mcp_capture::{CaptureGeometry, CaptureTarget, ScreenshotOptions};
+use gpui_mcp_protocol::{
+    BridgeResult, Capability, Operation, Screenshot, ScreenshotTarget, WindowGeometry,
+};
 use tokio::time::timeout;
-
-const CAPTURE_WORKER_DEADLINE: Duration = Duration::from_secs(15);
 
 use crate::client::BridgeClient;
 
+const CAPTURE_WORKER_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Capture an instrumented window from the external MCP process.
+///
+/// Keeping native capture outside the GPUI process is required on Windows, where native window
+/// enumeration intentionally excludes windows owned by the calling process. The bridge only
+/// supplies the stable process/window identity and current logical client-area geometry.
 pub(crate) async fn capture(
     client: &BridgeClient,
-    tree: &UiTree,
-    target: ScreenshotTarget,
-    options: CaptureOptions,
+    area: ScreenshotTarget,
 ) -> Result<Screenshot, String> {
-    if !client
-        .descriptor()
-        .capabilities
-        .supports(Capability::Screenshot)
-    {
-        return Err("native screenshot support was disabled by the application".to_owned());
+    let descriptor = client.descriptor();
+    if !descriptor.capabilities.supports(Capability::Screenshot) {
+        return Err("the application platform does not expose native window capture".to_owned());
     }
-    let pid = client.descriptor().pid;
-    let title = client.descriptor().window_title.clone();
-    let worker_title = title.clone();
-    let logical_size = logical_window_size(tree);
+    let window = descriptor
+        .native_window_id
+        .ok_or_else(|| "the application did not publish a native window identifier".to_owned())?;
+    let target = CaptureTarget::new(descriptor.pid, window);
+    let geometry = match area {
+        ScreenshotTarget::Window => None,
+        ScreenshotTarget::Region { .. } => Some(window_geometry(client).await?),
+    };
+    let options = ScreenshotOptions::new(area, geometry.map(capture_geometry));
+
     timeout(
         CAPTURE_WORKER_DEADLINE,
-        tokio::task::spawn_blocking(move || {
-            capture_window_with_options(pid, &worker_title, target, logical_size, None, options)
-        }),
+        tokio::task::spawn_blocking(move || gpui_mcp_capture::screenshot(target, options)),
     )
     .await
-    .map_err(|_| "screenshot capture exceeded the 15 second deadline".to_owned())?
+    .map_err(|_| "native screenshot capture exceeded the 15 second deadline".to_owned())?
     .map_err(|error| {
-        tracing::warn!(%error, "screenshot worker failed");
-        "screenshot worker failed".to_owned()
+        tracing::warn!(%error, "native screenshot worker failed");
+        "native screenshot worker failed".to_owned()
     })?
     .map_err(|error| {
         if let gpui_mcp_capture::CaptureFailure::TargetNotFound {
             window_count,
             pid_matches,
-            title_matches,
+            window_matches,
         } = error
         {
             tracing::warn!(
-                pid,
-                title,
+                process_id = descriptor.pid.get(),
+                native_window_id = window.get(),
                 window_count,
                 pid_matches,
-                title_matches,
-                "could not match native screenshot window"
+                window_matches,
+                "could not resolve exact native capture target"
             );
         }
         error.to_string()
     })
 }
 
-fn logical_window_size(tree: &UiTree) -> Option<(f32, f32)> {
-    tree.roots
-        .iter()
-        .filter_map(|id| tree.nodes.get(id))
-        .filter_map(|node| node.bounds)
-        .max_by(|left, right| (left.width * left.height).total_cmp(&(right.width * right.height)))
-        .map(|rect| (rect.width, rect.height))
+async fn window_geometry(client: &BridgeClient) -> Result<WindowGeometry, String> {
+    match client.call(Operation::GetWindowGeometry).await? {
+        BridgeResult::WindowGeometry(geometry) if geometry.is_valid() => Ok(geometry),
+        BridgeResult::WindowGeometry(_) => {
+            Err("the application returned invalid window geometry".to_owned())
+        }
+        _ => Err("the bridge returned the wrong result for window geometry".to_owned()),
+    }
+}
+
+fn capture_geometry(geometry: WindowGeometry) -> CaptureGeometry {
+    CaptureGeometry {
+        content_bounds: geometry.content_bounds,
+        viewport_size: (
+            geometry.content_bounds.width,
+            geometry.content_bounds.height,
+        ),
+        scale_factor: geometry.scale_factor,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use gpui_mcp_protocol::{Rect, WindowGeometry};
 
-    use gpui_mcp_protocol::{NodeState, Rect, Role, UiNode, UiTree};
-
-    use super::logical_window_size;
+    use super::capture_geometry;
 
     #[test]
-    fn uses_largest_semantic_root_for_capture_scaling() {
-        let mut tree = UiTree::default();
-        for (id, width, height) in [("small", 200.0, 100.0), ("large", 900.0, 700.0)] {
-            tree.roots.push(id.to_owned());
-            tree.nodes.insert(
-                id.to_owned(),
-                UiNode {
-                    id: id.to_owned(),
-                    parent: None,
-                    children: Vec::new(),
-                    role: Role::Window,
-                    label: None,
-                    description: None,
-                    bounds: Some(Rect {
-                        width,
-                        height,
-                        ..Rect::default()
-                    }),
-                    state: NodeState::default(),
-                    actions: Vec::new(),
-                    text: None,
-                    value: None,
-                    metadata: BTreeMap::new(),
-                },
-            );
-        }
-        assert_eq!(logical_window_size(&tree), Some((900.0, 700.0)));
+    fn maps_gpui_client_geometry_without_title_or_coordinate_fallbacks() {
+        let geometry = WindowGeometry {
+            content_bounds: Rect {
+                x: 40.0,
+                y: 70.0,
+                width: 900.0,
+                height: 640.0,
+            },
+            scale_factor: 1.5,
+        };
+
+        let capture = capture_geometry(geometry);
+        assert_eq!(capture.content_bounds, geometry.content_bounds);
+        assert_eq!(capture.viewport_size, (900.0, 640.0));
+        assert!((capture.scale_factor - 1.5).abs() < f32::EPSILON);
     }
 }

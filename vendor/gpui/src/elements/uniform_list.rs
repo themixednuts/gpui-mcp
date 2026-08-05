@@ -6,9 +6,10 @@
 
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, Entity,
-    GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity, IntoElement,
-    IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size,
-    StyleRefinement, Styled, Window, point, size,
+    GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity,
+    InteractivitySemanticsExt, IntoElement, IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels,
+    Point, ScrollHandle, SemanticAction, SemanticRole, Semantics, Size, StyleRefinement, Styled,
+    Window, point, size,
 };
 use smallvec::SmallVec;
 use std::{cell::RefCell, cmp, ops::Range, rc::Rc};
@@ -249,6 +250,14 @@ impl Element for UniformList {
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
         None
+    }
+
+    fn semantics(&self, window: &Window, _cx: &App) -> Option<(Semantics, Vec<SemanticAction>)> {
+        self.interactivity.semantic_node(window, SemanticRole::List)
+    }
+
+    fn semantic_focus_handle(&self) -> Option<crate::FocusHandle> {
+        self.interactivity.tracked_focus_handle.clone()
     }
 
     fn request_layout(

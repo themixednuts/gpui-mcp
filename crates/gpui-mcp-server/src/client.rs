@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -5,10 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use directories::BaseDirs;
 use gpui_mcp_protocol::{
-    BridgeResult, EndpointDescriptor, LocalEndpoint, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
-    Operation, PROTOCOL_VERSION, WireRequest, WireResponse,
+    AppId, BridgeResult, Capability, EndpointDescriptor, LocalEndpoint, MAX_REQUEST_BYTES,
+    MAX_RESPONSE_BYTES, Operation, PROTOCOL_VERSION, ProcessId, RequestId, WireRequest,
+    WireResponse,
 };
 use interprocess::local_socket::{
     GenericFilePath, GenericNamespaced, Name, ToFsName as _, ToNsName as _,
@@ -63,10 +64,10 @@ pub(crate) struct BridgeClient {
 }
 
 impl BridgeClient {
-    fn from_path(path: &Path, app_id: Option<&str>) -> Result<Self> {
+    fn from_path(path: &Path, app_id: Option<&AppId>) -> Result<Self> {
         let descriptor = read_descriptor(path)?;
         if let Some(expected) = app_id
-            && descriptor.app_id != expected
+            && descriptor.app_id != *expected
         {
             bail!(
                 "endpoint application id is {:?}, not {:?}",
@@ -86,8 +87,8 @@ impl BridgeClient {
         &self.descriptor
     }
 
-    pub(crate) fn target_id(&self) -> String {
-        target_id(&self.descriptor)
+    pub(crate) fn target_id(&self) -> TargetId {
+        TargetId::from_descriptor(&self.descriptor)
     }
 
     pub(crate) async fn call(&self, operation: Operation) -> Result<BridgeResult, String> {
@@ -98,7 +99,15 @@ impl BridgeClient {
             }
             _ => IO_TIMEOUT,
         };
-        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed).max(1);
+        let request_id =
+            self.next_request_id
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(1)
+                });
+        let request_id = request_id
+            .ok()
+            .and_then(RequestId::new)
+            .ok_or_else(|| "bridge request identifier space is exhausted".to_owned())?;
         let request = WireRequest {
             protocol_version: PROTOCOL_VERSION,
             request_id,
@@ -138,14 +147,56 @@ impl BridgeClient {
     }
 }
 
+/// Opaque, validated selection identity for one bridge instance.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub(crate) struct TargetId(String);
+
+impl TargetId {
+    fn from_descriptor(descriptor: &EndpointDescriptor) -> Self {
+        Self(format!(
+            "{}-{:016x}",
+            descriptor.app_id, descriptor.instance_id
+        ))
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        let Some((app_id, instance)) = value.rsplit_once('-') else {
+            return Err("target ID must end with a 16-digit instance identifier".to_owned());
+        };
+        AppId::new(app_id).map_err(|error| error.to_string())?;
+        if instance.len() != 16
+            || !instance.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || u64::from_str_radix(instance, 16)
+                .ok()
+                .and_then(gpui_mcp_protocol::InstanceId::new)
+                .is_none()
+        {
+            return Err(
+                "target ID must end with a nonzero 16-digit instance identifier".to_owned(),
+            );
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TargetId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Public, non-secret identity for one discoverable GPUI bridge.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct AppInfo {
-    pub(crate) target_id: String,
-    pub(crate) app_id: String,
+    pub(crate) target_id: TargetId,
+    pub(crate) app_id: AppId,
     pub(crate) app_name: String,
-    pub(crate) pid: u32,
-    pub(crate) window_title: String,
+    pub(crate) pid: ProcessId,
     pub(crate) selected: bool,
     pub(crate) capabilities: gpui_mcp_protocol::Capabilities,
 }
@@ -158,7 +209,6 @@ impl AppInfo {
             app_id: descriptor.app_id.clone(),
             app_name: descriptor.app_name.clone(),
             pid: descriptor.pid,
-            window_title: descriptor.window_title.clone(),
             selected,
             capabilities: descriptor.capabilities.clone(),
         }
@@ -169,12 +219,12 @@ impl AppInfo {
 ///
 /// A single available bridge is selected automatically. When several are live,
 /// callers select one by the opaque, non-secret target ID returned by
-/// [`Self::list_apps`]. The optional application ID remains a compatibility
+/// [`Self::list_apps`]. The optional application ID is an explicit discovery
 /// filter; normal MCP configuration does not need one.
 #[derive(Clone)]
 pub(crate) struct BridgeRegistry {
     endpoint: Option<PathBuf>,
-    app_id: Option<String>,
+    app_id: Option<AppId>,
     endpoint_dir: Option<PathBuf>,
     selected: Arc<RwLock<Option<BridgeClient>>>,
 }
@@ -182,7 +232,7 @@ pub(crate) struct BridgeRegistry {
 impl BridgeRegistry {
     pub(crate) fn new(
         endpoint: Option<PathBuf>,
-        app_id: Option<String>,
+        app_id: Option<AppId>,
         endpoint_dir: Option<PathBuf>,
     ) -> Self {
         Self {
@@ -227,6 +277,7 @@ impl BridgeRegistry {
     }
 
     pub(crate) async fn select(&self, requested: &str) -> Result<AppInfo, String> {
+        let requested = TargetId::parse(requested)?;
         let clients = self
             .discover()
             .await
@@ -236,7 +287,7 @@ impl BridgeRegistry {
             .find(|client| client.target_id() == requested)
         else {
             return Err(format!(
-                "GPUI target {requested:?} is not live; call list_apps to refresh available targets"
+                "GPUI target {requested} is not live; call list_apps to refresh available targets"
             ));
         };
         *self.selected.write().await = Some(client.clone());
@@ -285,22 +336,18 @@ impl BridgeRegistry {
 
     async fn discover(&self) -> Result<Vec<BridgeClient>> {
         if let Some(endpoint) = &self.endpoint {
-            let client = BridgeClient::from_path(endpoint, self.app_id.as_deref())?;
+            let client = BridgeClient::from_path(endpoint, self.app_id.as_ref())?;
             if probe(&client).await {
                 return Ok(vec![client]);
             }
             return Ok(Vec::new());
         }
-        discover_clients(self.app_id.as_deref(), self.endpoint_dir.as_deref()).await
+        discover_clients(self.app_id.as_ref(), self.endpoint_dir.as_deref()).await
     }
 }
 
 fn format_discovery_error(error: &anyhow::Error) -> String {
     format!("GPUI bridge discovery failed: {error:#}")
-}
-
-fn target_id(descriptor: &EndpointDescriptor) -> String {
-    format!("{}-{:016x}", descriptor.app_id, descriptor.instance_id)
 }
 
 async fn exchange(
@@ -352,10 +399,13 @@ fn endpoint_name(endpoint: &LocalEndpoint) -> std::io::Result<Name<'_>> {
 }
 
 async fn discover_clients(
-    app_id: Option<&str>,
+    app_id: Option<&AppId>,
     endpoint_dir: Option<&Path>,
 ) -> Result<Vec<BridgeClient>> {
-    let directory = endpoint_dir.map_or_else(default_endpoint_dir, Path::to_path_buf);
+    let directory = match endpoint_dir {
+        Some(directory) => directory.to_path_buf(),
+        None => default_endpoint_dir()?,
+    };
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -388,7 +438,7 @@ async fn discover_clients(
             let _ = fs::remove_file(&path);
             continue;
         }
-        if app_id.is_none_or(|expected| descriptor.app_id == expected)
+        if app_id.is_none_or(|expected| descriptor.app_id == *expected)
             && validate_descriptor(&descriptor, &path).is_ok()
         {
             probes.spawn(async move {
@@ -430,8 +480,9 @@ struct ProcessLiveness {
 }
 
 impl ProcessLiveness {
-    fn query(pids: impl Iterator<Item = u32>) -> Self {
-        let mut pids: Vec<sysinfo::Pid> = pids.map(sysinfo::Pid::from_u32).collect();
+    fn query(pids: impl Iterator<Item = ProcessId>) -> Self {
+        let mut pids: Vec<sysinfo::Pid> =
+            pids.map(|pid| sysinfo::Pid::from_u32(pid.get())).collect();
         pids.sort_unstable();
         pids.dedup();
         let mut system = sysinfo::System::new();
@@ -442,8 +493,8 @@ impl ProcessLiveness {
     /// True when the descriptor's owning process no longer exists, or when its
     /// pid now belongs to a process started after the descriptor was written
     /// (the pid was reused, so the original owner is dead).
-    fn is_stale(&self, pid: u32, descriptor_path: &Path) -> bool {
-        let Some(process) = self.system.process(sysinfo::Pid::from_u32(pid)) else {
+    fn is_stale(&self, pid: ProcessId, descriptor_path: &Path) -> bool {
+        let Some(process) = self.system.process(sysinfo::Pid::from_u32(pid.get())) else {
             return true;
         };
         let started = process.start_time();
@@ -495,14 +546,10 @@ fn validate_descriptor(descriptor: &EndpointDescriptor, descriptor_path: &Path) 
     {
         bail!("endpoint authentication token is malformed");
     }
-    if descriptor.app_id.is_empty()
-        || descriptor.app_id.len() > 64
-        || !descriptor
-            .app_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    if descriptor.capabilities.supports(Capability::Screenshot)
+        && descriptor.native_window_id.is_none()
     {
-        bail!("endpoint application identifier is malformed");
+        bail!("endpoint advertises screenshots without a native window identifier");
     }
     Ok(())
 }
@@ -578,18 +625,12 @@ fn validate_descriptor_permissions(metadata: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn default_runtime_root() -> PathBuf {
-    if let Some(base) = BaseDirs::new() {
-        return base
-            .runtime_dir()
-            .unwrap_or_else(|| base.data_local_dir())
-            .join("gpui-mcp");
-    }
-    std::env::temp_dir().join("gpui-mcp")
+pub(crate) fn default_runtime_root() -> Result<PathBuf> {
+    gpui_mcp_protocol::runtime_root().context("resolve the GPUI MCP runtime directory")
 }
 
-fn default_endpoint_dir() -> PathBuf {
-    default_runtime_root().join("run")
+fn default_endpoint_dir() -> Result<PathBuf> {
+    default_runtime_root().map(|root| root.join("run"))
 }
 
 #[cfg(test)]
@@ -599,8 +640,8 @@ mod tests {
 
     use anyhow::Result;
     use gpui_mcp_protocol::{
-        BridgeResult, Capabilities, EndpointDescriptor, LocalEndpoint, Operation, PROTOCOL_VERSION,
-        WireRequest, WireResponse,
+        AppId, BridgeResult, Capabilities, EndpointDescriptor, InstanceId, LocalEndpoint,
+        NativeWindowId, Operation, PROTOCOL_VERSION, ProcessId, WireRequest, WireResponse,
     };
     use interprocess::local_socket::{
         GenericFilePath, GenericNamespaced, ListenerOptions, ToFsName as _, ToNsName as _,
@@ -641,8 +682,8 @@ mod tests {
                 let response = WireResponse::success(
                     request.request_id,
                     BridgeResult::Pong {
-                        app_id: "test".to_owned(),
-                        pid: 7,
+                        app_id: AppId::new("test")?,
+                        pid: process_id(7)?,
                         protocol_version: PROTOCOL_VERSION,
                     },
                 );
@@ -657,13 +698,14 @@ mod tests {
         let path = directory.path().join("endpoint.json");
         let descriptor = EndpointDescriptor {
             protocol_version: PROTOCOL_VERSION,
-            app_id: "test".to_owned(),
+            app_id: AppId::new("test")?,
             app_name: "Test".to_owned(),
-            instance_id: 7,
-            pid: 7,
+            instance_id: InstanceId::new(7)
+                .ok_or_else(|| anyhow::anyhow!("invalid instance ID"))?,
+            pid: process_id(7)?,
             endpoint,
             token,
-            window_title: "Test".to_owned(),
+            native_window_id: NativeWindowId::new(17),
             capabilities: Capabilities::default(),
         };
         fs::write(&path, serde_json::to_vec(&descriptor)?)?;
@@ -679,7 +721,7 @@ mod tests {
                 .call(Operation::Ping)
                 .await
                 .map_err(anyhow::Error::msg)?;
-            assert!(matches!(result, BridgeResult::Pong { pid: 7, .. }));
+            assert!(matches!(result, BridgeResult::Pong { pid, .. } if pid.get() == 7));
         }
         task.await??;
         Ok(())
@@ -715,9 +757,10 @@ mod tests {
         let dead_path = directory.path().join("dead.json");
         write_test_descriptor(&dead_path, exited_process_id()?, dead_endpoint)?;
 
-        let discovered = super::discover_clients(Some("test-app"), Some(directory.path())).await?;
+        let app_id = AppId::new("test-app")?;
+        let discovered = super::discover_clients(Some(&app_id), Some(directory.path())).await?;
         assert_eq!(discovered.len(), 1);
-        assert_eq!(discovered[0].descriptor().app_id, "test-app");
+        assert_eq!(discovered[0].descriptor().app_id.as_str(), "test-app");
         assert!(live_path.exists());
         assert!(!dead_path.exists(), "stale descriptor should be deleted");
         drop(listener);
@@ -751,7 +794,7 @@ mod tests {
         let registry = BridgeRegistry::new(None, None, Some(directory.path().to_path_buf()));
 
         let client = registry.client().await.map_err(anyhow::Error::msg)?;
-        assert_eq!(client.target_id(), "single-app-0000000000000101");
+        assert_eq!(client.target_id().as_str(), "single-app-0000000000000101");
         let apps = registry.list_apps().await.map_err(anyhow::Error::msg)?;
         assert_eq!(apps.len(), 1);
         assert!(apps[0].selected);
@@ -798,7 +841,7 @@ mod tests {
             .select("shared-app-0000000000000202")
             .await
             .map_err(anyhow::Error::msg)?;
-        assert_eq!(selected.target_id, "shared-app-0000000000000202");
+        assert_eq!(selected.target_id.as_str(), "shared-app-0000000000000202");
         assert_eq!(
             registry
                 .client()
@@ -835,13 +878,13 @@ mod tests {
         )?;
         let registry = BridgeRegistry::new(
             None,
-            Some("beta".to_owned()),
+            Some(AppId::new("beta")?),
             Some(directory.path().to_path_buf()),
         );
 
         let apps = registry.list_apps().await.map_err(anyhow::Error::msg)?;
         assert_eq!(apps.len(), 1);
-        assert_eq!(apps[0].app_id, "beta");
+        assert_eq!(apps[0].app_id.as_str(), "beta");
         assert!(apps[0].selected);
         alpha_task.abort();
         beta_task.abort();
@@ -864,7 +907,7 @@ mod tests {
         let registry = BridgeRegistry::new(None, None, Some(directory.path().to_path_buf()));
 
         let before = registry.list_apps().await.map_err(anyhow::Error::msg)?;
-        assert_eq!(before[0].target_id, "restartable-0000000000000001");
+        assert_eq!(before[0].target_id.as_str(), "restartable-0000000000000001");
         assert!(before[0].selected);
 
         first_task.abort();
@@ -888,7 +931,7 @@ mod tests {
         )?;
 
         let after = registry.list_apps().await.map_err(anyhow::Error::msg)?;
-        assert_eq!(after[0].target_id, "restartable-0000000000000002");
+        assert_eq!(after[0].target_id.as_str(), "restartable-0000000000000002");
         assert!(after[0].selected);
         second_task.abort();
         Ok(())
@@ -901,6 +944,8 @@ mod tests {
         fs::write(&path, b"{}")?;
         let live_pid = std::process::id();
         let dead_pid = exited_process_id()?;
+        let live_pid = process_id(live_pid)?;
+        let dead_pid = process_id(dead_pid)?;
         let liveness = super::ProcessLiveness::query([live_pid, dead_pid].into_iter());
         assert!(!liveness.is_stale(live_pid, &path));
         assert!(liveness.is_stale(dead_pid, &path));
@@ -918,7 +963,7 @@ mod tests {
             .open(&path)?
             .set_modified(past)?;
         let mut child = long_running_process()?;
-        let pid = child.id();
+        let pid = process_id(child.id())?;
         let liveness = super::ProcessLiveness::query(std::iter::once(pid));
         let stale = liveness.is_stale(pid, &path);
         child.kill()?;
@@ -943,13 +988,14 @@ mod tests {
     ) -> Result<()> {
         let descriptor = EndpointDescriptor {
             protocol_version: PROTOCOL_VERSION,
-            app_id: app_id.to_owned(),
+            app_id: AppId::new(app_id)?,
             app_name: "Test".to_owned(),
-            instance_id,
-            pid,
+            instance_id: InstanceId::new(instance_id)
+                .ok_or_else(|| anyhow::anyhow!("invalid instance ID"))?,
+            pid: process_id(pid)?,
             endpoint,
             token: "ab".repeat(32),
-            window_title: "Test".to_owned(),
+            native_window_id: None,
             capabilities: Capabilities::default(),
         };
         fs::write(path, serde_json::to_vec(&descriptor)?)?;
@@ -959,6 +1005,10 @@ mod tests {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         }
         Ok(())
+    }
+
+    fn process_id(value: u32) -> Result<ProcessId> {
+        ProcessId::new(value).ok_or_else(|| anyhow::anyhow!("invalid process ID"))
     }
 
     fn exited_process_id() -> Result<u32> {

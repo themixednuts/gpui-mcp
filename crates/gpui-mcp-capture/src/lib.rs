@@ -1,4 +1,4 @@
-//! Native window capture for an exact process-and-title pair.
+//! Native window capture by stable operating-system identity.
 
 use std::io::Cursor;
 use std::time::Duration;
@@ -6,7 +6,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use base64::Engine as _;
-use gpui_mcp_protocol::{Rect, Screenshot, ScreenshotTarget};
+use gpui_mcp_protocol::{NativeWindowId, ProcessId, Rect, Screenshot, ScreenshotTarget};
 use image::{DynamicImage, ImageFormat, RgbaImage};
 
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
@@ -15,13 +15,14 @@ const MAX_ENCODED_BYTES: usize = 16 * 1024 * 1024;
 const COMPOSITOR_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MIN_STABILITY_DEADLINE: Duration = Duration::from_millis(32);
 const MAX_STABILITY_DEADLINE: Duration = Duration::from_secs(2);
+const DEFAULT_SETTLE_DEADLINE: Duration = Duration::from_secs(1);
 #[cfg(any(target_os = "windows", test))]
 const MIN_FRESHNESS_SAMPLES: u8 = 3;
 
 /// Bounded Windows Graphics Capture freshness policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaptureOptions {
-    compositor_stability_deadline: Duration,
+    settle_deadline: Duration,
 }
 
 impl CaptureOptions {
@@ -31,29 +32,56 @@ impl CaptureOptions {
     ///
     /// Returns [`CaptureFailure::InvalidStabilityDeadline`] unless `deadline` is
     /// between 32 milliseconds and 2 seconds, inclusive.
-    pub fn new(compositor_stability_deadline: Duration) -> Result<Self, CaptureFailure> {
-        if !(MIN_STABILITY_DEADLINE..=MAX_STABILITY_DEADLINE)
-            .contains(&compositor_stability_deadline)
-        {
+    pub fn new(deadline: Duration) -> Result<Self, CaptureFailure> {
+        if !(MIN_STABILITY_DEADLINE..=MAX_STABILITY_DEADLINE).contains(&deadline) {
             return Err(CaptureFailure::InvalidStabilityDeadline);
         }
         Ok(Self {
-            compositor_stability_deadline,
+            settle_deadline: deadline,
         })
     }
 
     /// Return the configured compositor freshness deadline.
     #[must_use]
-    pub const fn compositor_stability_deadline(self) -> Duration {
-        self.compositor_stability_deadline
+    pub const fn settle_deadline(self) -> Duration {
+        self.settle_deadline
     }
 }
 
 impl Default for CaptureOptions {
     fn default() -> Self {
         Self {
-            compositor_stability_deadline: Duration::from_secs(1),
+            settle_deadline: DEFAULT_SETTLE_DEADLINE,
         }
+    }
+}
+
+/// Logical screenshot selection and native capture policy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScreenshotOptions {
+    area: ScreenshotTarget,
+    geometry: Option<CaptureGeometry>,
+    capture: CaptureOptions,
+}
+
+impl ScreenshotOptions {
+    /// Configure one screenshot request.
+    #[must_use]
+    pub const fn new(area: ScreenshotTarget, geometry: Option<CaptureGeometry>) -> Self {
+        Self {
+            area,
+            geometry,
+            capture: CaptureOptions {
+                settle_deadline: DEFAULT_SETTLE_DEADLINE,
+            },
+        }
+    }
+
+    /// Set the bounded compositor-settlement policy.
+    #[must_use]
+    pub const fn settle(mut self, capture: CaptureOptions) -> Self {
+        self.capture = capture;
+        self
     }
 }
 
@@ -62,15 +90,15 @@ impl Default for CaptureOptions {
 /// The image is bounded by this crate's safety limits and, on Windows, has
 /// passed the same compositor-freshness policy used by MCP screenshots.
 #[derive(Clone, Debug)]
-pub struct NativeWindowCapture {
+pub struct NativeFrame {
     /// Captured native RGBA pixels, including any frame retained by the OS API.
     pub image: RgbaImage,
     /// Native global window origin when the platform reports one.
-    pub origin: Option<(i32, i32)>,
+    pub origin: (i32, i32),
     /// Physical pixels per logical display pixel from the native monitor API.
     pub scale_factor: f32,
     /// Window dimensions reported by the native window API, when available.
-    pub reported_size: Option<(u32, u32)>,
+    pub reported_size: (u32, u32),
 }
 
 /// GPUI client-area geometry used to map logical element coordinates into a decorated native
@@ -81,8 +109,75 @@ pub struct CaptureGeometry {
     /// report the outer-window origin for a decorated window; the mapper detects that case from
     /// the captured image and derives the decoration insets without platform constants.
     pub content_bounds: Rect,
+    /// Semantic viewport size in GPUI logical pixels.
+    pub viewport_size: (f32, f32),
     /// Physical pixels per GPUI logical pixel for the target window.
     pub scale_factor: f32,
+}
+
+/// Stable native window selector used by screenshot and video capture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureTarget {
+    process: ProcessId,
+    window: NativeWindowId,
+}
+
+/// Continuous native RGBA frame source for video recording.
+///
+/// Windows uses one persistent Windows Graphics Capture session. macOS and Linux
+/// sample their platform-native exact-window capture at the recorder cadence. Every
+/// backend emits raw RGBA frames and is selected at compile time.
+pub struct LiveFrameStream {
+    inner: platform_stream::PlatformFrameStream,
+}
+
+impl LiveFrameStream {
+    /// Open a continuous stream for one exact native window.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized [`CaptureFailure`] if the target cannot be resolved or
+    /// the operating system refuses capture.
+    pub fn open(target: CaptureTarget, frames_per_second: u8) -> Result<Self, CaptureFailure> {
+        if !(1..=30).contains(&frames_per_second) {
+            return Err(CaptureFailure::InvalidFrameRate);
+        }
+        Ok(Self {
+            inner: platform_stream::PlatformFrameStream::open(target, frames_per_second)?,
+        })
+    }
+
+    /// Wait for the next native frame up to `deadline`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized [`CaptureFailure`] when capture closes, times out, or
+    /// produces invalid dimensions.
+    pub fn next_frame(&mut self, deadline: Duration) -> Result<RgbaImage, CaptureFailure> {
+        let image = self.inner.next_frame(deadline)?;
+        validate_image_dimensions(&image)?;
+        Ok(image)
+    }
+}
+
+impl CaptureTarget {
+    /// Select one native window owned by one process.
+    #[must_use]
+    pub const fn new(process: ProcessId, window: NativeWindowId) -> Self {
+        Self { process, window }
+    }
+
+    /// Process identifier that owns the native window.
+    #[must_use]
+    pub const fn process(self) -> ProcessId {
+        self.process
+    }
+
+    /// Stable operating-system window identifier, when the bridge can provide one.
+    #[must_use]
+    pub const fn window(self) -> NativeWindowId {
+        self.window
+    }
 }
 
 /// A sanitized capture failure safe to return across the MCP boundary.
@@ -92,16 +187,22 @@ pub enum CaptureFailure {
     InvalidRegion,
     /// The compositor stability deadline was outside the supported range.
     InvalidStabilityDeadline,
+    /// The requested live frame rate was outside 1 through 30 FPS.
+    InvalidFrameRate,
+    /// No changed native frame arrived before the live stream deadline.
+    FrameTimeout,
+    /// A logical region was requested before GPUI published window geometry.
+    MissingGeometry,
     /// Native windows could not be enumerated.
     WindowEnumeration,
-    /// No native window matched both the exact process ID and title.
+    /// No native window matched the requested process and window identity.
     TargetNotFound {
         /// Number of enumerated candidate windows.
         window_count: usize,
         /// Number of candidates with the requested process ID.
         pid_matches: usize,
-        /// Number of candidates with the requested title.
-        title_matches: usize,
+        /// Number of candidates with the requested native window identifier.
+        window_matches: usize,
     },
     /// The operating system could not capture the matched window.
     CaptureUnavailable,
@@ -124,6 +225,9 @@ impl std::fmt::Display for CaptureFailure {
             Self::InvalidStabilityDeadline => {
                 "capture stability deadline must be between 32 milliseconds and 2 seconds"
             }
+            Self::InvalidFrameRate => "video frame rate must be between 1 and 30",
+            Self::FrameTimeout => "native frame stream did not change before the deadline",
+            Self::MissingGeometry => "GPUI window geometry is unavailable for region capture",
             Self::WindowEnumeration | Self::CaptureUnavailable => {
                 "native screenshot capture is unavailable; verify desktop-session support and OS permission"
             }
@@ -143,10 +247,7 @@ impl std::fmt::Display for CaptureFailure {
 
 impl std::error::Error for CaptureFailure {}
 
-/// Captures the native window that matches both `pid` and `title` exactly.
-///
-/// `logical_size` is the semantic root size in logical pixels and is used to
-/// scale a logical region into the captured image's physical pixels.
+/// Capture a complete native window or one logical GPUI region as PNG.
 ///
 /// # Errors
 ///
@@ -160,55 +261,18 @@ impl std::error::Error for CaptureFailure {}
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
-pub fn capture_window(
-    pid: u32,
-    title: &str,
-    target: ScreenshotTarget,
-    logical_size: Option<(f32, f32)>,
-    content_geometry: Option<CaptureGeometry>,
+pub fn screenshot(
+    window: CaptureTarget,
+    options: ScreenshotOptions,
 ) -> Result<Screenshot, CaptureFailure> {
-    capture_window_with_options(
-        pid,
-        title,
-        target,
-        logical_size,
-        content_geometry,
-        CaptureOptions::default(),
-    )
-}
-
-/// Captures an exact native window with a caller-selected bounded freshness policy.
-///
-/// # Errors
-///
-/// Returns a sanitized [`CaptureFailure`] when validation, native capture,
-/// compositor freshness sampling, cropping, or bounded PNG encoding fails.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss
-)]
-pub fn capture_window_with_options(
-    pid: u32,
-    title: &str,
-    target: ScreenshotTarget,
-    logical_size: Option<(f32, f32)>,
-    content_geometry: Option<CaptureGeometry>,
-    options: CaptureOptions,
-) -> Result<Screenshot, CaptureFailure> {
-    validate_target(target)?;
-    let native = capture_native_window_with_options(pid, title, options)?;
+    validate_target(options.area)?;
+    let native = frame(window, options.capture)?;
     let native_origin = native.origin;
     let mut image = native.image;
 
-    if let ScreenshotTarget::Region { rect } = target {
-        let mapping = region_mapping(
-            image.width(),
-            image.height(),
-            logical_size,
-            native_origin,
-            content_geometry,
-        );
+    if let ScreenshotTarget::Region { rect } = options.area {
+        let geometry = options.geometry.ok_or(CaptureFailure::MissingGeometry)?;
+        let mapping = region_mapping(image.width(), image.height(), native_origin, geometry)?;
         let left = (mapping.offset_x + rect.x * mapping.scale_x)
             .floor()
             .max(0.0) as u32;
@@ -245,36 +309,66 @@ pub fn capture_window_with_options(
     })
 }
 
-/// Capture bounded native RGBA pixels for an exact process-and-title pair.
+/// Capture bounded native RGBA pixels for one exact native window.
 ///
 /// This is the common platform abstraction used by MCP screenshots and visual
 /// parity tests. It uses the platform backend selected by `xcap`: Windows
 /// Graphics Capture on Windows, CoreGraphics on macOS, and X11 window capture
 /// on Linux. Native Wayland compositors intentionally do not expose unattended
-/// cross-process window capture by process ID and title.
+/// cross-process window capture by window identity.
 ///
 /// # Errors
 ///
 /// Returns a sanitized [`CaptureFailure`] when the window cannot be found,
 /// native display metadata is unavailable, or capture does not settle.
-pub fn capture_native_window(pid: u32, title: &str) -> Result<NativeWindowCapture, CaptureFailure> {
-    capture_native_window_with_options(pid, title, CaptureOptions::default())
+pub fn frame(
+    target: CaptureTarget,
+    options: CaptureOptions,
+) -> Result<NativeFrame, CaptureFailure> {
+    capture_frame(target, |capture| {
+        capture_after_compositor_settle(capture, options)
+    })
 }
 
-/// Capture native RGBA pixels with a caller-selected bounded freshness policy.
+/// Capture the newest available native RGBA frame without screenshot settling.
+///
+/// Video recording calls this repeatedly from one bounded recording worker. Unlike
+/// [`frame`], this does not take extra compositor freshness samples for every output
+/// frame, so the capture cadence is controlled by the video clock rather than the
+/// screenshot stability policy.
 ///
 /// # Errors
 ///
-/// Returns a sanitized [`CaptureFailure`] when window enumeration, display
-/// metadata, native capture, or compositor settlement fails.
-pub fn capture_native_window_with_options(
-    pid: u32,
-    title: &str,
-    options: CaptureOptions,
-) -> Result<NativeWindowCapture, CaptureFailure> {
+/// Returns a sanitized [`CaptureFailure`] when the native window cannot be resolved
+/// or captured, or when the returned pixels exceed the image safety bounds.
+pub fn live_frame(target: CaptureTarget) -> Result<NativeFrame, CaptureFailure> {
+    capture_frame(target, |capture| capture())
+}
+
+fn validate_image_dimensions(image: &RgbaImage) -> Result<(), CaptureFailure> {
+    if image.width() == 0
+        || image.height() == 0
+        || image.width() > MAX_IMAGE_DIMENSION
+        || image.height() > MAX_IMAGE_DIMENSION
+    {
+        Err(CaptureFailure::DimensionsOutOfBounds)
+    } else {
+        Ok(())
+    }
+}
+
+fn capture_frame(
+    target: CaptureTarget,
+    settle: impl FnOnce(
+        &mut dyn FnMut() -> Result<RgbaImage, CaptureFailure>,
+    ) -> Result<RgbaImage, CaptureFailure>,
+) -> Result<NativeFrame, CaptureFailure> {
     let windows = xcap::Window::all().map_err(|_| CaptureFailure::WindowEnumeration)?;
-    let native_window = find_native_window(windows, pid, title)?;
-    let origin = native_window.x().ok().zip(native_window.y().ok());
+    let native_window = find_native_window(windows, target)?;
+    let origin = native_window
+        .x()
+        .and_then(|x| native_window.y().map(|y| (x, y)))
+        .map_err(|_| CaptureFailure::CaptureUnavailable)?;
     let scale_factor = native_window
         .current_monitor()
         .and_then(|monitor| monitor.scale_factor())
@@ -282,28 +376,194 @@ pub fn capture_native_window_with_options(
     if !scale_factor.is_finite() || !(0.25..=8.0).contains(&scale_factor) {
         return Err(CaptureFailure::CaptureUnavailable);
     }
-    let reported_size = native_window.width().ok().zip(native_window.height().ok());
-    let image = capture_after_compositor_settle(
-        || {
-            native_window
-                .capture_image()
-                .map_err(|_| CaptureFailure::CaptureUnavailable)
-        },
-        options,
-    )?;
-    if image.width() == 0
-        || image.height() == 0
-        || image.width() > MAX_IMAGE_DIMENSION
-        || image.height() > MAX_IMAGE_DIMENSION
-    {
-        return Err(CaptureFailure::DimensionsOutOfBounds);
-    }
-    Ok(NativeWindowCapture {
+    let reported_size = native_window
+        .width()
+        .and_then(|width| native_window.height().map(|height| (width, height)))
+        .map_err(|_| CaptureFailure::CaptureUnavailable)?;
+    let image = settle(&mut || {
+        native_window
+            .capture_image()
+            .map_err(|_| CaptureFailure::CaptureUnavailable)
+    })?;
+    validate_image_dimensions(&image)?;
+    Ok(NativeFrame {
         image,
         origin,
         scale_factor,
         reported_size,
     })
+}
+
+#[cfg(target_os = "windows")]
+mod platform_stream {
+    use std::ffi::c_void;
+    use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+    use std::time::Duration;
+
+    use image::RgbaImage;
+    use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
+    use windows_capture::frame::Frame;
+    use windows_capture::graphics_capture_api::InternalCaptureControl;
+    use windows_capture::settings::{
+        ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+        MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+    };
+    use windows_capture::window::Window;
+
+    use super::{CaptureFailure, CaptureTarget, find_native_window};
+
+    type FrameResult = Result<RgbaImage, CaptureFailure>;
+
+    struct FrameHandler {
+        frames: SyncSender<FrameResult>,
+        scratch: Vec<u8>,
+    }
+
+    impl GraphicsCaptureApiHandler for FrameHandler {
+        type Flags = SyncSender<FrameResult>;
+        type Error = String;
+
+        fn new(context: Context<Self::Flags>) -> Result<Self, Self::Error> {
+            Ok(Self {
+                frames: context.flags,
+                scratch: Vec::new(),
+            })
+        }
+
+        fn on_frame_arrived(
+            &mut self,
+            frame: &mut Frame,
+            control: InternalCaptureControl,
+        ) -> Result<(), Self::Error> {
+            let width = frame.width();
+            let height = frame.height();
+            let result = frame
+                .buffer()
+                .map_err(|_| CaptureFailure::CaptureUnavailable)
+                .and_then(|buffer| {
+                    RgbaImage::from_raw(
+                        width,
+                        height,
+                        buffer.as_nopadding_buffer(&mut self.scratch).to_vec(),
+                    )
+                    .ok_or(CaptureFailure::CaptureUnavailable)
+                });
+            match self.frames.try_send(result) {
+                Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+                Err(TrySendError::Disconnected(_)) => {
+                    control.stop();
+                    Ok(())
+                }
+            }
+        }
+
+        fn on_closed(&mut self) -> Result<(), Self::Error> {
+            let _ = self
+                .frames
+                .try_send(Err(CaptureFailure::CaptureUnavailable));
+            Ok(())
+        }
+    }
+
+    pub(super) struct PlatformFrameStream {
+        frames: Receiver<FrameResult>,
+        control: Option<CaptureControl<FrameHandler, String>>,
+    }
+
+    impl PlatformFrameStream {
+        pub(super) fn open(
+            target: CaptureTarget,
+            frames_per_second: u8,
+        ) -> Result<Self, CaptureFailure> {
+            // Preserve the process + native-window identity check before converting the exact
+            // HWND into the Windows Graphics Capture source.
+            let windows = xcap::Window::all().map_err(|_| CaptureFailure::WindowEnumeration)?;
+            drop(find_native_window(windows, target)?);
+
+            let raw_window = usize::try_from(target.window().get()).map_err(|_| {
+                CaptureFailure::TargetNotFound {
+                    window_count: 0,
+                    pid_matches: 0,
+                    window_matches: 0,
+                }
+            })? as *mut c_void;
+            let window = Window::from_raw_hwnd(raw_window);
+            if !window.is_valid() {
+                return Err(CaptureFailure::CaptureUnavailable);
+            }
+            let (sender, frames) = sync_channel(2);
+            let period = Duration::from_nanos(1_000_000_000 / u64::from(frames_per_second));
+            let settings = Settings::new(
+                window,
+                CursorCaptureSettings::WithoutCursor,
+                DrawBorderSettings::WithoutBorder,
+                SecondaryWindowSettings::Exclude,
+                MinimumUpdateIntervalSettings::Custom(period),
+                DirtyRegionSettings::Default,
+                ColorFormat::Rgba8,
+                sender,
+            );
+            let control = FrameHandler::start_free_threaded(settings)
+                .map_err(|_| CaptureFailure::CaptureUnavailable)?;
+            Ok(Self {
+                frames,
+                control: Some(control),
+            })
+        }
+
+        pub(super) fn next_frame(
+            &mut self,
+            deadline: Duration,
+        ) -> Result<RgbaImage, CaptureFailure> {
+            self.frames
+                .recv_timeout(deadline)
+                .map_err(|error| match error {
+                    std::sync::mpsc::RecvTimeoutError::Timeout => CaptureFailure::FrameTimeout,
+                    std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                        CaptureFailure::CaptureUnavailable
+                    }
+                })?
+        }
+    }
+
+    impl Drop for PlatformFrameStream {
+        fn drop(&mut self) {
+            if let Some(control) = self.control.take() {
+                drop(control.stop());
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod platform_stream {
+    use std::time::Duration;
+
+    use image::RgbaImage;
+
+    use super::{CaptureFailure, CaptureTarget, live_frame};
+
+    pub(super) struct PlatformFrameStream {
+        target: CaptureTarget,
+    }
+
+    impl PlatformFrameStream {
+        pub(super) fn open(
+            target: CaptureTarget,
+            _frames_per_second: u8,
+        ) -> Result<Self, CaptureFailure> {
+            // Validate capture synchronously so start_video_recording fails before returning.
+            drop(live_frame(target)?);
+            Ok(Self { target })
+        }
+
+        pub(super) fn next_frame(
+            &mut self,
+            _deadline: Duration,
+        ) -> Result<RgbaImage, CaptureFailure> {
+            live_frame(self.target).map(|frame| frame.image)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -318,102 +578,51 @@ struct RegionMapping {
 fn region_mapping(
     image_width: u32,
     image_height: u32,
-    logical_size: Option<(f32, f32)>,
-    native_origin: Option<(i32, i32)>,
-    content_geometry: Option<CaptureGeometry>,
-) -> RegionMapping {
-    if let Some(geometry) = content_geometry {
-        let bounds = geometry.content_bounds;
-        let scale = geometry.scale_factor;
-        let global_offsets = native_origin.map(|(native_x, native_y)| {
-            (
-                bounds.x.mul_add(scale, -(native_x as f32)),
-                bounds.y.mul_add(scale, -(native_y as f32)),
-            )
-        });
-        // The published semantic root is the authoritative drawable area. On Windows, GPUI's
-        // platform `viewport_size` can temporarily include non-client chrome while the semantic
-        // root remains correctly client-relative. Prefer the root dimensions when available and
-        // retain the geometry dimensions as a fallback for native-only callers.
-        let (content_logical_width, content_logical_height) = logical_size
-            .filter(|(width, height)| *width > 0.0 && *height > 0.0)
-            .unwrap_or((bounds.width, bounds.height));
-        let tolerance = 2.0;
-        // WGC can exclude a few resize-border pixels horizontally even though GPUI reports the
-        // requested logical window width. Preserve the platform scale when the content fits, and
-        // only compress an axis when its predicted client area is larger than the capture.
-        let scale_x = if content_logical_width * scale > image_width as f32 + tolerance {
-            image_width as f32 / content_logical_width
-        } else {
-            scale
-        };
-        let scale_y = if content_logical_height * scale > image_height as f32 + tolerance {
-            image_height as f32 / content_logical_height
-        } else {
-            scale
-        };
-        let content_width = content_logical_width * scale_x;
-        let content_height = content_logical_height * scale_y;
-        let horizontal_inset = ((image_width as f32 - content_width) / 2.0).max(0.0);
-        let top_inset = (image_height as f32 - content_height).max(0.0);
-        let offset_x = global_offsets
-            .filter(|(global_offset_x, _)| {
-                (*global_offset_x + content_width - image_width as f32).abs() <= tolerance
-            })
-            .map_or(horizontal_inset, |(global_offset_x, _)| global_offset_x);
-        let offset_y = global_offsets
-            .filter(|(_, global_offset_y)| {
-                (*global_offset_y + content_height - image_height as f32).abs() <= tolerance
-            })
-            .map_or(top_inset, |(_, global_offset_y)| global_offset_y);
-        let content_right = content_width + offset_x;
-        let content_bottom = content_height + offset_y;
-        if bounds.is_valid()
-            && scale.is_finite()
-            && scale > 0.0
-            && offset_x >= -tolerance
-            && offset_y >= -tolerance
-            && content_right <= image_width as f32 + tolerance
-            && content_bottom <= image_height as f32 + tolerance
-        {
-            return RegionMapping {
-                offset_x: offset_x.max(0.0),
-                offset_y: offset_y.max(0.0),
-                scale_x,
-                scale_y,
-            };
-        }
-    }
-
-    if let Some((logical_width, logical_height)) =
-        logical_size.filter(|(width, height)| *width > 0.0 && *height > 0.0)
+    native_origin: (i32, i32),
+    geometry: CaptureGeometry,
+) -> Result<RegionMapping, CaptureFailure> {
+    let bounds = geometry.content_bounds;
+    let (viewport_width, viewport_height) = geometry.viewport_size;
+    let scale = geometry.scale_factor;
+    if !bounds.is_valid()
+        || !scale.is_finite()
+        || scale <= 0.0
+        || !viewport_width.is_finite()
+        || !viewport_height.is_finite()
+        || viewport_width <= 0.0
+        || viewport_height <= 0.0
     {
-        // Portable decorated-window fallback. A semantic root is client-relative, while native
-        // capture APIs commonly return the complete decorated frame. The horizontal ratio is the
-        // best available physical scale because title bars add height but not material width;
-        // any remaining vertical pixels are therefore the top decoration inset. If the captured
-        // image is shorter instead, constrain the vertical scale and do not invent an inset.
-        let scale_x = image_width as f32 / logical_width;
-        let predicted_content_height = logical_height * scale_x;
-        let (offset_y, scale_y) = if predicted_content_height <= image_height as f32 {
-            (image_height as f32 - predicted_content_height, scale_x)
-        } else {
-            (0.0, image_height as f32 / logical_height)
-        };
-        return RegionMapping {
-            offset_x: 0.0,
-            offset_y,
-            scale_x,
-            scale_y,
-        };
+        return Err(CaptureFailure::MissingGeometry);
     }
 
-    RegionMapping {
-        offset_x: 0.0,
-        offset_y: 0.0,
-        scale_x: 1.0,
-        scale_y: 1.0,
+    let offset_x = bounds.x.mul_add(scale, -(native_origin.0 as f32));
+    let offset_y = bounds.y.mul_add(scale, -(native_origin.1 as f32));
+    if !offset_x.is_finite()
+        || !offset_y.is_finite()
+        || offset_x < 0.0
+        || offset_y < 0.0
+        || offset_x >= image_width as f32
+        || offset_y >= image_height as f32
+    {
+        return Err(CaptureFailure::MissingGeometry);
     }
+
+    let scale_x = (image_width as f32 - offset_x) / viewport_width;
+    let scale_y = (image_height as f32 - offset_y) / viewport_height;
+    let minimum_scale = scale * 0.75;
+    let maximum_scale = scale * 1.25;
+    if !(minimum_scale..=maximum_scale).contains(&scale_x)
+        || !(minimum_scale..=maximum_scale).contains(&scale_y)
+    {
+        return Err(CaptureFailure::MissingGeometry);
+    }
+
+    Ok(RegionMapping {
+        offset_x,
+        offset_y,
+        scale_x,
+        scale_y,
+    })
 }
 
 fn capture_after_compositor_settle<T>(
@@ -451,7 +660,7 @@ fn capture_fresh_frame<T, E: Clone>(
     // sequence of ordered samples and return the newest one. Requiring byte equality is incorrect:
     // native capture borders and legitimate animation may change between every sample.
     let started = now();
-    let Some(deadline) = started.checked_add(options.compositor_stability_deadline()) else {
+    let Some(deadline) = started.checked_add(options.settle_deadline()) else {
         return Err(unstable_error.clone());
     };
     let mut latest = capture()?;
@@ -483,25 +692,24 @@ fn validate_target(target: ScreenshotTarget) -> Result<(), CaptureFailure> {
 
 fn find_native_window(
     windows: Vec<xcap::Window>,
-    pid: u32,
-    title: &str,
+    target: CaptureTarget,
 ) -> Result<xcap::Window, CaptureFailure> {
     let window_count = windows.len();
     let mut pid_matches = 0_usize;
-    let mut title_matches = 0_usize;
+    let mut window_matches = 0_usize;
     for window in windows {
-        let pid_matches_window = window.pid().ok() == Some(pid);
-        let title_matches_window = window.title().ok().as_deref() == Some(title);
+        let pid_matches_window = window.pid().ok() == Some(target.process().get());
+        let window_matches_window = window.id().ok() == Some(target.window().get());
         pid_matches += usize::from(pid_matches_window);
-        title_matches += usize::from(title_matches_window);
-        if pid_matches_window && title_matches_window {
+        window_matches += usize::from(window_matches_window);
+        if pid_matches_window && window_matches_window {
             return Ok(window);
         }
     }
     Err(CaptureFailure::TargetNotFound {
         window_count,
         pid_matches,
-        title_matches,
+        window_matches,
     })
 }
 
@@ -603,90 +811,46 @@ mod tests {
             region_mapping(
                 1_435,
                 932,
-                Some((1_440.0, 900.0)),
-                Some((100, 100)),
-                Some(CaptureGeometry {
+                (100, 100),
+                CaptureGeometry {
                     content_bounds: Rect {
                         x: 100.0,
                         y: 132.0,
                         width: 1_435.0,
                         height: 900.0,
                     },
+                    viewport_size: (1_440.0, 900.0),
                     scale_factor: 1.0,
-                }),
+                },
             ),
-            RegionMapping {
+            Ok(RegionMapping {
                 offset_x: 0.0,
                 offset_y: 32.0,
                 scale_x: 1_435.0 / 1_440.0,
                 scale_y: 1.0,
-            }
+            })
         );
     }
 
     #[test]
-    fn client_size_derives_title_chrome_when_global_origin_is_outer_origin() {
+    fn inconsistent_native_and_client_origins_are_rejected() {
         assert_eq!(
             region_mapping(
                 1_435,
                 932,
-                Some((1_440.0, 900.0)),
-                Some((100, 100)),
-                Some(CaptureGeometry {
+                (100, 132),
+                CaptureGeometry {
                     content_bounds: Rect {
                         x: 100.0,
                         y: 100.0,
                         width: 1_435.0,
                         height: 900.0,
                     },
+                    viewport_size: (1_440.0, 900.0),
                     scale_factor: 1.0,
-                }),
+                },
             ),
-            RegionMapping {
-                offset_x: 0.0,
-                offset_y: 32.0,
-                scale_x: 1_435.0 / 1_440.0,
-                scale_y: 1.0,
-            }
-        );
-    }
-
-    #[test]
-    fn client_size_derives_title_chrome_without_native_origin() {
-        assert_eq!(
-            region_mapping(
-                1_435,
-                932,
-                Some((1_440.0, 900.0)),
-                None,
-                Some(CaptureGeometry {
-                    content_bounds: Rect {
-                        width: 1_440.0,
-                        height: 932.0,
-                        ..Rect::default()
-                    },
-                    scale_factor: 1.0,
-                }),
-            ),
-            RegionMapping {
-                offset_x: 0.0,
-                offset_y: 32.0,
-                scale_x: 1_435.0 / 1_440.0,
-                scale_y: 1.0,
-            }
-        );
-    }
-
-    #[test]
-    fn semantic_root_derives_decorated_capture_without_native_geometry() {
-        assert_eq!(
-            region_mapping(1_435, 932, Some((1_440.0, 900.0)), None, None),
-            RegionMapping {
-                offset_x: 0.0,
-                offset_y: 932.0 - 900.0 * (1_435.0 / 1_440.0),
-                scale_x: 1_435.0 / 1_440.0,
-                scale_y: 1_435.0 / 1_440.0,
-            }
+            Err(CaptureFailure::MissingGeometry)
         );
     }
 }

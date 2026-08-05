@@ -1,27 +1,22 @@
 (
     version: 1,
     bindings: [
-        Event(
-            target: Id("run-build"),
-            event: Click,
-            handler: "run_build",
-        ),
-        Event(
-            target: Id("reset-build"),
-            event: Click,
-            handler: "reset_build",
-        ),
-        Property(
-            target: Id("build-count"),
-            property: Text,
-            source: "build_count",
-            mode: OneWay,
-        ),
-        Property(
-            target: Id("status-message"),
-            property: Text,
-            source: "status_message",
-            mode: OneWay,
-        ),
+        Event(target: Id("toggle-explorer"), event: Click, handler: "toggle_explorer"),
+        Event(target: Id("toggle-panel"), event: Click, handler: "toggle_panel"),
+        Event(target: Id("close-panel"), event: Click, handler: "toggle_panel"),
+        Event(target: Id("file-main"), event: Click, handler: "open_main"),
+        Event(target: Id("file-theme"), event: Click, handler: "open_theme"),
+        Event(target: Id("file-readme"), event: Click, handler: "open_readme"),
+        Event(target: Id("run-project"), event: Click, handler: "run_project"),
+        Event(target: Id("theme-midnight"), event: Click, handler: "select_midnight"),
+        Event(target: Id("theme-ayu"), event: Click, handler: "select_ayu"),
+        Event(target: Id("clear-terminal"), event: Click, handler: "clear_terminal"),
+
+        Property(target: Id("explorer"), property: Visible, source: "explorer_visible", mode: OneWay),
+        Property(target: Id("bottom-panel"), property: Visible, source: "panel_visible", mode: OneWay),
+        Property(target: Id("active-file-tab"), property: Text, source: "active_file", mode: OneWay),
+        Property(target: Id("active-file-crumb"), property: Text, source: "active_file", mode: OneWay),
+        Property(target: Id("status-message"), property: Text, source: "status_message", mode: OneWay),
+        Property(target: Id("code-editor"), property: Value, source: "editor_value", mode: TwoWay),
     ],
 )

@@ -1,16 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io::Cursor;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
-use gpui_mcp_capture::CaptureOptions;
 use gpui_mcp_protocol::{
-    ActionOutcome, BridgeResult, Capability, ContextResourceDescriptor, FrameStats, Highlight,
-    InputCommand, LiveDocumentSource, MouseButton, NativeInputCommand, NativeScrollDelta,
-    NodeAction, NodeState, Operation, Point, Rect, Role, Screenshot, ScreenshotTarget,
-    SemanticAction, UiNode, UiTree, ValueInfo,
+    BridgeResult, Capability, ContextResourceDescriptor, FrameStats, Highlight, InputCommand,
+    LiveDocumentSource, MouseButton, NodeAction, NodeState, Operation, Point, PointerCommand,
+    PointerScrollDelta, Rect, Role, Screenshot, ScreenshotTarget, UiNode, UiTree, ValueInfo,
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use rmcp::{
@@ -18,8 +17,8 @@ use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
         CallToolResult, ContentBlock, ErrorData, Implementation, ListResourcesResult,
-        PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult, Resource,
-        ResourceContents, ServerCapabilities, ServerInfo,
+        PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+        ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerInfo,
     },
     service::RequestContext,
     tool, tool_handler, tool_router,
@@ -33,7 +32,7 @@ use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{AppInfo, BridgeClient, BridgeRegistry};
-use crate::recording::{ArtifactStore, RecordingState};
+use crate::recording::{ArtifactStore, RecordingArtifact};
 
 mod application_commands;
 mod connection;
@@ -59,16 +58,17 @@ pub(crate) struct GpuiMcp {
     registry: BridgeRegistry,
     tool_router: ToolRouter<Self>,
     snapshots: Arc<RwLock<SnapshotStore>>,
-    recording: Arc<Mutex<RecordingState>>,
     recording_task: Arc<Mutex<Option<RecordingTask>>>,
+    recording_session: Arc<AtomicU64>,
+    pointer: Arc<Mutex<Point>>,
     artifacts: ArtifactStore,
-    capture_options: CaptureOptions,
     target_transition: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct RecordingTask {
     cancellation: CancellationToken,
-    join: JoinHandle<()>,
+    join: JoinHandle<Result<RecordingArtifact, String>>,
+    session_id: u64,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -132,17 +132,6 @@ struct ClickPointArgs {
     /// Click count from 1 through 3.
     #[serde(default = "default_click_count")]
     count: u8,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct NativeClickPointArgs {
-    /// Window-relative logical x coordinate.
-    x: f32,
-    /// Window-relative logical y coordinate.
-    y: f32,
-    /// `left`, `right`, or `middle`.
-    #[serde(default)]
-    button: MouseButton,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -219,7 +208,7 @@ struct SetTextArgs {
 struct SetValueArgs {
     /// Value-bearing semantic node identifier.
     id: String,
-    /// Replacement value, validated against annotated numeric bounds when present.
+    /// Replacement value, validated against exposed numeric bounds when present.
     value: String,
 }
 
@@ -231,35 +220,23 @@ struct ScrollArgs {
     x: Option<f32>,
     /// Window-relative y coordinate when `id` is omitted.
     y: Option<f32>,
-    /// Horizontal logical-pixel delta.
+    /// Horizontal logical-pixel delta; positive values scroll content right.
     #[serde(default)]
     delta_x: f32,
-    /// Vertical logical-pixel delta.
+    /// Vertical logical-pixel delta; positive values scroll content down.
     delta_y: f32,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct NativeScrollElementArgs {
-    /// Stable semantic node identifier whose live bounds center receives the native wheel event.
-    id: String,
-    /// Horizontal logical-pixel delta.
-    #[serde(default)]
-    delta_x: f32,
-    /// Vertical logical-pixel delta.
-    #[serde(default)]
-    delta_y: f32,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct NativeScrollPointArgs {
+struct ScrollPointArgs {
     /// Window-relative logical x coordinate.
     x: f32,
     /// Window-relative logical y coordinate.
     y: f32,
-    /// Horizontal logical-pixel delta.
+    /// Horizontal logical-pixel delta; positive values scroll content right.
     #[serde(default)]
     delta_x: f32,
-    /// Vertical logical-pixel delta.
+    /// Vertical logical-pixel delta; positive values scroll content down.
     #[serde(default)]
     delta_y: f32,
 }
@@ -347,10 +324,9 @@ struct CaptureNamedArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct StopVideoRecordingArgs {
+struct StartVideoRecordingArgs {
     /// Portable MP4 filename written inside the server-configured artifact directory.
-    /// Must be one 1-128 byte ASCII filename ending in lowercase `.mp4`; paths,
-    /// separators, traversal, hidden names, and Windows device names are rejected.
+    /// This is selected when recording starts so invalid destinations fail before capture.
     #[schemars(
         length(min = 1, max = 128),
         regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9._-]*[.]mp4$")
@@ -360,35 +336,11 @@ struct StopVideoRecordingArgs {
     /// Symlinks and non-regular files are always rejected.
     #[serde(default)]
     overwrite: bool,
-    /// Optional per-frame duration in milliseconds (20..=10000). This is primarily
-    /// for checkpoint recordings. Continuous recordings default to the duration
-    /// derived from their configured `frames_per_second`.
-    #[serde(default)]
-    #[schemars(range(min = 20, max = 10000))]
-    frame_duration_ms: Option<u32>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum VideoCaptureMode {
-    /// Capture only when `capture_video_frame` is called.
-    Checkpoint,
-    /// Continuously capture rendered GPUI frames at the requested bounded rate.
-    #[default]
-    Continuous,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct StartVideoRecordingArgs {
     /// Draw the current GPUI window-relative pointer into every captured frame. This is enabled
     /// by default and works identically on Windows, Linux, and macOS without global OS cursor access.
     #[serde(default = "default_true")]
     include_pointer: bool,
-    /// Capture continuously like a browser screencast, or only on explicit checkpoints.
-    #[serde(default)]
-    mode: VideoCaptureMode,
-    /// Target capture cadence for continuous mode (1..=30; default 10). The encoder
-    /// uses the matching deterministic frame duration.
+    /// Target capture and encoding cadence (1..=30; default 30).
     #[serde(default = "default_video_fps")]
     #[schemars(range(min = 1, max = 30))]
     frames_per_second: u8,
@@ -422,19 +374,15 @@ struct LogsArgs {
 
 #[tool_router(router = core_router)]
 impl GpuiMcp {
-    pub(crate) fn new(
-        registry: BridgeRegistry,
-        artifacts: ArtifactStore,
-        capture_options: CaptureOptions,
-    ) -> Self {
+    pub(crate) fn new(registry: BridgeRegistry, artifacts: ArtifactStore) -> Self {
         Self {
             registry,
             tool_router: Self::production_router(),
             snapshots: Arc::new(RwLock::new(SnapshotStore::default())),
-            recording: Arc::new(Mutex::new(RecordingState::default())),
             recording_task: Arc::new(Mutex::new(None)),
+            recording_session: Arc::new(AtomicU64::new(0)),
+            pointer: Arc::new(Mutex::new(Point::default())),
             artifacts,
-            capture_options,
             target_transition: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -476,9 +424,20 @@ impl GpuiMcp {
         self.ack_after_frame(Operation::Input { command }).await
     }
 
-    async fn dispatch_native_input(&self, command: NativeInputCommand) -> Result<(), String> {
-        self.ack_after_frame(Operation::NativeInput { command })
-            .await
+    async fn dispatch_pointer_input(&self, command: PointerCommand) -> Result<(), String> {
+        let point = match &command {
+            PointerCommand::MouseMove { point, .. }
+            | PointerCommand::MouseDown { point, .. }
+            | PointerCommand::MouseUp { point, .. }
+            | PointerCommand::ScrollWheel { point, .. } => *point,
+        };
+        self.ack_after_frame(Operation::PointerInput { command })
+            .await?;
+        *self
+            .pointer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = point;
+        Ok(())
     }
 
     async fn current_pointer_location(&self) -> Result<Point, String> {
@@ -498,11 +457,11 @@ impl GpuiMcp {
 
     async fn select_target(&self, target_id: &str) -> Result<AppInfo, String> {
         let _transition = self.target_transition.lock().await;
-        if !self
-            .recording
+        if self
+            .recording_task
             .lock()
             .map_err(|_| "recording state lock is poisoned".to_owned())?
-            .is_idle()
+            .is_some()
         {
             return Err(
                 "cannot switch GPUI targets while recording or encoding video; stop the recording first"
@@ -514,53 +473,44 @@ impl GpuiMcp {
         Ok(selected)
     }
 
-    async fn native_click_at(
-        &self,
-        point: Point,
-        button: MouseButton,
-        count: u8,
-    ) -> Result<(), String> {
-        validate_native_point(point)?;
+    async fn click_at(&self, point: Point, button: MouseButton, count: u8) -> Result<(), String> {
+        validate_pointer_point(point)?;
         if !(1..=3).contains(&count) {
-            return Err("native click count must be between 1 and 3".to_owned());
+            return Err("click count must be between 1 and 3".to_owned());
         }
         for click_count in 1..=count {
-            self.dispatch_native_input(NativeInputCommand::MouseDown {
+            self.dispatch_pointer_input(PointerCommand::MouseDown {
                 point,
                 button,
                 click_count,
             })
             .await?;
             if let Err(error) = self
-                .dispatch_native_input(NativeInputCommand::MouseUp {
+                .dispatch_pointer_input(PointerCommand::MouseUp {
                     point,
                     button,
                     click_count,
                 })
                 .await
             {
-                return Err(self
-                    .native_release_error(point, button, click_count, error)
-                    .await);
+                return Err(self.release_error(point, button, click_count, error).await);
             }
         }
         Ok(())
     }
 
-    async fn native_drag_between(&self, from: Point, to: Point, steps: u8) -> Result<(), String> {
-        validate_native_point(from)?;
-        validate_native_point(to)?;
+    async fn drag_between(&self, from: Point, to: Point, steps: u8) -> Result<(), String> {
+        validate_pointer_point(from)?;
+        validate_pointer_point(to)?;
         if !(1..=120).contains(&steps) {
-            return Err("native drag steps must be between 1 and 120".to_owned());
+            return Err("drag steps must be between 1 and 120".to_owned());
         }
         let distance = (to.x - from.x).hypot(to.y - from.y);
         if distance <= 2.0 {
-            return Err(
-                "native drag endpoints must be more than 2 logical pixels apart".to_owned(),
-            );
+            return Err("drag endpoints must be more than 2 logical pixels apart".to_owned());
         }
 
-        self.dispatch_native_input(NativeInputCommand::MouseDown {
+        self.dispatch_pointer_input(PointerCommand::MouseDown {
             point: from,
             button: MouseButton::Left,
             click_count: 1,
@@ -575,20 +525,20 @@ impl GpuiMcp {
                 y: from.y + (to.y - from.y) * progress,
             };
             if let Err(error) = self
-                .dispatch_native_input(NativeInputCommand::MouseMove {
+                .dispatch_pointer_input(PointerCommand::MouseMove {
                     point,
                     pressed_button: Some(MouseButton::Left),
                 })
                 .await
             {
                 return Err(self
-                    .native_release_error(last_point, MouseButton::Left, 1, error)
+                    .release_error(last_point, MouseButton::Left, 1, error)
                     .await);
             }
             last_point = point;
         }
 
-        self.dispatch_native_input(NativeInputCommand::MouseUp {
+        self.dispatch_pointer_input(PointerCommand::MouseUp {
             point: to,
             button: MouseButton::Left,
             click_count: 1,
@@ -596,22 +546,20 @@ impl GpuiMcp {
         .await
     }
 
-    async fn native_scroll_at(
-        &self,
-        point: Point,
-        delta_x: f32,
-        delta_y: f32,
-    ) -> Result<(), String> {
-        validate_native_point(point)?;
-        validate_native_scroll_delta(delta_x, delta_y)?;
-        self.dispatch_native_input(NativeInputCommand::ScrollWheel {
+    async fn scroll_at(&self, point: Point, delta_x: f32, delta_y: f32) -> Result<(), String> {
+        validate_pointer_point(point)?;
+        validate_scroll_delta(delta_x, delta_y)?;
+        self.dispatch_pointer_input(PointerCommand::ScrollWheel {
             point,
-            delta: NativeScrollDelta::Pixels { delta_x, delta_y },
+            delta: PointerScrollDelta::Pixels {
+                delta_x: -delta_x,
+                delta_y: -delta_y,
+            },
         })
         .await
     }
 
-    async fn native_release_error(
+    async fn release_error(
         &self,
         point: Point,
         button: MouseButton,
@@ -619,7 +567,7 @@ impl GpuiMcp {
         error: String,
     ) -> String {
         match self
-            .dispatch_native_input(NativeInputCommand::MouseUp {
+            .dispatch_pointer_input(PointerCommand::MouseUp {
                 point,
                 button,
                 click_count,
@@ -633,59 +581,21 @@ impl GpuiMcp {
         }
     }
 
-    async fn click_node(&self, id: &str, button: MouseButton, count: u8) -> Result<(), String> {
-        let tree = self.tree().await?;
-        self.invoke_node(&tree, id, SemanticAction::Click { button, count })
-            .await
+    async fn element_point(&self, id: &str, action: NodeAction) -> Result<Point, String> {
+        let node = self.element_with_action(id, action).await?;
+        Ok(require_bounds(&node)?.center())
     }
 
-    async fn invoke_node(
-        &self,
-        tree: &UiTree,
-        id: &str,
-        action: SemanticAction,
-    ) -> Result<(), String> {
-        let mut fresh_tree = None;
-        for attempt in 0..=1 {
-            let current_tree = fresh_tree.as_ref().unwrap_or(tree);
-            let node = get_node(current_tree, id)?;
-            if !node.state.visible || !node.state.enabled {
-                return Err(format!("element {id:?} is not visible and enabled"));
-            }
-            let required_action = action.required_node_action();
-            if !node.actions.contains(&required_action) {
-                return Err(format!(
-                    "element {id:?} does not advertise the {required_action:?} action"
-                ));
-            }
-            let result = self
-                .call(Operation::Invoke {
-                    node_id: id.to_owned(),
-                    expected_generation: current_tree.generation,
-                    action: action.clone(),
-                })
-                .await;
-            match result {
-                Err(error) if attempt == 0 && is_stale_generation_error(&error) => {
-                    fresh_tree = Some(self.tree().await?);
-                }
-                Err(error) => return Err(error),
-                Ok(BridgeResult::Action(ActionOutcome::Handled)) => {
-                    // Semantic generations intentionally remain stable when only pixels change.
-                    // Wait for the completed repaint instead so every following operation observes
-                    // the action's fully painted result.
-                    self.settle_after_refresh(Duration::from_secs(2)).await?;
-                    return Ok(());
-                }
-                Ok(BridgeResult::Action(ActionOutcome::Rejected { reason })) => {
-                    return Err(reason);
-                }
-                Ok(_) => {
-                    return Err("bridge returned the wrong result for semantic action".to_owned());
-                }
-            }
+    async fn element_with_action(&self, id: &str, action: NodeAction) -> Result<UiNode, String> {
+        let tree = self.tree().await?;
+        let node = get_node(&tree, id)?;
+        if !node.state.visible || !node.state.enabled {
+            return Err(format!("element {id:?} is not visible and enabled"));
         }
-        Err("semantic action retry was exhausted".to_owned())
+        if !node.actions.contains(&action) {
+            return Err(format!("element {id:?} does not support {action:?}"));
+        }
+        Ok(node.clone())
     }
 
     async fn wait_for_tree(&self, generation: u64, wait: Duration) -> Result<UiTree, String> {
@@ -726,9 +636,8 @@ impl GpuiMcp {
 
     async fn capture(&self, target: ScreenshotTarget) -> Result<Screenshot, String> {
         self.settle_after_refresh(Duration::from_secs(2)).await?;
-        let tree = self.tree().await?;
         let client = self.client().await?;
-        crate::capture::capture(&client, &tree, target, self.capture_options).await
+        crate::capture::capture(&client, target).await
     }
 
     async fn stored_images(
@@ -794,7 +703,7 @@ impl ServerHandler for GpuiMcp {
         ServerInfo::new(capabilities)
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "Discover, inspect, and automate explicitly instrumented GPUI windows. Call list_apps first when more than one app may be running, then select_app with the desired target_id; a single live app is selected automatically. Selection persists for this MCP transport. Prefer semantic element tools over coordinates. Pointer actions require app-provided NodeSpec::on_event handlers; keyboard input uses GPUI directly. Screenshots and snapshots remain in memory, and all coordinates are logical pixels relative to the selected window. Video recording is a continuous bounded screencast by default: keep one MCP transport open for start_video_recording and stop_video_recording; capture_video_frame is an optional explicit checkpoint. Targets cannot be switched during recording or encoding. The recording artifact is an H.264 MP4 with an optional GPUI pointer overlay; it never controls or reads the global OS cursor. Video tools accept only a portable MP4 artifact name inside the server-configured artifact directory; overwrite is opt-in."
+                "Discover, inspect, and automate explicitly instrumented GPUI windows. Call list_apps first when more than one app may be running, then select_app with the desired target_id; a single live app is selected automatically. Selection persists for this MCP transport. Prefer semantic element tools over coordinates. Pointer actions use GPUI's native event pipeline; keyboard input uses GPUI directly. Screenshots and snapshots remain in memory, and all coordinates are logical pixels relative to the selected window. Video recording continuously captures raw native-window frames and encodes them directly into H.264/MP4 while recording; keep one MCP transport open for start_video_recording and stop_video_recording. Targets cannot be switched during recording. The optional pointer overlay reflects the same GPUI pointer state used for hover and clicks without reading or moving the global OS cursor. Artifact names are portable filenames inside the configured artifact directory; overwrite is opt-in."
                     .to_owned(),
             )
     }
@@ -816,12 +725,12 @@ impl ServerHandler for GpuiMcp {
                     resources.extend(context_resources.into_iter().map(mcp_resource));
                 }
                 Ok(_) => tracing::warn!(
-                    target_id = client.target_id(),
+                    target_id = %client.target_id(),
                     "bridge returned the wrong result while listing context resources"
                 ),
                 Err(error) => tracing::warn!(
                     %error,
-                    target_id = client.target_id(),
+                    target_id = %client.target_id(),
                     "could not list selected bridge context resources"
                 ),
             }
@@ -833,7 +742,7 @@ impl ServerHandler for GpuiMcp {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
+    ) -> Result<ReadResourceResponse, ErrorData> {
         if request.uri == "gpui://apps" {
             let apps = self
                 .registry
@@ -845,7 +754,8 @@ impl ServerHandler for GpuiMcp {
             })?;
             return Ok(ReadResourceResult::new(vec![
                 ResourceContents::text(text, request.uri).with_mime_type("application/json"),
-            ]));
+            ])
+            .into());
         }
         let result = self
             .call(Operation::ReadContextResource {
@@ -862,7 +772,8 @@ impl ServerHandler for GpuiMcp {
         Ok(ReadResourceResult::new(vec![
             ResourceContents::text(resource.text, resource.descriptor.uri)
                 .with_mime_type(resource.descriptor.mime_type),
-        ]))
+        ])
+        .into())
     }
 }
 
@@ -913,7 +824,7 @@ fn default_click_count() -> u8 {
 }
 
 fn default_video_fps() -> u8 {
-    10
+    30
 }
 
 fn default_drag_steps() -> u8 {
@@ -932,7 +843,7 @@ fn default_log_limit() -> u16 {
     100
 }
 
-fn validate_native_point(point: Point) -> Result<(), String> {
+fn validate_pointer_point(point: Point) -> Result<(), String> {
     if !point.is_valid() {
         return Err("native input coordinates must be finite".to_owned());
     }
@@ -942,12 +853,12 @@ fn validate_native_point(point: Point) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_native_scroll_delta(delta_x: f32, delta_y: f32) -> Result<(), String> {
+fn validate_scroll_delta(delta_x: f32, delta_y: f32) -> Result<(), String> {
     if !delta_x.is_finite() || !delta_y.is_finite() {
-        return Err("native scroll deltas must be finite".to_owned());
+        return Err("scroll deltas must be finite".to_owned());
     }
     if delta_x.abs() > 100_000.0 || delta_y.abs() > 100_000.0 {
-        return Err("native scroll delta exceeds the safety bound".to_owned());
+        return Err("scroll delta exceeds the safety bound".to_owned());
     }
     Ok(())
 }
@@ -988,26 +899,26 @@ fn require_bounds(node: &UiNode) -> Result<Rect, String> {
         .ok_or_else(|| format!("element {:?} has no valid current bounds", node.id))
 }
 
-fn validate_value(input: &str, annotation: &ValueInfo) -> Result<(), String> {
-    if annotation.min.is_none() && annotation.max.is_none() && annotation.step.is_none() {
+fn validate_value(input: &str, value: &ValueInfo) -> Result<(), String> {
+    if value.min.is_none() && value.max.is_none() && value.step.is_none() {
         return Ok(());
     }
     let number: f64 = input
         .parse()
-        .map_err(|_| "annotated numeric value requires a finite number".to_owned())?;
+        .map_err(|_| "numeric value requires a finite number".to_owned())?;
     if !number.is_finite() {
-        return Err("annotated numeric value requires a finite number".to_owned());
+        return Err("numeric value requires a finite number".to_owned());
     }
-    if annotation.min.is_some_and(|min| number < min) {
+    if value.min.is_some_and(|min| number < min) {
         return Err(format!(
-            "value is below the annotated minimum {min}",
-            min = annotation.min.unwrap_or_default()
+            "value is below the minimum {min}",
+            min = value.min.unwrap_or_default()
         ));
     }
-    if annotation.max.is_some_and(|max| number > max) {
+    if value.max.is_some_and(|max| number > max) {
         return Err(format!(
-            "value is above the annotated maximum {max}",
-            max = annotation.max.unwrap_or_default()
+            "value is above the maximum {max}",
+            max = value.max.unwrap_or_default()
         ));
     }
     Ok(())
@@ -1195,10 +1106,6 @@ fn performance_assessment(stats: &FrameStats) -> &'static str {
     }
 }
 
-fn is_stale_generation_error(error: &str) -> bool {
-    error.starts_with("StaleGeneration:")
-}
-
 fn ack_json(action: &'static str) -> Json<Value> {
     object_output(json!({ "ok": true, "action": action }))
 }
@@ -1238,23 +1145,10 @@ mod tests {
     use gpui_mcp_protocol::{BridgeResult, FrameStats, NodeState, Operation, UiNode};
     use serde_json::json;
 
-    use crate::recording::validate_frame_delay;
-
     use super::{
-        FindArgs, Role, StartVideoRecordingArgs, UiTree, VideoCaptureMode, WaitStateArgs,
-        default_result_limit_for_test, find_nodes, is_stale_generation_error,
-        settle_refresh_frames, state_matches, tree_diff,
+        FindArgs, Role, StartVideoRecordingArgs, UiTree, WaitStateArgs,
+        default_result_limit_for_test, find_nodes, settle_refresh_frames, state_matches, tree_diff,
     };
-
-    #[test]
-    fn semantic_retry_matches_only_typed_stale_generation_errors() {
-        assert!(is_stale_generation_error(
-            "StaleGeneration: semantic tree changed"
-        ));
-        assert!(!is_stale_generation_error(
-            "NotFound: StaleGeneration is only message text"
-        ));
-    }
 
     #[tokio::test]
     async fn mutation_settlement_waits_from_each_refresh_token() -> Result<(), String> {
@@ -1437,14 +1331,6 @@ mod tests {
                 "pointer_click",
                 "pointer_drag",
                 "pointer_scroll",
-                "native_click",
-                "native_double_click",
-                "native_hover",
-                "native_drag",
-                "native_scroll",
-                "native_click_coordinates",
-                "native_drag_coordinates",
-                "native_scroll_coordinates",
                 "keyboard",
                 "type_text",
                 "focus_element",
@@ -1476,7 +1362,6 @@ mod tests {
                 "compare_screenshots",
                 "diff_screenshots",
                 "start_video_recording",
-                "capture_video_frame",
                 "stop_video_recording",
             ]
             .map(str::to_owned),
@@ -1485,35 +1370,32 @@ mod tests {
     }
 
     #[test]
-    fn default_video_recording_uses_continuous_screencast_mode() -> Result<(), String> {
-        let args = serde_json::from_value::<StartVideoRecordingArgs>(json!({}))
-            .map_err(|error| error.to_string())?;
+    fn default_video_recording_uses_live_thirty_fps_capture() -> Result<(), String> {
+        let args = serde_json::from_value::<StartVideoRecordingArgs>(json!({
+            "artifact_name": "demo.mp4"
+        }))
+        .map_err(|error| error.to_string())?;
 
-        assert_eq!(args.mode, VideoCaptureMode::Continuous);
-        assert_eq!(args.frames_per_second, 10);
-        validate_frame_delay(1_000 / u32::from(args.frames_per_second))
+        assert_eq!(args.frames_per_second, 30);
+        assert!(args.include_pointer);
+        Ok(())
     }
 
     #[test]
-    fn stop_video_recording_schema_exposes_input_bounds() -> Result<(), String> {
+    fn start_video_recording_schema_exposes_destination_bounds() -> Result<(), String> {
         let router = super::GpuiMcp::production_router();
         let Some(tool) = router
             .list_all()
             .into_iter()
-            .find(|tool| tool.name == "stop_video_recording")
+            .find(|tool| tool.name == "start_video_recording")
         else {
-            return Err("stop_video_recording was not registered".to_owned());
+            return Err("start_video_recording was not registered".to_owned());
         };
         let properties = tool
             .input_schema
             .get("properties")
             .and_then(serde_json::Value::as_object)
-            .ok_or_else(|| "stop_video_recording schema has no properties".to_owned())?;
-        let delay = properties
-            .get("frame_duration_ms")
-            .ok_or_else(|| "frame_duration_ms schema is missing".to_owned())?;
-        assert_eq!(delay.get("minimum"), Some(&json!(20)));
-        assert_eq!(delay.get("maximum"), Some(&json!(10_000)));
+            .ok_or_else(|| "start_video_recording schema has no properties".to_owned())?;
         let artifact_name = properties
             .get("artifact_name")
             .ok_or_else(|| "artifact_name schema is missing".to_owned())?;

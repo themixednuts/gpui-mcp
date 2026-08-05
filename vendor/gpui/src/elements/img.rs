@@ -1,9 +1,10 @@
 use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
     Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
-    SMOOTH_SVG_SCALE_FACTOR, SharedString, SharedUri, StyleRefinement, Styled, SvgSize, Task,
-    Window, px, swap_rgba_pa_to_bgra,
+    Interactivity, InteractivitySemanticsExt, IntoElement, LayoutId, Length, ObjectFit, Pixels,
+    RenderImage, Resource, SMOOTH_SVG_SCALE_FACTOR, SemanticAction, SemanticRole, Semantics,
+    SharedString, SharedUri, StyleRefinement, Styled, SvgSize, Task, Window, px,
+    swap_rgba_pa_to_bgra,
 };
 use anyhow::{Context as _, Result};
 
@@ -269,6 +270,14 @@ impl Element for Img {
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
         self.interactivity.source_location()
+    }
+
+    fn semantics(&self, window: &Window, _cx: &App) -> Option<(Semantics, Vec<SemanticAction>)> {
+        self.interactivity.semantic_node(window, SemanticRole::Image)
+    }
+
+    fn semantic_focus_handle(&self) -> Option<crate::FocusHandle> {
+        self.interactivity.tracked_focus_handle.clone()
     }
 
     fn request_layout(

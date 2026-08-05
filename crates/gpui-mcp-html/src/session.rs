@@ -3,8 +3,8 @@ use std::rc::Rc;
 
 use gpui::{AnyElement, App, Window};
 use gpui_mcp::{
-    Automation, BridgeError, BridgeHandle, ErrorCode, LiveDocument, LiveDocumentDiagnostic,
-    LiveDocumentHostError, LiveDocumentPreview, LiveDocumentRequest, LiveDocumentResponse,
+    Automation, BridgeError, BridgeHandle, ErrorCode, HostError, LiveDocument,
+    LiveDocumentDiagnostic, LiveDocumentPreview, LiveDocumentRequest, LiveDocumentResponse,
     LiveDocumentSource, MAX_LABEL_BYTES, MAX_LIVE_DOCUMENT_DIAGNOSTICS,
     MAX_LIVE_DOCUMENT_SOURCE_BYTES,
 };
@@ -93,9 +93,9 @@ impl LiveHtmlSession {
     /// # Errors
     ///
     /// Returns an error when the bridge capability is disabled or already has a host.
-    pub fn register_mcp_preview(&self, bridge: &BridgeHandle) -> Result<(), LiveDocumentHostError> {
+    pub fn serve_mcp(&self, bridge: &BridgeHandle) -> Result<(), HostError> {
         let session = self.clone();
-        bridge.register_live_document_handler(move |request, _, _| session.handle(request))
+        bridge.on_document(move |request, _, _| session.handle(request))
     }
 
     /// Apply the same revision-checked in-memory preview path used by MCP.

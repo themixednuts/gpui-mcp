@@ -9,19 +9,15 @@ repository.workspace = true
 homepage.workspace = true
 
 [[bin]]
-name = "gpui-mcp-server"
+name = "gpui-mcp"
 path = "src/main.rs"
-
-[[bin]]
-name = "gpui-mcp-call"
-path = "src/bin/gpui-mcp-call.rs"
+doc = false
 
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
-directories.workspace = true
 gpui-mcp-capture = { path = "../gpui-mcp-capture" }
 gpui-mcp-protocol = { path = "../gpui-mcp-protocol" }
 image.workspace = true

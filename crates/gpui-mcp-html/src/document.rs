@@ -204,7 +204,7 @@ fn validate_binding_targets(plan: &RenderPlan, bindings: &BindingDocument) -> Ve
             diagnostics.push(HtmlDiagnostic {
                 severity: Severity::Error,
                 message: format!(
-                    "multiple two-way bindings for `{id}` resolve to the same semantic action"
+                    "multiple two-way bindings for `{id}` resolve to the same input channel"
                 ),
                 span: element.span,
             });
@@ -381,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn two_way_properties_cannot_share_one_semantic_action() {
+    fn two_way_properties_cannot_share_one_input_channel() {
         let bindings = BindingDocument::new()
             .with_binding(Binding::Property {
                 target: BindingTarget::Id(ElementId::new("title")),
@@ -399,7 +399,7 @@ mod tests {
         assert!(matches!(
             HtmlUi::compile("<input id=\"title\" type=\"text\">", bindings),
             Err(HtmlUiError::Source { diagnostics })
-                if diagnostics.iter().any(|diagnostic| diagnostic.message.contains("same semantic action"))
+                if diagnostics.iter().any(|diagnostic| diagnostic.message.contains("same input channel"))
         ));
     }
 

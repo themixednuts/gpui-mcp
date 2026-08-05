@@ -14,5 +14,8 @@ gpui-mcp-protocol = { path = "../gpui-mcp-protocol" }
 image.workspace = true
 xcap.workspace = true
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-capture = "2.0.0"
+
 [lints]
 workspace = true

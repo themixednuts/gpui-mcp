@@ -1,14 +1,25 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use gpui::{App, Window};
-use gpui_mcp::ActionOutcome;
 
 use crate::{Binding, BindingDocument, BindingMode, ElementId, HandlerId, StateBindingId, UiEvent};
 
-type EventHook = Rc<dyn Fn(&HookEvent, &mut Window, &mut App) -> ActionOutcome>;
+type EventHook = Rc<dyn Fn(&HookEvent, &mut Window, &mut App) -> HookOutcome>;
 type StateReader = Rc<dyn Fn(&mut Window, &mut App) -> StateValue>;
-type StateWriter = Rc<dyn Fn(StateValue, &mut Window, &mut App) -> ActionOutcome>;
+type StateWriter = Rc<dyn Fn(StateValue, &mut Window, &mut App) -> HookOutcome>;
+
+/// Result returned by an application-owned event or state hook.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HookOutcome {
+    /// The hook accepted and handled the request.
+    Handled,
+    /// The hook deliberately declined the request.
+    Rejected {
+        /// Non-sensitive explanation suitable for diagnostics.
+        reason: String,
+    },
+}
 
 /// Runtime value exposed by an application-owned state binding.
 #[derive(Clone, Debug, PartialEq)]
@@ -106,7 +117,6 @@ struct StateHook {
 pub struct HookRegistry {
     events: HashMap<HandlerId, EventHook>,
     states: HashMap<StateBindingId, StateHook>,
-    design_time_fallback: bool,
 }
 
 impl HookRegistry {
@@ -114,18 +124,6 @@ impl HookRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Permit unresolved hooks as inert design-time capabilities.
-    ///
-    /// Registered hooks still run normally. Missing event hooks acknowledge an
-    /// interaction without executing application code; missing state hooks read
-    /// as empty and accept writes without persistence. Production applications
-    /// should retain the default strict behavior.
-    #[must_use]
-    pub fn with_design_time_fallback(mut self) -> Self {
-        self.design_time_fallback = true;
-        self
     }
 
     /// Register one event callback without replacing an existing symbol.
@@ -136,7 +134,7 @@ impl HookRegistry {
     pub fn register_event(
         &mut self,
         id: HandlerId,
-        hook: impl Fn(&HookEvent, &mut Window, &mut App) -> ActionOutcome + 'static,
+        hook: impl Fn(&HookEvent, &mut Window, &mut App) -> HookOutcome + 'static,
     ) -> Result<(), HookRegistryError> {
         if self.events.contains_key(&id) {
             return Err(HookRegistryError::DuplicateEvent {
@@ -169,7 +167,7 @@ impl HookRegistry {
         &mut self,
         id: StateBindingId,
         read: impl Fn(&mut Window, &mut App) -> StateValue + 'static,
-        write: impl Fn(StateValue, &mut Window, &mut App) -> ActionOutcome + 'static,
+        write: impl Fn(StateValue, &mut Window, &mut App) -> HookOutcome + 'static,
     ) -> Result<(), HookRegistryError> {
         self.register_state_hook(id, Rc::new(read), Some(Rc::new(write)))
     }
@@ -190,34 +188,35 @@ impl HookRegistry {
     }
 
     pub(crate) fn validate(&self, document: &BindingDocument) -> Result<(), HookRegistryError> {
+        let mut missing_events = BTreeSet::new();
+        let mut missing_states = BTreeSet::new();
+        let mut read_only_states = BTreeSet::new();
         for binding in &document.bindings {
             match binding {
-                Binding::Event { handler, .. }
-                    if !self.design_time_fallback && !self.events.contains_key(handler) =>
-                {
-                    return Err(HookRegistryError::MissingEvent {
-                        id: handler.as_str().to_owned(),
-                    });
+                Binding::Event { handler, .. } if !self.events.contains_key(handler) => {
+                    missing_events.insert(handler.as_str().to_owned());
                 }
                 Binding::Property { source, mode, .. } => {
                     let Some(state) = self.states.get(source) else {
-                        if self.design_time_fallback {
-                            continue;
-                        }
-                        return Err(HookRegistryError::MissingState {
-                            id: source.as_str().to_owned(),
-                        });
+                        missing_states.insert(source.as_str().to_owned());
+                        continue;
                     };
                     if *mode == BindingMode::TwoWay && state.writer.is_none() {
-                        return Err(HookRegistryError::ReadOnlyState {
-                            id: source.as_str().to_owned(),
-                        });
+                        read_only_states.insert(source.as_str().to_owned());
                     }
                 }
                 Binding::Event { .. } => {}
             }
         }
-        Ok(())
+        if missing_events.is_empty() && missing_states.is_empty() && read_only_states.is_empty() {
+            Ok(())
+        } else {
+            Err(HookRegistryError::Unresolved {
+                missing_events: missing_events.into_iter().collect(),
+                missing_states: missing_states.into_iter().collect(),
+                read_only_states: read_only_states.into_iter().collect(),
+            })
+        }
     }
 
     pub(crate) fn invoke(
@@ -226,9 +225,9 @@ impl HookRegistry {
         event: &HookEvent,
         window: &mut Window,
         cx: &mut App,
-    ) -> ActionOutcome {
+    ) -> HookOutcome {
         self.events.get(handler).map_or_else(
-            || self.missing_hook_outcome("binding handler is unavailable"),
+            || Self::missing_hook_outcome("binding handler is unavailable"),
             |hook| hook(event, window, cx),
         )
     }
@@ -238,10 +237,10 @@ impl HookRegistry {
         source: &StateBindingId,
         window: &mut Window,
         cx: &mut App,
-    ) -> StateValue {
+    ) -> Option<StateValue> {
         self.states
             .get(source)
-            .map_or(StateValue::Empty, |state| (state.reader)(window, cx))
+            .map(|state| (state.reader)(window, cx))
     }
 
     pub(crate) fn write(
@@ -250,23 +249,19 @@ impl HookRegistry {
         value: StateValue,
         window: &mut Window,
         cx: &mut App,
-    ) -> ActionOutcome {
+    ) -> HookOutcome {
         self.states
             .get(source)
             .and_then(|state| state.writer.as_ref())
             .map_or_else(
-                || self.missing_hook_outcome("state binding is read-only"),
+                || Self::missing_hook_outcome("state binding is read-only"),
                 |writer| writer(value, window, cx),
             )
     }
 
-    fn missing_hook_outcome(&self, reason: &str) -> ActionOutcome {
-        if self.design_time_fallback {
-            ActionOutcome::Handled
-        } else {
-            ActionOutcome::Rejected {
-                reason: reason.to_owned(),
-            }
+    fn missing_hook_outcome(reason: &str) -> HookOutcome {
+        HookOutcome::Rejected {
+            reason: reason.to_owned(),
         }
     }
 }
@@ -286,23 +281,17 @@ pub enum HookRegistryError {
         /// Duplicate symbol.
         id: String,
     },
-    /// A binding references an unregistered event hook.
-    #[error("event hook `{id}` is not registered")]
-    MissingEvent {
-        /// Missing symbol.
-        id: String,
-    },
-    /// A binding references an unregistered state hook.
-    #[error("state hook `{id}` is not registered")]
-    MissingState {
-        /// Missing symbol.
-        id: String,
-    },
-    /// A two-way property references a read-only state hook.
-    #[error("state hook `{id}` is read-only but the binding is two-way")]
-    ReadOnlyState {
-        /// Read-only symbol.
-        id: String,
+    /// One or more binding symbols could not be resolved safely.
+    #[error(
+        "unresolved hooks: missing events {missing_events:?}, missing states {missing_states:?}, read-only states used two-way {read_only_states:?}"
+    )]
+    Unresolved {
+        /// Every missing event symbol, sorted and deduplicated.
+        missing_events: Vec<String>,
+        /// Every missing state symbol, sorted and deduplicated.
+        missing_states: Vec<String>,
+        /// Every read-only state symbol used by a two-way binding.
+        read_only_states: Vec<String>,
     },
 }
 
@@ -334,18 +323,8 @@ mod tests {
     fn strict_registry_rejects_unknown_project_hooks() {
         assert!(matches!(
             HookRegistry::new().validate(&unresolved_document()),
-            Err(HookRegistryError::MissingEvent { .. })
+            Err(HookRegistryError::Unresolved { .. })
         ));
-    }
-
-    #[test]
-    fn design_time_registry_accepts_unknown_project_hooks() {
-        assert!(
-            HookRegistry::new()
-                .with_design_time_fallback()
-                .validate(&unresolved_document())
-                .is_ok()
-        );
     }
 
     #[test]

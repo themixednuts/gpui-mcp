@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use gpui::{
-    App, AppContext as _, Application, AsyncWindowContext, Bounds, Context, IntoElement, Render,
-    Timer, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, px,
+    App, AppContext as _, Application, AsyncWindowContext, Bounds, Context, IntoElement, Modifiers,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, Render, Timer,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, point, px,
     size,
 };
-use gpui_mcp::{Automation, MouseButton, SemanticAction};
+use gpui_mcp::{Automation, NativeWindowId, ProcessId};
 use gpui_mcp_capture::CaptureFailure;
 use gpui_mcp_html::{BindingDocument, HookRegistry, HtmlUi, LiveHtml};
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
@@ -44,12 +45,12 @@ enum Command {
         #[arg(long, value_enum, default_value_t = FixtureState::Baseline)]
         state: FixtureState,
     },
-    /// Capture an exact PID/title window and normalize it to CSS pixels.
+    /// Capture one exact native window and normalize it to CSS pixels.
     Capture {
         #[arg(long)]
         pid: u32,
-        #[arg(long, default_value = WINDOW_TITLE)]
-        title: String,
+        #[arg(long)]
+        window_id: u32,
         #[arg(long)]
         output: PathBuf,
         #[arg(long)]
@@ -92,20 +93,21 @@ enum FixtureState {
 }
 
 impl FixtureState {
-    fn action(self) -> Option<(&'static str, SemanticAction)> {
+    fn action(self) -> Option<(&'static str, FixtureAction)> {
         match self {
             Self::Baseline => None,
-            Self::Hover => Some(("hover-card", SemanticAction::Hover)),
-            Self::Focus => Some(("focus-card", SemanticAction::Focus)),
-            Self::DropdownOpen => Some((
-                "dropdown",
-                SemanticAction::Click {
-                    button: MouseButton::Left,
-                    count: 1,
-                },
-            )),
+            Self::Hover => Some(("hover-card", FixtureAction::Hover)),
+            Self::Focus => Some(("focus-card", FixtureAction::Focus)),
+            Self::DropdownOpen => Some(("dropdown", FixtureAction::Click)),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FixtureAction {
+    Hover,
+    Focus,
+    Click,
 }
 
 struct FixtureView {
@@ -123,7 +125,7 @@ fn main() -> Result<()> {
         Command::Fixture { fixture, state } => run_fixture(fixture, state),
         Command::Capture {
             pid,
-            title,
+            window_id,
             output,
             raw_output,
             width,
@@ -131,8 +133,10 @@ fn main() -> Result<()> {
             timeout_ms,
             settle_ms,
         } => capture_window(&CaptureRequest {
-            pid,
-            title,
+            target: gpui_mcp_capture::CaptureTarget::new(
+                ProcessId::new(pid).context("capture process ID must be nonzero")?,
+                NativeWindowId::new(window_id).context("capture window ID must be nonzero")?,
+            ),
             output,
             raw_output,
             width,
@@ -181,6 +185,11 @@ fn run_fixture(fixture: FixtureName, state: FixtureState) -> Result<()> {
             },
             |window, cx| {
                 window.set_window_title(WINDOW_TITLE);
+                let Some(native_window_id) = window.native_window_id() else {
+                    eprintln!("the active platform does not expose a native window identifier");
+                    cx.quit();
+                    return cx.new(|_| FixtureView { live });
+                };
                 // `Window::resize` is GPUI's cross-platform content-size API. Its
                 // platform implementations account for each OS's non-client area.
                 window.resize(fixture_content_size());
@@ -193,19 +202,13 @@ fn run_fixture(fixture: FixtureName, state: FixtureState) -> Result<()> {
                             return;
                         }
 
-                        if let Some((node_id, action)) = state.action() {
-                            let completed_frame = automation.completed_test_frame_count();
+                        if let Some((node_name, action)) = state.action() {
+                            let completed_frame = automation.completed_frames();
                             let result = cx.update(|window, cx| {
-                                let generation = automation.snapshot().generation;
-                                let result = automation
-                                    .dispatch_test_action(node_id, generation, &action, window, cx);
-                                if result.is_ok() {
-                                    window.refresh();
-                                }
-                                result
+                                apply_fixture_action(&automation, node_name, action, window, cx)
                             });
                             match result {
-                                Ok(Ok(_)) => {}
+                                Ok(Ok(())) => {}
                                 Ok(Err(error)) => {
                                     eprintln!("could not apply fixture state: {}", error.message);
                                     let _ = cx.update(|_, cx| cx.quit());
@@ -224,7 +227,7 @@ fn run_fixture(fixture: FixtureName, state: FixtureState) -> Result<()> {
                                 return;
                             }
                         }
-                        print_ready();
+                        print_ready(native_window_id);
                     })
                     .detach();
                 cx.new(|_| FixtureView { live })
@@ -240,6 +243,78 @@ fn run_fixture(fixture: FixtureName, state: FixtureState) -> Result<()> {
     Ok(())
 }
 
+fn apply_fixture_action(
+    automation: &Automation,
+    node_name: &str,
+    action: FixtureAction,
+    window: &mut Window,
+    cx: &mut App,
+) -> Result<(), gpui_mcp::BridgeError> {
+    let tree = automation.snapshot();
+    let node = tree
+        .nodes
+        .values()
+        .find(|node| node.id == node_name || node.id.ends_with(&format!(".{node_name}")))
+        .ok_or_else(|| {
+            gpui_mcp::BridgeError::new(
+                gpui_mcp::ErrorCode::NotFound,
+                "fixture semantic element was not found",
+            )
+        })?;
+    if matches!(action, FixtureAction::Focus) {
+        if window.focus_semantic_element(&node.id) {
+            return Ok(());
+        }
+        return Err(gpui_mcp::BridgeError::new(
+            gpui_mcp::ErrorCode::NotFound,
+            "fixture semantic element is not focusable",
+        ));
+    }
+    let bounds = node.bounds.ok_or_else(|| {
+        gpui_mcp::BridgeError::new(
+            gpui_mcp::ErrorCode::NotFound,
+            "fixture semantic element has no bounds",
+        )
+    })?;
+    let center = point(px(bounds.center().x), px(bounds.center().y));
+    match action {
+        FixtureAction::Hover => {
+            window.dispatch_event(
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position: center,
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                }),
+                cx,
+            );
+        }
+        FixtureAction::Click => {
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: center,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: center,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                }),
+                cx,
+            );
+        }
+        FixtureAction::Focus => {}
+    }
+    window.refresh();
+    Ok(())
+}
+
 async fn wait_for_content_surface(
     automation: &Automation,
     cx: &mut AsyncWindowContext,
@@ -251,7 +326,7 @@ async fn wait_for_content_surface(
             .update(|window, _| window.viewport_size())
             .context("inspect fixture viewport")?;
         if viewport == target {
-            let completed_frame = automation.completed_test_frame_count();
+            let completed_frame = automation.completed_frames();
             cx.update(|window, _| window.refresh())
                 .context("refresh resized fixture")?;
             return wait_for_completed_frame(automation, completed_frame).await;
@@ -266,7 +341,7 @@ async fn wait_for_content_surface(
 
 async fn wait_for_completed_frame(automation: &Automation, after_frame: u64) -> Result<()> {
     let started = Instant::now();
-    while automation.completed_test_frame_count() <= after_frame {
+    while automation.completed_frames() <= after_frame {
         ensure!(
             started.elapsed() < FIXTURE_READY_TIMEOUT,
             "fixture did not complete a root-paint frame within {FIXTURE_READY_TIMEOUT:?}"
@@ -276,14 +351,13 @@ async fn wait_for_completed_frame(automation: &Automation, after_frame: u64) -> 
     Ok(())
 }
 
-fn print_ready() {
-    println!("READY {} {WINDOW_TITLE}", std::process::id());
+fn print_ready(window_id: u32) {
+    println!("READY {} {window_id}", std::process::id());
     let _ = std::io::stdout().flush();
 }
 
 struct CaptureRequest {
-    pid: u32,
-    title: String,
+    target: gpui_mcp_capture::CaptureTarget,
     output: PathBuf,
     raw_output: Option<PathBuf>,
     width: u32,
@@ -304,7 +378,7 @@ fn capture_window(request: &CaptureRequest) -> Result<()> {
     thread::sleep(request.settle);
     let started = Instant::now();
     let native = loop {
-        match gpui_mcp_capture::capture_native_window(request.pid, &request.title) {
+        match gpui_mcp_capture::frame(request.target, gpui_mcp_capture::CaptureOptions::default()) {
             Ok(capture) => break capture,
             Err(CaptureFailure::TargetNotFound { .. }) if started.elapsed() < request.timeout => {
                 thread::sleep(Duration::from_millis(50));
@@ -319,9 +393,7 @@ fn capture_window(request: &CaptureRequest) -> Result<()> {
     let normalized = normalize_capture(&image, request.width, request.height, native.scale_factor)?;
     save_png(&normalized, &request.output)?;
     let scale = f64::from(normalized.width()) / f64::from(request.width);
-    let reported_size = native
-        .reported_size
-        .unwrap_or((image.width(), image.height()));
+    let reported_size = native.reported_size;
     println!(
         "CAPTURED {}x{} -> {}x{} at {scale:.2}x",
         reported_size.0,

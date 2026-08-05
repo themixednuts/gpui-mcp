@@ -7,7 +7,7 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 
-use crate::render::dispatch_semantic_event;
+use crate::render::dispatch_input_change;
 use crate::{Binding, ElementId, HookRegistry};
 
 /// Initialize native controls used by the live HTML renderer.
@@ -77,11 +77,11 @@ impl RuntimeTextInput {
                 if consume_programmatic_echo(&suppressed_change, &value) {
                     return;
                 }
-                let _ = dispatch_semantic_event(
+                let _ = dispatch_input_change(
                     &this.hooks,
                     &this.element_id,
                     &this.bindings,
-                    &gpui_mcp::NodeEvent::SetValue { value },
+                    value,
                     window,
                     cx,
                 );

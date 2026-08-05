@@ -2,7 +2,7 @@
 
 ## Scope
 
-`gpui-mcp` is a local automation bridge. Anyone who can authenticate to it can invoke annotated application actions and keyboard input, inspect application-published semantics/logs, and request screenshots of the configured application window.
+`gpui-mcp` is a local automation bridge. Anyone who can authenticate to it can drive the rendered application's GPUI input handlers, inspect its semantic tree and logs, and request screenshots of the configured application window.
 
 Do not ship the bridge enabled in a production application unless local automation is an intentional, documented product feature. Prefer a development-only Cargo feature in downstream applications.
 
@@ -29,7 +29,7 @@ The following are outside its boundary:
 
 - a process already running with the same user's privileges and able to read that user's private runtime/local-data files;
 - a compromised instrumented application;
-- secrets deliberately published by application code in labels, text/value annotations, metadata, or logs;
+- secrets deliberately published by application code in semantic labels, text, values, metadata, or logs;
 - operating-system screenshot implementations and desktop portals after the user grants permission;
 - denial of service by the owning user terminating either process.
 
@@ -38,7 +38,7 @@ The following are outside its boundary:
 - Use a dedicated downstream Cargo feature and disable it in release builds.
 - Keep the endpoint descriptor in the default private directory or an equally protected directory.
 - Keep recording artifacts in the default MCP-server-session runtime directory or an explicitly private `--artifact-dir`; never point it at a shared or privileged directory.
-- Drive a recording through one long-lived MCP client session (or one bounded `gpui-mcp-call --batch` invocation); separate one-shot tool processes do not share recording state.
+- Drive a recording through one long-lived MCP client session; recording state belongs to that session.
 - Keep Unix socket, descriptor, and artifact-directory modes owner-only; do not weaken the Windows named-pipe DACL.
 - Never copy the descriptor or token into logs, chat messages, CI artifacts, or shared directories.
 - Give each application a clear logical ID in Rust. Use the non-secret IDs from `list_apps` with `select_app` when multiple instances run; never copy endpoint descriptors or bearer tokens into MCP configuration.

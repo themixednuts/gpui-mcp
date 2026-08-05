@@ -1,8 +1,9 @@
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
-    TextRun, TextStyle, TooltipId, WhiteSpace, Window, WrappedLine, WrappedLineLayout,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SemanticAction, SemanticRole,
+    SemanticText, Semantics, SharedString, Size, TextOverflow, TextRun, TextStyle, TooltipId,
+    WhiteSpace, Window, WrappedLine, WrappedLineLayout,
     register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
@@ -26,6 +27,10 @@ impl Element for &'static str {
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
         None
+    }
+
+    fn semantic_text(&self) -> Option<&str> {
+        Some(self)
     }
 
     fn request_layout(
@@ -92,6 +97,10 @@ impl Element for SharedString {
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
         None
+    }
+
+    fn semantic_text(&self) -> Option<&str> {
+        Some(self.as_ref())
     }
 
     fn request_layout(
@@ -254,6 +263,10 @@ impl Element for StyledText {
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
         None
+    }
+
+    fn semantic_text(&self) -> Option<&str> {
+        Some(self.text.as_ref())
     }
 
     fn request_layout(
@@ -711,6 +724,38 @@ impl Element for InteractiveText {
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
         None
+    }
+
+    fn semantics(
+        &self,
+        _window: &Window,
+        _cx: &App,
+    ) -> Option<(Semantics, Vec<SemanticAction>)> {
+        let text = self.text.text.to_string();
+        let mut actions = Vec::new();
+        if self.click_listener.is_some()
+            && matches!(&self.clickable_ranges[..], [range] if range.start == 0 && range.end == text.len())
+        {
+            actions.push(SemanticAction::Click);
+        }
+        if self.hover_listener.is_some() || self.tooltip_builder.is_some() {
+            actions.push(SemanticAction::Hover);
+        }
+        Some((
+            Semantics {
+                role: SemanticRole::Text,
+                text: Some(SemanticText {
+                    text,
+                    ..SemanticText::default()
+                }),
+                ..Semantics::default()
+            },
+            actions,
+        ))
+    }
+
+    fn semantic_text(&self) -> Option<&str> {
+        Some(self.text.text.as_ref())
     }
 
     fn request_layout(

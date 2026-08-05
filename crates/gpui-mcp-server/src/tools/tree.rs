@@ -7,9 +7,7 @@ use super::{
 
 #[tool_router(router = tree_router)]
 impl GpuiMcp {
-    #[tool(
-        description = "Return the latest application-annotated GPUI semantic tree with real layout bounds"
-    )]
+    #[tool(description = "Return the latest rendered GPUI semantic tree with real layout bounds")]
     async fn get_ui_tree(&self) -> Result<Json<Value>, String> {
         let tree = self.tree().await?;
         Ok(object_output(

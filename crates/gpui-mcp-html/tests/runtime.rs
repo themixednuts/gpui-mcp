@@ -3,14 +3,16 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use gpui::{App, Context, IntoElement, Render, Styled as _, TestAppContext, Window, div, px, size};
-use gpui_mcp::{
-    ActionOutcome, Automation, MouseButton, NodeAction, Role, SemanticAction, UiTree, ValueInfo,
+use gpui::{
+    App, AppContext as _, Context, IntoElement, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PlatformInput, Render, ScrollDelta, ScrollWheelEvent,
+    Styled as _, TestAppContext, TouchPhase, Window, div, point, px, size,
 };
+use gpui_mcp::{Automation, NodeAction, Role, UiTree, ValueInfo};
 use gpui_mcp_html::{
     Binding, BindingDocument, BindingMode, BindingTarget, ComponentRegistry, ElementId, HandlerId,
-    HookRegistry, HtmlUi, LiveHtml, SemanticNamespace, StateBindingId, StateValue, UiEvent,
-    UiProperty,
+    HookOutcome, HookRegistry, HtmlUi, LiveHtml, SemanticNamespace, StateBindingId, StateValue,
+    UiEvent, UiProperty,
 };
 
 const HTML: &str = r#"<!doctype html>
@@ -26,7 +28,7 @@ const HTML: &str = r#"<!doctype html>
       <input id="published" type="checkbox">
       <button id="save" type="button">Save</button>
       <project-card id="preview">
-        <span id="status">fallback status</span>
+        <span id="status">default status</span>
       </project-card>
     </main>
   </body>
@@ -208,6 +210,145 @@ struct Fixture {
     state: TestState,
 }
 
+#[derive(Clone, Debug)]
+enum TestInput {
+    Click { button: MouseButton, count: u8 },
+    Focus,
+    Hover,
+    Scroll { delta_x: f32, delta_y: f32 },
+    SetValue { value: String },
+}
+
+fn dispatch_test_input(
+    automation: &Automation,
+    node_id: &str,
+    action: &TestInput,
+    window: &mut Window,
+    cx: &mut App,
+) -> Result<HookOutcome, gpui_mcp::BridgeError> {
+    let tree = automation.snapshot();
+    let node = tree.nodes.get(node_id).ok_or_else(|| {
+        gpui_mcp::BridgeError::new(gpui_mcp::ErrorCode::NotFound, "semantic node was not found")
+    })?;
+    let required = match action {
+        TestInput::Click { .. } | TestInput::SetValue { .. } => NodeAction::Click,
+        TestInput::Focus => NodeAction::Focus,
+        TestInput::Hover => NodeAction::Hover,
+        TestInput::Scroll { .. } => NodeAction::Scroll,
+    };
+    if !node.actions.contains(&required) {
+        return Err(gpui_mcp::BridgeError::new(
+            gpui_mcp::ErrorCode::Unsupported,
+            "semantic node does not support the requested input",
+        ));
+    }
+    if let TestInput::Focus = action {
+        return window
+            .focus_semantic_element(node_id)
+            .then_some(HookOutcome::Handled)
+            .ok_or_else(|| {
+                gpui_mcp::BridgeError::new(gpui_mcp::ErrorCode::NotFound, "node is not focusable")
+            });
+    }
+    if let TestInput::SetValue { value } = action {
+        let requested = match value.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => {
+                return Ok(HookOutcome::Rejected {
+                    reason: "checked and selected values accept only `true` or `false`".to_owned(),
+                });
+            }
+        };
+        if node.state.checked == Some(requested) {
+            return Ok(HookOutcome::Handled);
+        }
+    }
+    let bounds = node.bounds.ok_or_else(|| {
+        gpui_mcp::BridgeError::new(gpui_mcp::ErrorCode::NotFound, "semantic node has no bounds")
+    })?;
+    let center = point(px(bounds.center().x), px(bounds.center().y));
+    dispatch_pointer_test_input(action, center, window, cx);
+    window.refresh();
+    Ok(HookOutcome::Handled)
+}
+
+fn dispatch_pointer_test_input(
+    action: &TestInput,
+    center: gpui::Point<gpui::Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    match action {
+        TestInput::Click { button, count } => {
+            for click_count in 1..=*count {
+                window.dispatch_event(
+                    PlatformInput::MouseDown(MouseDownEvent {
+                        button: *button,
+                        position: center,
+                        modifiers: Modifiers::default(),
+                        click_count: usize::from(click_count),
+                        first_mouse: false,
+                    }),
+                    cx,
+                );
+                window.dispatch_event(
+                    PlatformInput::MouseUp(MouseUpEvent {
+                        button: *button,
+                        position: center,
+                        modifiers: Modifiers::default(),
+                        click_count: usize::from(click_count),
+                    }),
+                    cx,
+                );
+            }
+        }
+        TestInput::Hover => {
+            window.dispatch_event(
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position: center,
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                }),
+                cx,
+            );
+        }
+        TestInput::Scroll { delta_x, delta_y } => {
+            window.dispatch_event(
+                PlatformInput::ScrollWheel(ScrollWheelEvent {
+                    position: center,
+                    delta: ScrollDelta::Pixels(point(px(-*delta_x), px(-*delta_y))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: TouchPhase::Moved,
+                }),
+                cx,
+            );
+        }
+        TestInput::SetValue { .. } => {
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: center,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: center,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                }),
+                cx,
+            );
+        }
+        TestInput::Focus => {}
+    }
+}
+
 #[derive(Clone)]
 struct TestState {
     title: Rc<RefCell<String>>,
@@ -263,13 +404,13 @@ fn build_hooks(state: &TestState) -> Option<HookRegistry> {
             move |_, _| StateValue::Text(title_reader.borrow().clone()),
             move |value, window, _| {
                 let StateValue::Text(value) = value else {
-                    return ActionOutcome::Rejected {
+                    return HookOutcome::Rejected {
                         reason: "title requires text".to_owned(),
                     };
                 };
                 *title_writer.borrow_mut() = value;
                 window.refresh();
-                ActionOutcome::Handled
+                HookOutcome::Handled
             },
         ),
         "title hook should register",
@@ -290,7 +431,7 @@ fn build_hooks(state: &TestState) -> Option<HookRegistry> {
                 event.event(),
                 event.element_id().as_str()
             ));
-            ActionOutcome::Handled
+            HookOutcome::Handled
         }),
         "save hook should register",
     )?;
@@ -302,7 +443,7 @@ fn build_hooks(state: &TestState) -> Option<HookRegistry> {
                 event.event(),
                 event.element_id().as_str()
             ));
-            ActionOutcome::Handled
+            HookOutcome::Handled
         }),
         "double-click hook should register",
     )?;
@@ -318,13 +459,13 @@ fn register_published_hook(hooks: &mut HookRegistry, state: &TestState) -> Optio
             move |_, _| StateValue::Boolean(published_reader.get()),
             move |value, window, _| {
                 let StateValue::Boolean(value) = value else {
-                    return ActionOutcome::Rejected {
+                    return HookOutcome::Rejected {
                         reason: "published requires a boolean".to_owned(),
                     };
                 };
                 published_writer.set(value);
                 window.refresh();
-                ActionOutcome::Handled
+                HookOutcome::Handled
             },
         ),
         "published hook should register",
@@ -377,7 +518,12 @@ fn build_fixture() -> Option<Fixture> {
 }
 
 fn assert_initial_tree(tree: &UiTree, state: &TestState) {
-    assert_eq!(tree.roots, ["html-root"]);
+    assert_eq!(tree.roots, ["window-backdrop"]);
+    assert_eq!(
+        tree.nodes["root"].parent.as_deref(),
+        Some("window-backdrop")
+    );
+    assert_eq!(tree.nodes["html-root"].parent.as_deref(), Some("root"));
     assert_eq!(tree.nodes["workspace"].parent.as_deref(), Some("html-root"));
     assert_eq!(
         tree.nodes["workspace"]
@@ -414,11 +560,7 @@ fn assert_initial_tree(tree: &UiTree, state: &TestState) {
     assert!(tree.nodes["secret"].value.is_none());
     assert_eq!(tree.nodes["published"].role, Role::Checkbox);
     assert_eq!(tree.nodes["published"].state.checked, Some(false));
-    assert!(
-        tree.nodes["published"]
-            .actions
-            .contains(&NodeAction::SetValue)
-    );
+    assert!(tree.nodes["published"].actions.contains(&NodeAction::Click));
     assert_eq!(
         tree.nodes["status"]
             .text
@@ -446,41 +588,41 @@ fn assert_initial_tree(tree: &UiTree, state: &TestState) {
     );
 }
 
-fn dispatch_actions(automation: &Automation, generation: u64, window: &mut Window, cx: &mut App) {
-    let click = SemanticAction::Click {
+fn dispatch_actions(automation: &Automation, window: &mut Window, cx: &mut App) {
+    let click = TestInput::Click {
         button: MouseButton::Left,
         count: 1,
     };
-    let invalid_published = SemanticAction::SetValue {
+    let invalid_published = TestInput::SetValue {
         value: "yes".to_owned(),
     };
-    let publish = SemanticAction::SetValue {
+    let publish = TestInput::SetValue {
         value: "true".to_owned(),
     };
-    let rename = SemanticAction::SetText {
-        text: "Published title".to_owned(),
-    };
     let mut dispatch =
-        |node_id, action| automation.dispatch_test_action(node_id, generation, action, window, cx);
-    assert_eq!(dispatch("save", &click), Ok(ActionOutcome::Handled));
+        |node_id, action| dispatch_test_input(automation, node_id, action, window, cx);
+    assert_eq!(dispatch("save", &click), Ok(HookOutcome::Handled));
     assert_eq!(
         dispatch(
             "save",
-            &SemanticAction::Click {
+            &TestInput::Click {
                 button: MouseButton::Left,
                 count: 2,
             }
         ),
-        Ok(ActionOutcome::Handled)
+        Ok(HookOutcome::Handled)
     );
     assert_eq!(
         dispatch("published", &invalid_published),
-        Ok(ActionOutcome::Rejected {
+        Ok(HookOutcome::Rejected {
             reason: "checked and selected values accept only `true` or `false`".to_owned(),
         })
     );
-    assert_eq!(dispatch("published", &publish), Ok(ActionOutcome::Handled));
-    assert_eq!(dispatch("title", &rename), Ok(ActionOutcome::Handled));
+    assert_eq!(dispatch("published", &publish), Ok(HookOutcome::Handled));
+    assert_eq!(
+        dispatch("title", &TestInput::Focus),
+        Ok(HookOutcome::Handled)
+    );
 }
 
 fn assert_updated_tree(tree: &UiTree, old_generation: u64) {
@@ -496,7 +638,7 @@ fn assert_updated_tree(tree: &UiTree, old_generation: u64) {
 }
 
 #[gpui::test]
-fn html_renders_to_gpui_and_round_trips_semantic_actions(cx: &mut TestAppContext) {
+fn html_renders_to_gpui_and_uses_real_input(cx: &mut TestAppContext) {
     cx.update(gpui_mcp_html::init);
     let Some(fixture) = build_fixture() else {
         return;
@@ -506,16 +648,27 @@ fn html_renders_to_gpui_and_round_trips_semantic_actions(cx: &mut TestAppContext
         automation,
         state,
     } = fixture;
-    let (view, visual) = cx.add_window_view(|_, _| RuntimeView { live });
+    let (view, visual) = cx.add_window_view(|window, cx| {
+        let runtime = cx.new(|_| RuntimeView { live });
+        gpui_mcp_html::NativeRoot::new(runtime, window, cx)
+    });
     visual.run_until_parked();
 
     let tree = automation.snapshot();
     assert_initial_tree(&tree, &state);
-    visual.update(|window, cx| dispatch_actions(&automation, tree.generation, window, cx));
-    assert_eq!(&*state.events.borrow(), &["Click:save", "DoubleClick:save"]);
-    assert_eq!(&*state.title.borrow(), "Published title");
+    visual.update(|window, cx| dispatch_actions(&automation, window, cx));
+    assert_eq!(
+        &*state.events.borrow(),
+        &["Click:save", "Click:save", "Click:save", "DoubleClick:save"]
+    );
     assert!(state.published.get());
 
+    view.update(visual, |_, cx| cx.notify());
+    visual.run_until_parked();
+    visual.update(|window, cx| {
+        assert!(window.replace_input_text("Published title", cx));
+    });
+    assert_eq!(&*state.title.borrow(), "Published title");
     view.update(visual, |_, cx| cx.notify());
     visual.run_until_parked();
     assert_updated_tree(&automation.snapshot(), tree.generation);
@@ -562,16 +715,23 @@ fn complex_layout_and_interactive_states_round_trip(cx: &mut TestAppContext) {
     };
     assert!(live.diagnostics().is_empty(), "{:?}", live.diagnostics());
 
-    let (view, visual) = cx.add_window_view(|_, _| RuntimeView { live });
+    let (view, visual) = cx.add_window_view(|window, cx| {
+        let runtime = cx.new(|_| RuntimeView { live });
+        gpui_mcp_html::NativeRoot::new(runtime, window, cx)
+    });
     visual.run_until_parked();
     let initial = automation.snapshot();
     assert_eq!(initial.nodes["dropdown"].state.expanded, Some(false));
     assert!(!initial.nodes.contains_key("menu"));
-    assert!(
-        initial.nodes["dropdown"]
-            .actions
-            .contains(&NodeAction::Click)
-    );
+    let disclosure_control = initial
+        .nodes
+        .values()
+        .find(|node| {
+            node.parent.as_deref() == Some("dropdown") && node.actions.contains(&NodeAction::Click)
+        })
+        .map(|node| node.id.clone());
+    assert!(disclosure_control.is_some());
+    let disclosure_control = disclosure_control.unwrap_or_default();
     assert!(
         initial.nodes["hover-card"]
             .actions
@@ -585,37 +745,25 @@ fn complex_layout_and_interactive_states_round_trip(cx: &mut TestAppContext) {
 
     visual.update(|window, cx| {
         assert_eq!(
-            automation.dispatch_test_action(
-                "hover-card",
-                initial.generation,
-                &SemanticAction::Hover,
-                window,
-                cx,
-            ),
-            Ok(ActionOutcome::Handled)
+            dispatch_test_input(&automation, "hover-card", &TestInput::Hover, window, cx,),
+            Ok(HookOutcome::Handled)
         );
         assert_eq!(
-            automation.dispatch_test_action(
-                "focus-card",
-                initial.generation,
-                &SemanticAction::Focus,
-                window,
-                cx,
-            ),
-            Ok(ActionOutcome::Handled)
+            dispatch_test_input(&automation, "focus-card", &TestInput::Focus, window, cx,),
+            Ok(HookOutcome::Handled)
         );
         assert_eq!(
-            automation.dispatch_test_action(
-                "dropdown",
-                initial.generation,
-                &SemanticAction::Click {
+            dispatch_test_input(
+                &automation,
+                &disclosure_control,
+                &TestInput::Click {
                     button: MouseButton::Left,
                     count: 1,
                 },
                 window,
                 cx,
             ),
-            Ok(ActionOutcome::Handled)
+            Ok(HookOutcome::Handled)
         );
     });
     view.update(visual, |_, cx| cx.notify());
@@ -626,6 +774,66 @@ fn complex_layout_and_interactive_states_round_trip(cx: &mut TestAppContext) {
     assert_eq!(updated.nodes["dropdown"].state.expanded, Some(true));
     assert!(updated.nodes.contains_key("menu"));
     assert!(updated.nodes["focus-card"].state.focused);
+}
+
+#[gpui::test]
+fn disclosure_only_toggles_from_its_summary(cx: &mut TestAppContext) {
+    cx.update(gpui_mcp_html::init);
+    let Some(ui) = expect_ok(
+        HtmlUi::compile_with_stylesheet(
+            "<details id='folder' open><summary id='folder-summary'>src</summary><button id='file'>main.rs</button></details>",
+            BindingDocument::new(),
+            "disclosure.css",
+            "body { width: 300px; height: 200px; } details, summary, button { display: flex; width: 200px; height: 32px; }",
+        ),
+        "disclosure fixture should compile",
+    ) else {
+        return;
+    };
+    let automation = Automation::for_test();
+    let Some(live) = expect_ok(
+        LiveHtml::new(ui, automation.clone(), HookRegistry::new()),
+        "disclosure fixture should connect",
+    ) else {
+        return;
+    };
+    let (_view, visual) = cx.add_window_view(|window, cx| {
+        let runtime = cx.new(|_| RuntimeView { live });
+        gpui_mcp_html::NativeRoot::new(runtime, window, cx)
+    });
+    visual.run_until_parked();
+
+    let initial = automation.snapshot();
+    assert_eq!(initial.nodes["folder"].state.expanded, Some(true));
+    let file = initial.nodes["file"].bounds.unwrap_or_default();
+    visual.simulate_click(
+        point(
+            px(file.x + file.width / 2.0),
+            px(file.y + file.height / 2.0),
+        ),
+        Modifiers::default(),
+    );
+    visual.run_until_parked();
+
+    let after_file_click = automation.snapshot();
+    assert_eq!(after_file_click.nodes["folder"].state.expanded, Some(true));
+    assert!(after_file_click.nodes.contains_key("file"));
+
+    let summary = after_file_click.nodes["folder-summary"]
+        .bounds
+        .unwrap_or_default();
+    visual.simulate_click(
+        point(
+            px(summary.x + summary.width / 2.0),
+            px(summary.y + summary.height / 2.0),
+        ),
+        Modifiers::default(),
+    );
+    visual.run_until_parked();
+
+    let collapsed = automation.snapshot();
+    assert_eq!(collapsed.nodes["folder"].state.expanded, Some(false));
+    assert!(!collapsed.nodes.contains_key("file"));
 }
 
 #[gpui::test]
@@ -649,7 +857,10 @@ fn overflow_elements_expose_and_handle_semantic_scroll(cx: &mut TestAppContext) 
     ) else {
         return;
     };
-    let (view, visual) = cx.add_window_view(|_, _| RuntimeView { live });
+    let (view, visual) = cx.add_window_view(|window, cx| {
+        let runtime = cx.new(|_| RuntimeView { live });
+        gpui_mcp_html::NativeRoot::new(runtime, window, cx)
+    });
     visual.run_until_parked();
 
     let initial = automation.snapshot();
@@ -664,17 +875,17 @@ fn overflow_elements_expose_and_handle_semantic_scroll(cx: &mut TestAppContext) 
 
     visual.update(|window, cx| {
         assert_eq!(
-            automation.dispatch_test_action(
+            dispatch_test_input(
+                &automation,
                 "scroller",
-                initial.generation,
-                &SemanticAction::Scroll {
+                &TestInput::Scroll {
                     delta_x: 0.0,
                     delta_y: 80.0,
                 },
                 window,
                 cx,
             ),
-            Ok(ActionOutcome::Handled)
+            Ok(HookOutcome::Handled)
         );
     });
     view.update(visual, |_, cx| cx.notify());
@@ -709,7 +920,10 @@ fn percentage_height_and_flex_content_track_window_resizes(cx: &mut TestAppConte
     ) else {
         return;
     };
-    let (view, visual) = cx.add_window_view(|_, _| RuntimeView { live });
+    let (view, visual) = cx.add_window_view(|window, cx| {
+        let runtime = cx.new(|_| RuntimeView { live });
+        gpui_mcp_html::NativeRoot::new(runtime, window, cx)
+    });
 
     for height in [600.0, 420.0, 760.0] {
         visual.simulate_resize(size(px(800.), px(height)));
@@ -789,7 +1003,10 @@ fn embedded_component_height_tracks_its_flex_host(cx: &mut TestAppContext) {
     .map(|live| live.with_components(components)) else {
         return;
     };
-    let (view, visual) = cx.add_window_view(|_, _| RuntimeView { live: outer });
+    let (view, visual) = cx.add_window_view(|window, cx| {
+        let runtime = cx.new(|_| RuntimeView { live: outer });
+        gpui_mcp_html::NativeRoot::new(runtime, window, cx)
+    });
 
     for height in [600.0, 420.0, 760.0] {
         visual.simulate_resize(size(px(800.), px(height)));

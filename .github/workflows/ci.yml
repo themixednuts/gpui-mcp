@@ -93,3 +93,40 @@ jobs:
         with:
           tool: cargo-audit
       - run: cargo audit
+
+  external-consumer:
+    name: Public Git installation
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Linux native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            clang libclang-dev pkg-config cmake \
+            libfontconfig-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxrandr-dev libegl-dev libgbm-dev \
+            libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-xinput-dev \
+            libxcb-composite0-dev libpipewire-0.3-dev libdbus-1-dev libegl1-mesa-dev \
+            mesa-vulkan-drivers
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal && rustup default 1.96.0
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Install gpui-mcp from this Git commit
+        env:
+          INSTALL_ROOT: ${{ runner.temp }}/gpui-mcp-install
+          REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: >-
+          cargo install --git "$REPOSITORY_URL" --rev "$GITHUB_SHA" --locked
+          --root "$INSTALL_ROOT" gpui-mcp-server
+
+      - name: Verify the installed MCP executable
+        env:
+          INSTALL_ROOT: ${{ runner.temp }}/gpui-mcp-install
+        run: '"$INSTALL_ROOT/bin/gpui-mcp" --version'

@@ -18,8 +18,9 @@ This shape supports both ways of adopting the system:
    application callbacks/state in `HookRegistry`, optionally register custom
    elements in `ComponentRegistry`, and retain `LiveHtml` plus `BridgeHandle`
    in the owning view.
-2. **Create a project.** Run `gpui-mcp new <name>`. The scaffold produces the
-   bundle and a working GPUI/MCP host without overwriting an existing path.
+2. **Create a project.** A host such as GPUI Studio calls the
+   `gpui-mcp-html` project-generation API. It produces the bundle and a working
+   GPUI/MCP host without overwriting an existing path.
 
 ## Why HTML, RON, and JSON each have a separate job
 

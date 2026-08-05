@@ -6,13 +6,12 @@ use std::rc::Rc;
 use gpui::{
     AlignItems, AlignSelf, AnyElement, App, AppContext as _, BoxShadow, Context, DefiniteLength,
     Div, Entity, FocusHandle, FontFallbacks, FontWeight, GridPlacement, InteractiveElement as _,
-    IntoElement, Length, Overflow, ParentElement as _, Render, ScrollHandle, SharedString,
-    Stateful, StatefulInteractiveElement as _, Styled, Window, div, point, px, relative, rgba,
+    IntoElement, Length, Overflow, ParentElement as _, Render, ScrollHandle,
+    SemanticElementExt as _, SemanticRole, SemanticState, SemanticText, SemanticValue,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled, Window, div, point, px,
+    relative, rgba,
 };
-use gpui_mcp::{
-    ActionOutcome, Automation, MAX_LABEL_BYTES, MAX_TEXT_BYTES, McpElementExt as _, NodeAction,
-    NodeEvent, NodeSpec, NodeState, Role, TextInfo, ValueInfo,
-};
+use gpui_mcp::{Automation, MAX_LABEL_BYTES, MAX_TEXT_BYTES};
 use htmlswap::{
     RenderElement, RenderNode, RenderPlan, RenderStyleCondition, RenderStyleVariant,
     StyleDeclaration, StyleProperty, UiRole,
@@ -22,8 +21,8 @@ use crate::components::{ComponentNode, ComponentRegistry};
 use crate::document::{attribute, is_text_editable};
 use crate::input::{RuntimeTextInput, RuntimeTextInputOptions};
 use crate::{
-    Binding, BindingMode, ElementId, HandlerId, HookEvent, HookRegistry, HookRegistryError, HtmlUi,
-    StateValue, UiEvent, UiProperty,
+    Binding, BindingMode, ElementId, HandlerId, HookEvent, HookOutcome, HookRegistry,
+    HookRegistryError, HtmlUi, StateValue, UiEvent, UiProperty,
 };
 
 /// Minimal hover tooltip view that renders an element's `title` attribute text.
@@ -325,6 +324,7 @@ impl LiveHtml {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
+        self.automation.attach(window);
         self.viewport_override.set(Some(viewport));
         let available_fonts = self.available_fonts(cx);
         let children = self
@@ -333,7 +333,9 @@ impl LiveHtml {
             .nodes
             .iter()
             .enumerate()
-            .map(|(index, node)| self.render_node(node, &[index], &available_fonts, window, cx))
+            .map(|(index, node)| {
+                self.render_node(node, &[index], None, &available_fonts, window, cx)
+            })
             .collect::<Vec<_>>();
         let root = apply_declarations(
             children.into_iter().fold(div(), gpui::ParentElement::child),
@@ -346,15 +348,9 @@ impl LiveHtml {
             viewport,
             &available_fonts,
         );
-        let root_id = self.scoped_id("html-root");
-        let root_spec = NodeSpec::new(root_id, Role::Application);
-        let root_spec = if self.embedded_namespace.is_some() {
-            root_spec
-        } else {
-            root_spec.root()
-        };
         let rendered = root
-            .mcp_node(&self.automation, root_spec)
+            .id(SharedString::from(self.scoped_id("html-root")))
+            .semantic_role(SemanticRole::Application)
             .into_any_element();
         self.viewport_override.set(None);
         rendered
@@ -385,6 +381,7 @@ impl LiveHtml {
         &self,
         node: &RenderNode,
         path: &[usize],
+        disclosure_owner: Option<&ElementId>,
         available_fonts: &HashSet<String>,
         window: &mut Window,
         cx: &mut App,
@@ -393,7 +390,7 @@ impl LiveHtml {
             RenderNode::Text(text) => text.value.clone().into_any_element(),
             RenderNode::Raw(raw) => raw.html.clone().into_any_element(),
             RenderNode::Element(element) => {
-                self.render_element(element, path, available_fonts, window, cx)
+                self.render_element(element, path, disclosure_owner, available_fonts, window, cx)
             }
         }
     }
@@ -403,6 +400,7 @@ impl LiveHtml {
         &self,
         element: &RenderElement,
         path: &[usize],
+        disclosure_owner: Option<&ElementId>,
         available_fonts: &HashSet<String>,
         window: &mut Window,
         cx: &mut App,
@@ -455,6 +453,7 @@ impl LiveHtml {
                 .or_default()
                 .clone()
         });
+        let toggle = semantic_toggle(element, &state, &bindings);
         let mut host = install_pointer_hooks(
             host,
             &runtime_id,
@@ -462,13 +461,15 @@ impl LiveHtml {
             &bindings,
             &self.hooks,
             state.enabled,
+            toggle,
         );
         if let Some(scroll_handle) = &scroll_handle {
             host = host.track_scroll(scroll_handle);
         }
-        if is_disclosure && state.enabled {
+        if state.enabled
+            && let Some(disclosure_id) = disclosure_owner.cloned()
+        {
             let disclosures = self.disclosures.clone();
-            let disclosure_id = element_id.clone();
             host = host.on_click(move |_, window, _| {
                 toggle_disclosure(&disclosures, &disclosure_id);
                 window.refresh();
@@ -489,21 +490,45 @@ impl LiveHtml {
             self.media_viewport(window),
             available_fonts,
         );
+        if hoverable {
+            // GPUI's style-only hover hook does not itself retain enough state for a
+            // runtime document to reproduce the hovered cascade on every refreshed frame.
+            // Mirror native hit-test transitions into the same state used by semantic hover,
+            // so physical input, MCP PlatformInput, and semantic automation resolve one CSS
+            // :hover state instead of taking separate rendering paths.
+            let hovered_element = self.hovered_element.clone();
+            let hovered_id = element_id.clone();
+            host = host.on_hover(move |hovered, window, _| {
+                update_hovered_element(&hovered_element, &hovered_id, *hovered);
+                window.refresh();
+            });
+        }
 
-        let mut spec = NodeSpec::new(runtime_id, semantic_role(element))
-            .state(state)
-            .metadata("html_tag", element.source_tag.to_string());
+        host = host
+            .semantic_role(semantic_role(element))
+            .semantic_visible(state.visible)
+            .semantic_enabled(state.enabled)
+            .semantic_metadata("html_tag", element.source_tag.to_string());
+        if let Some(checked) = state.checked {
+            host = host.semantic_checked(checked);
+        }
+        if let Some(selected) = state.selected {
+            host = host.semantic_selected(selected);
+        }
+        if let Some(expanded) = state.expanded {
+            host = host.semantic_expanded(expanded);
+        }
         if let Some(authored_id) = attribute(element, "id") {
-            spec = spec.metadata("authored_id", authored_id);
+            host = host.semantic_metadata("authored_id", authored_id);
         }
         if let Some(component_id) = attribute(element, "component") {
-            spec = spec.metadata("component_id", component_id);
+            host = host.semantic_metadata("component_id", component_id);
         }
         if let Some(label) = accessible_label(element, &property_values) {
-            spec = spec.label(label);
+            host = host.accessible_name(label);
         }
         if let Some(title) = attribute(element, "title") {
-            spec = spec.description(title);
+            host = host.accessible_description(title);
             let tooltip_text = SharedString::from(title.to_owned());
             host = host.tooltip(move |_window, cx| {
                 cx.new(|_| TitleTooltip {
@@ -512,39 +537,14 @@ impl LiveHtml {
                 .into()
             });
         }
-        for action in runtime_semantic_actions(
-            element,
-            &bindings,
-            is_disclosure,
-            hoverable,
-            focus_handle.is_some(),
-            scroll_handle.is_some(),
-        ) {
-            spec = spec.action(action);
+        if let Some(text) = semantic_text(element, &property_values, &bindings) {
+            host = host.semantic_text(text);
         }
-        if let Some(text) = semantic_text(element, &property_values) {
-            spec = spec.text(text);
+        if let Some(value) = semantic_value(element, &property_values, &bindings) {
+            host = host.semantic_value(value);
         }
-        if let Some(value) = semantic_value(element, &property_values) {
-            spec = spec.value(value);
-        }
-        spec = install_runtime_action_handler(
-            spec,
-            RuntimeActions {
-                element_id,
-                bindings: bindings.clone(),
-                focus_handle,
-                scroll_handle,
-                scroll_axes,
-                is_disclosure,
-                hoverable,
-            },
-            &self.hooks,
-            &self.hovered_element,
-            &self.disclosures,
-        );
 
-        host.mcp_node(&self.automation, spec).into_any_element()
+        host.into_any_element()
     }
 
     fn disclosure_open(
@@ -582,6 +582,11 @@ impl LiveHtml {
         if let Some(value) = text {
             return vec![value.display().into_any_element()];
         }
+        let disclosure_owner = disclosure_open.map(|_| {
+            ElementId::new(
+                attribute(element, "id").map_or_else(|| generated_id(path), str::to_owned),
+            )
+        });
         element
             .children
             .iter()
@@ -590,7 +595,17 @@ impl LiveHtml {
             .map(|(index, child)| {
                 let mut child_path = path.to_vec();
                 child_path.push(index);
-                self.render_node(child, &child_path, available_fonts, window, cx)
+                let child_disclosure_owner = disclosure_owner
+                    .as_ref()
+                    .filter(|_| is_summary_element(child));
+                self.render_node(
+                    child,
+                    &child_path,
+                    child_disclosure_owner,
+                    available_fonts,
+                    window,
+                    cx,
+                )
             })
             .collect()
     }
@@ -785,116 +800,6 @@ fn toggle_disclosure(disclosures: &Rc<RefCell<HashMap<ElementId, bool>>>, elemen
     *open = !*open;
 }
 
-struct RuntimeActions {
-    element_id: ElementId,
-    bindings: Rc<[Binding]>,
-    focus_handle: Option<FocusHandle>,
-    scroll_handle: Option<ScrollHandle>,
-    scroll_axes: ScrollAxes,
-    is_disclosure: bool,
-    hoverable: bool,
-}
-
-#[allow(clippy::fn_params_excessive_bools)]
-fn runtime_semantic_actions(
-    element: &RenderElement,
-    bindings: &[Binding],
-    is_disclosure: bool,
-    hoverable: bool,
-    focusable: bool,
-    scrollable: bool,
-) -> Vec<NodeAction> {
-    let mut actions = semantic_actions(element, bindings);
-    for (condition, action) in [
-        (is_disclosure, NodeAction::Click),
-        (hoverable, NodeAction::Hover),
-        (focusable, NodeAction::Focus),
-        (scrollable, NodeAction::Scroll),
-    ] {
-        if condition && !actions.contains(&action) {
-            actions.push(action);
-        }
-    }
-    actions
-}
-
-fn install_runtime_action_handler(
-    spec: NodeSpec,
-    actions: RuntimeActions,
-    hooks: &HookRegistry,
-    hovered_element: &Rc<RefCell<Option<ElementId>>>,
-    disclosures: &Rc<RefCell<HashMap<ElementId, bool>>>,
-) -> NodeSpec {
-    if actions.bindings.is_empty()
-        && !actions.is_disclosure
-        && !actions.hoverable
-        && actions.focus_handle.is_none()
-        && actions.scroll_handle.is_none()
-    {
-        return spec;
-    }
-    let hooks = hooks.clone();
-    let hovered_element = hovered_element.clone();
-    let disclosures = disclosures.clone();
-    spec.on_event_result(move |event, window, cx| {
-        let handled_internally = match event {
-            NodeEvent::Click { .. } if actions.is_disclosure => {
-                toggle_disclosure(&disclosures, &actions.element_id);
-                window.refresh();
-                true
-            }
-            NodeEvent::Hover { .. } if actions.hoverable => {
-                *hovered_element.borrow_mut() = Some(actions.element_id.clone());
-                window.refresh();
-                true
-            }
-            NodeEvent::Focus if actions.focus_handle.is_some() => {
-                if let Some(focus_handle) = &actions.focus_handle {
-                    window.focus(focus_handle);
-                    window.refresh();
-                }
-                true
-            }
-            NodeEvent::Scroll { delta_x, delta_y } if actions.scroll_handle.is_some() => {
-                if let Some(scroll_handle) = &actions.scroll_handle {
-                    scroll_handle_by(scroll_handle, actions.scroll_axes, *delta_x, *delta_y);
-                    window.refresh();
-                }
-                true
-            }
-            _ => false,
-        };
-        if actions.bindings.is_empty() {
-            return internal_action_outcome(handled_internally);
-        }
-        match dispatch_semantic_event(
-            &hooks,
-            &actions.element_id,
-            &actions.bindings,
-            event,
-            window,
-            cx,
-        ) {
-            ActionOutcome::Rejected { reason }
-                if handled_internally && reason == "no compatible binding handled the action" =>
-            {
-                ActionOutcome::Handled
-            }
-            outcome => outcome,
-        }
-    })
-}
-
-fn internal_action_outcome(handled: bool) -> ActionOutcome {
-    if handled {
-        ActionOutcome::Handled
-    } else {
-        ActionOutcome::Rejected {
-            reason: "no compatible binding handled the action".to_owned(),
-        }
-    }
-}
-
 fn index_bindings<'a>(
     bindings: impl Iterator<Item = &'a Binding>,
 ) -> HashMap<ElementId, Rc<[Binding]>> {
@@ -954,7 +859,9 @@ fn read_properties(
             else {
                 return None;
             };
-            Some((*property, hooks.read(source, window, cx)))
+            hooks
+                .read(source, window, cx)
+                .map(|value| (*property, value))
         })
         .collect()
 }
@@ -962,7 +869,7 @@ fn read_properties(
 fn semantic_state(
     element: &RenderElement,
     properties: &HashMap<UiProperty, StateValue>,
-) -> NodeState {
+) -> SemanticState {
     let disabled = properties
         .get(&UiProperty::Disabled)
         .and_then(StateValue::as_boolean)
@@ -972,7 +879,7 @@ fn semantic_state(
                 .as_ref()
                 .is_some_and(|control| control.disabled)
         });
-    NodeState {
+    SemanticState {
         visible: properties
             .get(&UiProperty::Visible)
             .and_then(StateValue::as_boolean)
@@ -986,69 +893,69 @@ fn semantic_state(
             .get(&UiProperty::Selected)
             .and_then(StateValue::as_boolean)
             .or_else(|| attribute(element, "selected").map(|_| true)),
-        ..NodeState::default()
+        ..SemanticState::default()
     }
 }
 
-fn semantic_role(element: &RenderElement) -> Role {
+fn semantic_role(element: &RenderElement) -> SemanticRole {
     if let Some(role) = attribute(element, "role").and_then(aria_role) {
         return role;
     }
     if element.source_tag == "input" {
         match attribute(element, "type") {
-            Some("checkbox") => return Role::Checkbox,
-            Some("radio") => return Role::Radio,
-            Some("search") => return Role::SearchInput,
+            Some("checkbox") => return SemanticRole::Checkbox,
+            Some("radio") => return SemanticRole::Radio,
+            Some("search") => return SemanticRole::SearchInput,
             _ => {}
         }
     }
     match element.role {
-        UiRole::Container | UiRole::Form | UiRole::Fieldset | UiRole::Select => Role::Group,
+        UiRole::Container | UiRole::Form | UiRole::Fieldset | UiRole::Select => SemanticRole::Group,
         UiRole::Inline
         | UiRole::Paragraph
         | UiRole::Heading(_)
         | UiRole::Label
-        | UiRole::Legend => Role::Text,
-        UiRole::Button => Role::Button,
-        UiRole::TextInput => Role::TextInput,
-        UiRole::Option | UiRole::ListItem => Role::ListItem,
-        UiRole::Link => Role::Link,
-        UiRole::Image => Role::Image,
-        UiRole::List { .. } => Role::List,
-        UiRole::Unknown => Role::Generic,
+        | UiRole::Legend => SemanticRole::Text,
+        UiRole::Button => SemanticRole::Button,
+        UiRole::TextInput => SemanticRole::TextInput,
+        UiRole::Option | UiRole::ListItem => SemanticRole::ListItem,
+        UiRole::Link => SemanticRole::Link,
+        UiRole::Image => SemanticRole::Image,
+        UiRole::List { .. } => SemanticRole::List,
+        UiRole::Unknown => SemanticRole::Generic,
     }
 }
 
-fn aria_role(role: &str) -> Option<Role> {
+fn aria_role(role: &str) -> Option<SemanticRole> {
     Some(match role.trim().to_ascii_lowercase().as_str() {
-        "application" => Role::Application,
-        "alert" => Role::Alert,
-        "button" => Role::Button,
-        "checkbox" => Role::Checkbox,
-        "combobox" => Role::Combobox,
-        "dialog" => Role::Dialog,
-        "group" => Role::Group,
-        "img" => Role::Image,
-        "link" => Role::Link,
-        "list" | "listbox" => Role::List,
-        "listitem" => Role::ListItem,
-        "menu" | "menubar" => Role::Menu,
-        "menuitem" | "menuitemcheckbox" | "menuitemradio" => Role::MenuItem,
-        "option" => Role::Option,
-        "progressbar" => Role::Progress,
-        "radio" => Role::Radio,
-        "scrollbar" => Role::ScrollArea,
-        "searchbox" => Role::SearchInput,
-        "separator" => Role::Separator,
-        "slider" => Role::Slider,
-        "switch" => Role::Switch,
-        "tab" => Role::Tab,
-        "table" | "grid" | "treegrid" => Role::Table,
-        "tablist" => Role::TabList,
-        "toolbar" => Role::Toolbar,
-        "tooltip" => Role::Tooltip,
-        "tree" => Role::Tree,
-        "treeitem" => Role::TreeItem,
+        "application" => SemanticRole::Application,
+        "alert" => SemanticRole::Alert,
+        "button" => SemanticRole::Button,
+        "checkbox" => SemanticRole::Checkbox,
+        "combobox" => SemanticRole::Combobox,
+        "dialog" => SemanticRole::Dialog,
+        "group" => SemanticRole::Group,
+        "img" => SemanticRole::Image,
+        "link" => SemanticRole::Link,
+        "list" | "listbox" => SemanticRole::List,
+        "listitem" => SemanticRole::ListItem,
+        "menu" | "menubar" => SemanticRole::Menu,
+        "menuitem" | "menuitemcheckbox" | "menuitemradio" => SemanticRole::MenuItem,
+        "option" => SemanticRole::Option,
+        "progressbar" => SemanticRole::Progress,
+        "radio" => SemanticRole::Radio,
+        "scrollbar" => SemanticRole::ScrollArea,
+        "searchbox" => SemanticRole::SearchInput,
+        "separator" => SemanticRole::Separator,
+        "slider" => SemanticRole::Slider,
+        "switch" => SemanticRole::Switch,
+        "tab" => SemanticRole::Tab,
+        "table" | "grid" | "treegrid" => SemanticRole::Table,
+        "tablist" => SemanticRole::TabList,
+        "toolbar" => SemanticRole::Toolbar,
+        "tooltip" => SemanticRole::Tooltip,
+        "tree" => SemanticRole::Tree,
+        "treeitem" => SemanticRole::TreeItem,
         _ => return None,
     })
 }
@@ -1083,65 +990,17 @@ fn accessible_label(
         .map(|label| bounded_utf8(label, MAX_LABEL_BYTES))
 }
 
-fn semantic_actions(element: &RenderElement, bindings: &[Binding]) -> Vec<NodeAction> {
-    let text_editable = is_text_editable(element);
-    let mut actions = Vec::new();
-    for binding in bindings {
-        let action = match binding {
-            Binding::Event {
-                event: UiEvent::Click | UiEvent::DoubleClick | UiEvent::Submit,
-                ..
-            } => Some(NodeAction::Click),
-            Binding::Event {
-                event: UiEvent::Focus,
-                ..
-            } => Some(NodeAction::Focus),
-            Binding::Event {
-                event: UiEvent::Hover,
-                ..
-            } => Some(NodeAction::Hover),
-            Binding::Event {
-                event: UiEvent::Change | UiEvent::Input,
-                ..
-            }
-            | Binding::Property {
-                property: UiProperty::Value,
-                mode: BindingMode::TwoWay,
-                ..
-            } => Some(if text_editable {
-                NodeAction::SetText
-            } else {
-                NodeAction::SetValue
-            }),
-            Binding::Property {
-                property: UiProperty::Text,
-                mode: BindingMode::TwoWay,
-                ..
-            } => Some(NodeAction::SetText),
-            Binding::Property {
-                property: UiProperty::Checked | UiProperty::Selected,
-                mode: BindingMode::TwoWay,
-                ..
-            } => Some(NodeAction::SetValue),
-            Binding::Property { .. } => None,
-        };
-        if let Some(action) = action
-            && !actions.contains(&action)
-        {
-            actions.push(action);
-        }
-    }
-    actions
-}
-
 fn semantic_text(
     element: &RenderElement,
     properties: &HashMap<UiProperty, StateValue>,
-) -> Option<TextInfo> {
+    bindings: &[Binding],
+) -> Option<SemanticText> {
+    let editable = is_text_editable(element) && has_writable_text_binding(bindings);
     if is_password(element) {
-        return Some(TextInfo {
+        return Some(SemanticText {
             redacted: true,
-            ..TextInfo::default()
+            editable,
+            ..SemanticText::default()
         });
     }
 
@@ -1160,24 +1019,27 @@ fn semantic_text(
         })
         .or_else(|| is_text_role(&element.role).then(|| element_text_content(element)))?;
     let text = bounded_utf8(text, MAX_TEXT_BYTES);
-    (!text.is_empty() || matches!(element.role, UiRole::TextInput)).then(|| TextInfo {
+    (!text.is_empty() || matches!(element.role, UiRole::TextInput)).then(|| SemanticText {
         text,
-        ..TextInfo::default()
+        editable,
+        ..SemanticText::default()
     })
 }
 
 fn semantic_value(
     element: &RenderElement,
     properties: &HashMap<UiProperty, StateValue>,
-) -> Option<ValueInfo> {
+    bindings: &[Binding],
+) -> Option<SemanticValue> {
     if is_password(element) {
         return None;
     }
     properties
         .get(&UiProperty::Value)
-        .map(|value| ValueInfo {
+        .map(|value| SemanticValue {
             value: bounded_utf8(value.display(), MAX_TEXT_BYTES),
-            ..ValueInfo::default()
+            editable: is_text_editable(element) && has_writable_text_binding(bindings),
+            ..SemanticValue::default()
         })
         .or_else(|| {
             element
@@ -1185,11 +1047,28 @@ fn semantic_value(
                 .as_ref()?
                 .value
                 .as_ref()
-                .map(|value| ValueInfo {
+                .map(|value| SemanticValue {
                     value: bounded_utf8(value.to_string(), MAX_TEXT_BYTES),
-                    ..ValueInfo::default()
+                    editable: is_text_editable(element) && has_writable_text_binding(bindings),
+                    ..SemanticValue::default()
                 })
         })
+}
+
+fn has_writable_text_binding(bindings: &[Binding]) -> bool {
+    bindings.iter().any(|binding| {
+        matches!(
+            binding,
+            Binding::Event {
+                event: UiEvent::Input | UiEvent::Change,
+                ..
+            } | Binding::Property {
+                property: UiProperty::Text | UiProperty::Value,
+                mode: BindingMode::TwoWay,
+                ..
+            }
+        )
+    })
 }
 
 fn is_password(element: &RenderElement) -> bool {
@@ -1245,6 +1124,7 @@ fn install_pointer_hooks(
     bindings: &[Binding],
     hooks: &HookRegistry,
     enabled: bool,
+    toggle: Option<ToggleBinding>,
 ) -> Stateful<Div> {
     let mut host = host.id(SharedString::from(runtime_id.to_owned()));
     if !enabled {
@@ -1252,18 +1132,36 @@ fn install_pointer_hooks(
     }
     let click = event_handlers(bindings, &[UiEvent::Click, UiEvent::Submit]);
     let double_click = event_handlers(bindings, &[UiEvent::DoubleClick]);
-    if !click.is_empty() || !double_click.is_empty() {
+    if !click.is_empty() || !double_click.is_empty() || toggle.is_some() {
         let hooks = hooks.clone();
         let element_id = element_id.clone();
+        let bindings = bindings.to_vec();
         host = host.on_click(move |pointer, window, cx| {
-            let handlers = if pointer.click_count() >= 2 && !double_click.is_empty() {
-                &double_click
-            } else {
-                &click
-            };
-            for (event, handler) in handlers {
+            for (event, handler) in &click {
                 let hook_event = HookEvent::new(element_id.clone(), *event, None);
                 let _ = hooks.invoke(handler, &hook_event, window, cx);
+            }
+            if pointer.click_count() >= 2 {
+                for (event, handler) in &double_click {
+                    let hook_event = HookEvent::new(element_id.clone(), *event, None);
+                    let _ = hooks.invoke(handler, &hook_event, window, cx);
+                }
+            }
+            if let Some(toggle) = toggle {
+                for binding in &bindings {
+                    let Binding::Property {
+                        property,
+                        source,
+                        mode: BindingMode::TwoWay,
+                        ..
+                    } = binding
+                    else {
+                        continue;
+                    };
+                    if *property == toggle.property {
+                        let _ = hooks.write(source, StateValue::Boolean(toggle.value), window, cx);
+                    }
+                }
             }
         });
     }
@@ -1283,6 +1181,40 @@ fn install_pointer_hooks(
     host
 }
 
+#[derive(Clone, Copy)]
+struct ToggleBinding {
+    property: UiProperty,
+    value: bool,
+}
+
+fn semantic_toggle(
+    element: &RenderElement,
+    state: &SemanticState,
+    bindings: &[Binding],
+) -> Option<ToggleBinding> {
+    let (property, value) = match semantic_role(element) {
+        SemanticRole::Checkbox | SemanticRole::Switch => {
+            (UiProperty::Checked, !state.checked.unwrap_or(false))
+        }
+        SemanticRole::Radio => (UiProperty::Checked, true),
+        SemanticRole::Option => (UiProperty::Selected, true),
+        _ => return None,
+    };
+    bindings
+        .iter()
+        .any(|binding| {
+            matches!(
+                binding,
+                Binding::Property {
+                    property: bound_property,
+                    mode: BindingMode::TwoWay,
+                    ..
+                } if *bound_property == property
+            )
+        })
+        .then_some(ToggleBinding { property, value })
+}
+
 fn event_handlers(bindings: &[Binding], events: &[UiEvent]) -> Vec<(UiEvent, HandlerId)> {
     bindings
         .iter()
@@ -1295,104 +1227,47 @@ fn event_handlers(bindings: &[Binding], events: &[UiEvent]) -> Vec<(UiEvent, Han
         .collect()
 }
 
-pub(crate) fn dispatch_semantic_event(
+pub(crate) fn dispatch_input_change(
     hooks: &HookRegistry,
     element_id: &ElementId,
     bindings: &[Binding],
-    event: &NodeEvent,
+    text: String,
     window: &mut Window,
     cx: &mut App,
-) -> ActionOutcome {
-    let (events, value, property_action) = match event {
-        NodeEvent::Click { count, .. }
-            if *count >= 2
-                && bindings.iter().any(|binding| {
-                    matches!(
-                        binding,
-                        Binding::Event {
-                            event: UiEvent::DoubleClick,
-                            ..
-                        }
-                    )
-                }) =>
-        {
-            (&[UiEvent::DoubleClick][..], None, None)
-        }
-        NodeEvent::Click { .. } => (&[UiEvent::Click, UiEvent::Submit][..], None, None),
-        NodeEvent::Focus => (&[UiEvent::Focus][..], None, None),
-        NodeEvent::Hover { .. } => (&[UiEvent::Hover][..], None, None),
-        NodeEvent::SetText { text } => (
-            &[UiEvent::Input, UiEvent::Change][..],
-            Some(StateValue::Text(text.clone())),
-            Some(UiProperty::Text),
-        ),
-        NodeEvent::SetValue { value } => (
-            &[UiEvent::Input, UiEvent::Change][..],
-            Some(StateValue::Text(value.clone())),
-            Some(UiProperty::Value),
-        ),
-        NodeEvent::Drag { .. } | NodeEvent::DragMove { .. } | NodeEvent::Scroll { .. } => {
-            return ActionOutcome::Rejected {
-                reason: "HTML binding does not advertise this action".to_owned(),
-            };
-        }
-    };
+) -> HookOutcome {
+    let value = StateValue::Text(text);
 
     let mut handled = false;
-    if let (Some(value), Some(property)) = (&value, property_action) {
-        for binding in bindings {
-            let Binding::Property {
-                property: bound_property,
-                source,
-                mode: BindingMode::TwoWay,
-                ..
-            } = binding
-            else {
-                continue;
-            };
-            let replacement = match mutation_value(property, *bound_property, value) {
-                Ok(Some(value)) => value,
-                Ok(None) => continue,
-                Err(reason) => return ActionOutcome::Rejected { reason },
-            };
-            let outcome = hooks.write(source, replacement, window, cx);
-            if let ActionOutcome::Rejected { .. } = outcome {
-                return outcome;
-            }
-            handled = true;
+    for binding in bindings {
+        let Binding::Property {
+            property: UiProperty::Text | UiProperty::Value,
+            source,
+            mode: BindingMode::TwoWay,
+            ..
+        } = binding
+        else {
+            continue;
+        };
+        let outcome = hooks.write(source, value.clone(), window, cx);
+        if let HookOutcome::Rejected { .. } = outcome {
+            return outcome;
         }
+        handled = true;
     }
-    for (bound_event, handler) in event_handlers(bindings, events) {
-        let hook_event = HookEvent::new(element_id.clone(), bound_event, value.clone());
+    for (bound_event, handler) in event_handlers(bindings, &[UiEvent::Input, UiEvent::Change]) {
+        let hook_event = HookEvent::new(element_id.clone(), bound_event, Some(value.clone()));
         let outcome = hooks.invoke(&handler, &hook_event, window, cx);
-        if let ActionOutcome::Rejected { .. } = outcome {
+        if let HookOutcome::Rejected { .. } = outcome {
             return outcome;
         }
         handled = true;
     }
     if handled {
-        ActionOutcome::Handled
+        HookOutcome::Handled
     } else {
-        ActionOutcome::Rejected {
+        HookOutcome::Rejected {
             reason: "no compatible binding handled the action".to_owned(),
         }
-    }
-}
-
-fn mutation_value(
-    action_property: UiProperty,
-    bound_property: UiProperty,
-    value: &StateValue,
-) -> Result<Option<StateValue>, String> {
-    match (action_property, bound_property) {
-        (UiProperty::Text, UiProperty::Text | UiProperty::Value)
-        | (UiProperty::Value, UiProperty::Value) => Ok(Some(value.clone())),
-        (UiProperty::Value, UiProperty::Checked | UiProperty::Selected) => value
-            .as_boolean()
-            .map(StateValue::Boolean)
-            .map(Some)
-            .ok_or_else(|| "checked and selected values accept only `true` or `false`".to_owned()),
-        _ => Ok(None),
     }
 }
 
@@ -2007,6 +1882,19 @@ fn interactive_variants(
         .collect()
 }
 
+fn update_hovered_element(
+    hovered_element: &Rc<RefCell<Option<ElementId>>>,
+    element_id: &ElementId,
+    hovered: bool,
+) {
+    let mut current = hovered_element.borrow_mut();
+    if hovered {
+        *current = Some(element_id.clone());
+    } else if current.as_ref() == Some(element_id) {
+        current.take();
+    }
+}
+
 fn apply_variant_declarations<T: Styled>(
     host: T,
     variants: &[&RenderStyleVariant],
@@ -2276,26 +2164,6 @@ fn element_scroll_axes(element: &RenderElement, viewport: MediaViewport) -> Scro
         }
     }
     axes
-}
-
-fn scroll_handle_by(handle: &ScrollHandle, axes: ScrollAxes, delta_x: f32, delta_y: f32) {
-    let offset = handle.offset();
-    let maximum = handle.max_offset();
-    let offset_x: f32 = offset.x.into();
-    let offset_y: f32 = offset.y.into();
-    let maximum_x: f32 = maximum.width.into();
-    let maximum_y: f32 = maximum.height.into();
-    let next_x = if axes.x {
-        (offset_x - delta_x).clamp(-maximum_x, 0.0)
-    } else {
-        offset_x
-    };
-    let next_y = if axes.y {
-        (offset_y - delta_y).clamp(-maximum_y, 0.0)
-    } else {
-        offset_y
-    };
-    handle.set_offset(point(px(next_x), px(next_y)));
 }
 
 fn overflow(value: &str) -> Option<Overflow> {
@@ -3050,10 +2918,12 @@ fn border_shorthand_property(property: &StyleProperty) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
+    use std::rc::Rc;
 
-    use gpui::{GridPlacement, px};
-    use gpui_mcp::{Automation, Role};
+    use gpui::{GridPlacement, SemanticRole, px};
+    use gpui_mcp::Automation;
     use htmlswap::{RenderNode, StyleDeclaration, StyleProperty};
 
     use crate::{
@@ -3066,16 +2936,32 @@ mod tests {
         border_value, box_shadows, box_values, collect_declaration_diagnostics, color,
         cursor_supported, definite_length, effective_border_style, flex_value, font_family,
         grid_column, grid_column_count, length, line_height, media_query_matches, opacity,
-        overflow,
+        overflow, update_hovered_element,
     };
 
     #[test]
+    fn gpui_hover_transitions_share_the_semantic_hover_state() {
+        let hovered = Rc::new(RefCell::new(None));
+        let first = ElementId::new("first");
+        let second = ElementId::new("second");
+
+        update_hovered_element(&hovered, &first, true);
+        assert_eq!(hovered.borrow().as_ref(), Some(&first));
+        update_hovered_element(&hovered, &second, true);
+        assert_eq!(hovered.borrow().as_ref(), Some(&second));
+        update_hovered_element(&hovered, &first, false);
+        assert_eq!(hovered.borrow().as_ref(), Some(&second));
+        update_hovered_element(&hovered, &second, false);
+        assert!(hovered.borrow().is_none());
+    }
+
+    #[test]
     fn aria_roles_preserve_tree_and_floating_surface_semantics() {
-        assert_eq!(aria_role("tree"), Some(Role::Tree));
-        assert_eq!(aria_role("TREEITEM"), Some(Role::TreeItem));
-        assert_eq!(aria_role("menuitemcheckbox"), Some(Role::MenuItem));
-        assert_eq!(aria_role("combobox"), Some(Role::Combobox));
-        assert_eq!(aria_role("option"), Some(Role::Option));
+        assert_eq!(aria_role("tree"), Some(SemanticRole::Tree));
+        assert_eq!(aria_role("TREEITEM"), Some(SemanticRole::TreeItem));
+        assert_eq!(aria_role("menuitemcheckbox"), Some(SemanticRole::MenuItem));
+        assert_eq!(aria_role("combobox"), Some(SemanticRole::Combobox));
+        assert_eq!(aria_role("option"), Some(SemanticRole::Option));
         assert_eq!(aria_role("presentation"), None);
     }
 

@@ -516,6 +516,10 @@ impl Drop for WindowsWindow {
 }
 
 impl PlatformWindow for WindowsWindow {
+    fn native_window_id(&self) -> Option<u32> {
+        Some(self.0.hwnd.0 as u32)
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.0.state.borrow().bounds()
     }

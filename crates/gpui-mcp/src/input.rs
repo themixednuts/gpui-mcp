@@ -3,93 +3,64 @@ use gpui::{
     MouseUpEvent, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px,
 };
 use gpui_mcp_protocol::{
-    BridgeError, ErrorCode, InputCommand, MAX_TEXT_BYTES, MouseButton, NativeInputCommand,
-    NativeScrollDelta, Point, SemanticAction,
+    BridgeError, ErrorCode, InputCommand, MAX_KEY_SEQUENCE, MAX_TEXT_BYTES, MouseButton, Point,
+    PointerCommand, PointerScrollDelta,
 };
 
 pub(crate) fn validate(command: &InputCommand) -> Result<(), BridgeError> {
     match command {
-        InputCommand::Click { point, count, .. } => {
-            validate_point(*point)?;
-            validate_click_count(*count)?;
-        }
-        InputCommand::Hover { point } => validate_point(*point)?,
-        InputCommand::Drag { from, to, steps } => {
-            validate_point(*from)?;
-            validate_point(*to)?;
-            if !(1..=120).contains(steps) {
-                return Err(invalid("drag steps must be between 1 and 120"));
-            }
-        }
         InputCommand::Key { keystroke } => {
             validate_text(keystroke)?;
             Keystroke::parse(keystroke).map_err(|_| invalid("invalid GPUI keystroke syntax"))?;
         }
+        InputCommand::KeySequence { keystrokes } => {
+            if keystrokes.is_empty() || keystrokes.len() > MAX_KEY_SEQUENCE {
+                return Err(invalid("key sequence must contain 1 through 1024 events"));
+            }
+            for keystroke in keystrokes {
+                validate_text(keystroke)?;
+                Keystroke::parse(keystroke)
+                    .map_err(|_| invalid("invalid GPUI keystroke syntax"))?;
+            }
+        }
         InputCommand::TypeText { text } | InputCommand::ReplaceText { text } => {
             validate_text(text)?;
-        }
-        InputCommand::Scroll {
-            point,
-            delta_x,
-            delta_y,
-        } => {
-            validate_point(*point)?;
-            validate_scroll_delta(*delta_x, *delta_y)?;
         }
     }
     Ok(())
 }
 
-pub(crate) fn validate_native(command: &NativeInputCommand) -> Result<(), BridgeError> {
+pub(crate) fn validate_pointer(command: &PointerCommand) -> Result<(), BridgeError> {
     match command {
-        NativeInputCommand::MouseMove { point, .. } => validate_point(*point),
-        NativeInputCommand::MouseDown {
+        PointerCommand::MouseMove { point, .. } => validate_point(*point),
+        PointerCommand::MouseDown {
             point, click_count, ..
         }
-        | NativeInputCommand::MouseUp {
+        | PointerCommand::MouseUp {
             point, click_count, ..
         } => {
             validate_point(*point)?;
             validate_click_count(*click_count)
         }
-        NativeInputCommand::ScrollWheel { point, delta } => {
+        PointerCommand::ScrollWheel { point, delta } => {
             validate_point(*point)?;
             let (delta_x, delta_y) = match delta {
-                NativeScrollDelta::Pixels { delta_x, delta_y }
-                | NativeScrollDelta::Lines { delta_x, delta_y } => (*delta_x, *delta_y),
+                PointerScrollDelta::Pixels { delta_x, delta_y }
+                | PointerScrollDelta::Lines { delta_x, delta_y } => (*delta_x, *delta_y),
             };
             validate_scroll_delta(delta_x, delta_y)
         }
     }
 }
 
-pub(crate) fn validate_semantic(action: &SemanticAction) -> Result<(), BridgeError> {
-    match action {
-        SemanticAction::Click { count, .. } => validate_click_count(*count)?,
-        SemanticAction::Focus | SemanticAction::Hover => {}
-        SemanticAction::Drag { to, steps } => {
-            validate_point(*to)?;
-            if !(1..=120).contains(steps) {
-                return Err(invalid("drag steps must be between 1 and 120"));
-            }
-        }
-        SemanticAction::Scroll { delta_x, delta_y } => {
-            validate_scroll_delta(*delta_x, *delta_y)?;
-        }
-        SemanticAction::SetText { text } => validate_text(text)?,
-        SemanticAction::SetValue { value } => validate_text(value)?,
-    }
-    Ok(())
-}
-
-pub(crate) fn dispatch_native(
-    command: &NativeInputCommand,
+pub(crate) fn dispatch_pointer(
+    command: &PointerCommand,
     window: &mut Window,
     cx: &mut App,
 ) -> Result<(), BridgeError> {
-    validate_native(command)?;
+    validate_pointer(command)?;
     let event = match command {
-        NativeInputCommand::MouseMove {
+        PointerCommand::MouseMove {
             point: position,
             pressed_button,
         } => PlatformInput::MouseMove(MouseMoveEvent {
@@ -97,7 +68,7 @@ pub(crate) fn dispatch_native(
             pressed_button: pressed_button.map(native_button),
             modifiers: Modifiers::default(),
         }),
-        NativeInputCommand::MouseDown {
+        PointerCommand::MouseDown {
             point: position,
             button,
             click_count,
@@ -108,7 +79,7 @@ pub(crate) fn dispatch_native(
             click_count: usize::from(*click_count),
             first_mouse: false,
         }),
-        NativeInputCommand::MouseUp {
+        PointerCommand::MouseUp {
             point: position,
             button,
             click_count,
@@ -118,16 +89,16 @@ pub(crate) fn dispatch_native(
             modifiers: Modifiers::default(),
             click_count: usize::from(*click_count),
         }),
-        NativeInputCommand::ScrollWheel {
+        PointerCommand::ScrollWheel {
             point: position,
             delta,
         } => PlatformInput::ScrollWheel(ScrollWheelEvent {
             position: native_point(*position),
             delta: match delta {
-                NativeScrollDelta::Pixels { delta_x, delta_y } => {
+                PointerScrollDelta::Pixels { delta_x, delta_y } => {
                     ScrollDelta::Pixels(point(px(*delta_x), px(*delta_y)))
                 }
-                NativeScrollDelta::Lines { delta_x, delta_y } => {
+                PointerScrollDelta::Lines { delta_x, delta_y } => {
                     ScrollDelta::Lines(point(*delta_x, *delta_y))
                 }
             },
@@ -161,45 +132,30 @@ pub(crate) fn dispatch_keyboard(
                 .map_err(|_| invalid("invalid GPUI keystroke syntax"))?;
             window.dispatch_keystroke(parsed, cx);
         }
-        InputCommand::TypeText { text } => type_text(&text, window, cx),
-        InputCommand::ReplaceText { text } => {
-            let select_all = Keystroke::parse("secondary-a")
-                .map_err(|_| BridgeError::new(ErrorCode::Internal, "key mapping unavailable"))?;
-            window.dispatch_keystroke(select_all, cx);
-            if text.is_empty() {
-                let backspace = Keystroke::parse("backspace").map_err(|_| {
-                    BridgeError::new(ErrorCode::Internal, "key mapping unavailable")
-                })?;
-                window.dispatch_keystroke(backspace, cx);
-            } else {
-                type_text(&text, window, cx);
+        InputCommand::KeySequence { keystrokes } => {
+            for keystroke in keystrokes {
+                let parsed = Keystroke::parse(&keystroke)
+                    .map_err(|_| invalid("invalid GPUI keystroke syntax"))?;
+                window.dispatch_keystroke(parsed, cx);
             }
         }
-        _ => {
-            return Err(BridgeError::new(
-                ErrorCode::Unsupported,
-                "pointer input requires an annotated GPUI action handler",
-            ));
-        }
+        InputCommand::TypeText { text } => require_input_handler(
+            window.insert_input_text(&text, cx),
+            "focused element has no active text input handler",
+        )?,
+        InputCommand::ReplaceText { text } => require_input_handler(
+            window.replace_input_text(&text, cx),
+            "focused input cannot expose its complete document range",
+        )?,
     }
     Ok(())
 }
 
-fn type_text(text: &str, window: &mut Window, cx: &mut App) {
-    for character in text.chars() {
-        let keystroke = match character {
-            '\n' | '\r' => Keystroke::parse("enter").ok(),
-            '\t' => Keystroke::parse("tab").ok(),
-            _ => Some(Keystroke {
-                modifiers: Modifiers::default(),
-                key: character.to_lowercase().collect(),
-                key_char: Some(character.to_string()),
-            }),
-        };
-        if let Some(keystroke) = keystroke {
-            window.dispatch_keystroke(keystroke, cx);
-        }
+fn require_input_handler(available: bool, message: &'static str) -> Result<(), BridgeError> {
+    if !available {
+        return Err(BridgeError::new(ErrorCode::Unsupported, message));
     }
+    Ok(())
 }
 
 fn native_point(position: Point) -> gpui::Point<gpui::Pixels> {
@@ -262,9 +218,31 @@ mod tests {
         MouseButton as GpuiMouseButton, ParentElement as _, Render,
         StatefulInteractiveElement as _, Styled as _, TestAppContext, Window, div, point, px, size,
     };
-    use gpui_mcp_protocol::{MouseButton, NativeInputCommand, Point};
+    use gpui_mcp_protocol::{InputCommand, MAX_KEY_SEQUENCE, MouseButton, Point, PointerCommand};
 
-    use super::dispatch_native;
+    use super::{dispatch_pointer, validate};
+
+    #[test]
+    fn key_sequences_are_bounded_and_fully_validated() {
+        assert!(
+            validate(&InputCommand::KeySequence {
+                keystrokes: vec!["home".to_owned(), "right".to_owned()],
+            })
+            .is_ok()
+        );
+        assert!(
+            validate(&InputCommand::KeySequence {
+                keystrokes: Vec::new(),
+            })
+            .is_err()
+        );
+        assert!(
+            validate(&InputCommand::KeySequence {
+                keystrokes: vec!["right".to_owned(); MAX_KEY_SEQUENCE + 1],
+            })
+            .is_err()
+        );
+    }
 
     #[derive(Clone, Copy)]
     struct DragValue;
@@ -278,7 +256,41 @@ mod tests {
     }
 
     #[gpui::test]
-    fn synthetic_platform_drag_runs_native_mouse_drag_and_drop_handlers(cx: &mut TestAppContext) {
+    fn synthetic_mouse_move_runs_gpui_hover_handlers(cx: &mut TestAppContext) {
+        let hovered = Rc::new(Cell::new(false));
+        let hovered_for_handler = hovered.clone();
+        let visual = cx.add_empty_window();
+        visual.draw(
+            point(px(0.0), px(0.0)),
+            size(px(300.0), px(100.0)),
+            move |_, _| {
+                div()
+                    .id("native-hover-target")
+                    .w(px(100.0))
+                    .h(px(100.0))
+                    .on_hover(move |value, _, _| hovered_for_handler.set(*value))
+            },
+        );
+
+        visual.update(|window, cx| {
+            assert_eq!(
+                dispatch_pointer(
+                    &PointerCommand::MouseMove {
+                        point: Point { x: 50.0, y: 50.0 },
+                        pressed_button: None,
+                    },
+                    window,
+                    cx,
+                ),
+                Ok(())
+            );
+        });
+
+        assert!(hovered.get());
+    }
+
+    #[gpui::test]
+    fn synthetic_platform_drag_runs_gpui_drag_and_drop_handlers(cx: &mut TestAppContext) {
         let pressed = Rc::new(Cell::new(false));
         let drag_started = Rc::new(Cell::new(false));
         let dropped = Rc::new(Cell::new(false));
@@ -320,8 +332,8 @@ mod tests {
 
         visual.update(|window, cx| {
             assert_eq!(
-                dispatch_native(
-                    &NativeInputCommand::MouseDown {
+                dispatch_pointer(
+                    &PointerCommand::MouseDown {
                         point: Point { x: 50.0, y: 50.0 },
                         button: MouseButton::Left,
                         click_count: 1,
@@ -332,8 +344,8 @@ mod tests {
                 Ok(())
             );
             assert_eq!(
-                dispatch_native(
-                    &NativeInputCommand::MouseMove {
+                dispatch_pointer(
+                    &PointerCommand::MouseMove {
                         point: Point { x: 60.0, y: 50.0 },
                         pressed_button: Some(MouseButton::Left),
                     },
@@ -343,8 +355,8 @@ mod tests {
                 Ok(())
             );
             assert_eq!(
-                dispatch_native(
-                    &NativeInputCommand::MouseMove {
+                dispatch_pointer(
+                    &PointerCommand::MouseMove {
                         point: Point { x: 200.0, y: 50.0 },
                         pressed_button: Some(MouseButton::Left),
                     },
@@ -354,8 +366,8 @@ mod tests {
                 Ok(())
             );
             assert_eq!(
-                dispatch_native(
-                    &NativeInputCommand::MouseUp {
+                dispatch_pointer(
+                    &PointerCommand::MouseUp {
                         point: Point { x: 200.0, y: 50.0 },
                         button: MouseButton::Left,
                         click_count: 1,

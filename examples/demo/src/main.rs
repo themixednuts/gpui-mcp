@@ -1,13 +1,10 @@
 //! Small instrumented GPUI application used to exercise the MCP bridge.
 
 use gpui::{
-    App, Application, Bounds, Context, IntoElement, Render, Window, WindowBounds, WindowOptions,
-    div, prelude::*, px, rgb, size,
+    App, Application, Bounds, Context, IntoElement, Render, SemanticRole, Window, WindowBounds,
+    WindowOptions, div, prelude::*, px, rgb, size,
 };
-use gpui_mcp::{
-    Automation, BridgeConfig, BridgeHandle, McpElementExt, NodeAction, NodeEvent, NodeSpec, Role,
-    TextInfo,
-};
+use gpui_mcp::{Automation, BridgeConfig, BridgeHandle};
 
 const TITLE: &str = "GPUI MCP Demo";
 
@@ -35,7 +32,6 @@ impl Demo {
 impl Render for Demo {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let counter = self.count;
-        let automation = self.automation.clone();
         div()
             .id("demo-root")
             .flex()
@@ -47,23 +43,15 @@ impl Render for Demo {
             .text_color(rgb(0xe8_ee_f7))
             .child(
                 div()
+                    .id("heading")
                     .text_2xl()
-                    .child("GPUI MCP cross-platform demo")
-                    .mcp_node(
-                        &automation,
-                        NodeSpec::new("heading", Role::Text).label("GPUI MCP cross-platform demo"),
-                    ),
+                    .child("GPUI MCP cross-platform demo"),
             )
             .child(
-                div().text_lg().child(format!("Count: {counter}")).mcp_node(
-                    &automation,
-                    NodeSpec::new("count", Role::Text)
-                        .label("Counter value")
-                        .text(TextInfo {
-                            text: counter.to_string(),
-                            ..TextInfo::default()
-                        }),
-                ),
+                div()
+                    .id("count")
+                    .text_lg()
+                    .child(format!("Count: {counter}")),
             )
             .child(
                 div()
@@ -78,18 +66,7 @@ impl Render for Demo {
                             .bg(rgb(0x16_77_ff))
                             .cursor_pointer()
                             .child("Increment")
-                            .on_click(cx.listener(|this, _, _, cx| this.increment(cx)))
-                            .mcp_node(
-                                &automation,
-                                NodeSpec::new("increment", Role::Button)
-                                    .label("Increment counter")
-                                    .action(NodeAction::Click)
-                                    .on_event(cx.listener(|this, event, _, cx| {
-                                        if matches!(event, NodeEvent::Click { .. }) {
-                                            this.increment(cx);
-                                        }
-                                    })),
-                            ),
+                            .on_click(cx.listener(|this, _, _, cx| this.increment(cx))),
                     )
                     .child(
                         div()
@@ -100,35 +77,11 @@ impl Render for Demo {
                             .bg(rgb(0x39_42_53))
                             .cursor_pointer()
                             .child("Reset")
-                            .on_click(cx.listener(|this, _, _, cx| this.reset(cx)))
-                            .mcp_node(
-                                &automation,
-                                NodeSpec::new("reset", Role::Button)
-                                    .label("Reset counter")
-                                    .action(NodeAction::Click)
-                                    .on_event(cx.listener(|this, event, _, cx| {
-                                        if matches!(event, NodeEvent::Click { .. }) {
-                                            this.reset(cx);
-                                        }
-                                    })),
-                            ),
+                            .on_click(cx.listener(|this, _, _, cx| this.reset(cx))),
                     ),
             )
-            .child(
-                div()
-                    .mt_4()
-                    .text_sm()
-                    .text_color(rgb(0x9b_a8_bb))
-                    .child("The endpoint descriptor path is printed to stderr at startup.")
-                    .mcp_node(
-                        &automation,
-                        NodeSpec::new("help", Role::Text).label("Endpoint descriptor help"),
-                    ),
-            )
-            .mcp_node(
-                &automation,
-                NodeSpec::new("app", Role::Application).label(TITLE).root(),
-            )
+            .semantic_role(SemanticRole::Application)
+            .accessible_name(TITLE)
     }
 }
 
@@ -146,18 +99,21 @@ fn main() {
             },
             |window, cx| {
                 window.set_window_title(TITLE);
-                let bridge = match BridgeHandle::install(
-                    window,
-                    cx,
-                    BridgeConfig::new("gpui-mcp-demo", TITLE),
-                ) {
-                    Ok(bridge) => bridge,
+                let app_id = match gpui_mcp::AppId::new("gpui-mcp-demo") {
+                    Ok(app_id) => app_id,
                     Err(error) => {
-                        eprintln!("could not install GPUI MCP bridge: {error}");
+                        eprintln!("invalid GPUI MCP application ID: {error}");
                         std::process::exit(1);
                     }
                 };
-                eprintln!("GPUI MCP endpoint: {}", bridge.endpoint_path().display());
+                let bridge =
+                    match BridgeHandle::install(window, cx, BridgeConfig::new(app_id, TITLE)) {
+                        Ok(bridge) => bridge,
+                        Err(error) => {
+                            eprintln!("could not install GPUI MCP bridge: {error}");
+                            std::process::exit(1);
+                        }
+                    };
                 let automation = bridge.automation();
                 cx.new(|_| Demo {
                     count: 0,

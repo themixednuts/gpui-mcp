@@ -458,6 +458,9 @@ pub(crate) struct RequestFrameOptions {
 }
 
 pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+    fn native_window_id(&self) -> Option<u32> {
+        None
+    }
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;
     fn window_bounds(&self) -> WindowBounds;
@@ -952,6 +955,28 @@ impl PlatformInputHandler {
 
     pub(crate) fn dispatch_input(&mut self, input: &str, window: &mut Window, cx: &mut App) {
         self.handler.replace_text_in_range(None, input, window, cx);
+    }
+
+    pub(crate) fn replace_all_text(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let mut document_range = None;
+        if self
+            .handler
+            .text_for_range(0..usize::MAX, &mut document_range, window, cx)
+            .is_none()
+        {
+            return false;
+        }
+        let Some(document_range) = document_range else {
+            return false;
+        };
+        self.handler
+            .replace_text_in_range(Some(document_range), text, window, cx);
+        true
     }
 
     pub fn selected_bounds(&mut self, window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {

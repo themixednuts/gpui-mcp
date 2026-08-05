@@ -8,18 +8,16 @@ use std::thread;
 use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
-use directories::BaseDirs;
 use gpui::{App, Window};
 use gpui_mcp_protocol::{
-    ActionOutcome, ApplicationCommandDescriptor, ApplicationCommandResult, BridgeError,
-    BridgeResult, Capabilities, Capability, ContextResource, ContextResourceDescriptor,
-    EndpointDescriptor, ErrorCode, Highlight, LiveDocument, LiveDocumentPreview,
-    LiveDocumentSource, LocalEndpoint, MAX_APPLICATION_COMMAND_OUTPUT_BYTES,
-    MAX_APPLICATION_COMMAND_SCHEMA_BYTES, MAX_APPLICATION_COMMANDS, MAX_CONTEXT_RESOURCE_BYTES,
-    MAX_CONTEXT_RESOURCE_URI_BYTES, MAX_CONTEXT_RESOURCES, MAX_ID_BYTES, MAX_LABEL_BYTES,
-    MAX_LIVE_DOCUMENT_DIAGNOSTICS, MAX_LIVE_DOCUMENT_SOURCE_BYTES, MAX_REQUEST_BYTES,
-    MAX_RESPONSE_BYTES, MAX_WAIT_MS, Operation, PROTOCOL_VERSION, ScreenshotTarget, WireRequest,
-    WireResponse,
+    AppId, ApplicationCommandDescriptor, ApplicationCommandResult, BridgeError, BridgeResult,
+    Capabilities, Capability, ContextResource, ContextResourceDescriptor, EndpointDescriptor,
+    ErrorCode, Highlight, InstanceId, LiveDocument, LiveDocumentPreview, LiveDocumentSource,
+    LocalEndpoint, MAX_APPLICATION_COMMAND_OUTPUT_BYTES, MAX_APPLICATION_COMMAND_SCHEMA_BYTES,
+    MAX_APPLICATION_COMMANDS, MAX_CONTEXT_RESOURCE_BYTES, MAX_CONTEXT_RESOURCE_URI_BYTES,
+    MAX_CONTEXT_RESOURCES, MAX_ID_BYTES, MAX_LABEL_BYTES, MAX_LIVE_DOCUMENT_DIAGNOSTICS,
+    MAX_LIVE_DOCUMENT_SOURCE_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MAX_WAIT_MS,
+    NativeWindowId, Operation, PROTOCOL_VERSION, ProcessId, WireRequest, WireResponse,
 };
 use interprocess::local_socket::{
     GenericFilePath, GenericNamespaced, ListenerOptions, Name, ToFsName as _, ToNsName as _,
@@ -35,7 +33,6 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::Automation;
-use crate::capture;
 use crate::input;
 use crate::registry::SharedState;
 
@@ -47,14 +44,10 @@ const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_mins(30);
 /// Configuration for one GPUI window bridge.
 #[derive(Clone, Debug)]
 pub struct BridgeConfig {
-    app_id: String,
+    app_id: AppId,
     app_name: String,
-    window_title: String,
     endpoint_dir: Option<PathBuf>,
     operation_timeout: Duration,
-    live_document: bool,
-    context_resources: bool,
-    application_commands: bool,
 }
 
 impl BridgeConfig {
@@ -63,71 +56,58 @@ impl BridgeConfig {
     /// `app_id` is declared once in Rust and discovered automatically by the
     /// MCP server; users do not repeat it in MCP client configuration. Multiple
     /// running bridges with the same logical ID receive independent automatic
-    /// instance IDs. The native window title defaults to `app_name`; use
-    /// [`Self::window_title`] when they differ.
+    /// instance IDs.
     #[must_use]
-    pub fn new(app_id: impl Into<String>, app_name: impl Into<String>) -> Self {
-        let app_name = app_name.into();
+    pub fn new(app_id: AppId, app_name: impl Into<String>) -> Self {
         Self {
-            app_id: app_id.into(),
-            window_title: app_name.clone(),
-            app_name,
+            app_id,
+            app_name: app_name.into(),
             endpoint_dir: None,
             operation_timeout: Duration::from_secs(5),
-            live_document: false,
-            context_resources: false,
-            application_commands: false,
         }
     }
 
-    /// Override the exact native title used to match this window for capture.
-    #[must_use]
-    pub fn window_title(mut self, title: impl Into<String>) -> Self {
-        self.window_title = title.into();
-        self
-    }
-
     /// Override the private endpoint descriptor directory.
-    #[must_use]
-    pub fn endpoint_dir(mut self, directory: impl Into<PathBuf>) -> Self {
-        self.endpoint_dir = Some(directory.into());
-        self
-    }
-
-    /// Override the UI operation deadline. Values are clamped to 100 ms through 30 seconds.
-    #[must_use]
-    pub fn operation_timeout(mut self, duration: Duration) -> Self {
-        self.operation_timeout =
-            duration.clamp(Duration::from_millis(100), Duration::from_secs(30));
-        self
-    }
-
-    /// Opt into revisioned in-memory live-document operations for this endpoint.
     ///
-    /// A document handler must also be registered on the installed [`BridgeHandle`].
-    #[must_use]
-    pub const fn enable_live_document(mut self) -> Self {
-        self.live_document = true;
-        self
+    /// # Errors
+    ///
+    /// Returns [`BridgeConfigError::RelativeEndpoint`] unless the path is absolute.
+    pub fn endpoint_dir(
+        mut self,
+        directory: impl Into<PathBuf>,
+    ) -> Result<Self, BridgeConfigError> {
+        let directory = directory.into();
+        if !directory.is_absolute() {
+            return Err(BridgeConfigError::RelativeEndpoint);
+        }
+        self.endpoint_dir = Some(directory);
+        Ok(self)
     }
 
-    /// Opt into bounded application-owned MCP context resources for this endpoint.
+    /// Override the UI operation deadline.
     ///
-    /// A resource handler must also be registered on the installed [`BridgeHandle`].
-    #[must_use]
-    pub const fn enable_context_resources(mut self) -> Self {
-        self.context_resources = true;
-        self
+    /// # Errors
+    ///
+    /// Returns [`BridgeConfigError::InvalidTimeout`] unless the duration is
+    /// between 100 milliseconds and 30 seconds, inclusive.
+    pub fn operation_timeout(mut self, duration: Duration) -> Result<Self, BridgeConfigError> {
+        if !(Duration::from_millis(100)..=Duration::from_secs(30)).contains(&duration) {
+            return Err(BridgeConfigError::InvalidTimeout);
+        }
+        self.operation_timeout = duration;
+        Ok(self)
     }
+}
 
-    /// Opt into bounded application-owned structured commands for this endpoint.
-    ///
-    /// A command handler must also be registered on the installed [`BridgeHandle`].
-    #[must_use]
-    pub const fn enable_application_commands(mut self) -> Self {
-        self.application_commands = true;
-        self
-    }
+/// Invalid bridge configuration supplied before installation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum BridgeConfigError {
+    /// A custom endpoint directory was not absolute.
+    #[error("custom endpoint directory must be absolute")]
+    RelativeEndpoint,
+    /// The UI operation timeout was outside the supported range.
+    #[error("operation timeout must be between 100 milliseconds and 30 seconds")]
+    InvalidTimeout,
 }
 
 /// App-side request delivered to an opt-in live-document handler on the GPUI thread.
@@ -144,10 +124,6 @@ pub enum LiveDocumentRequest {
     },
 }
 
-type LiveDocumentHandler = Rc<
-    dyn Fn(LiveDocumentRequest, &mut Window, &mut App) -> Result<LiveDocumentResponse, BridgeError>,
->;
-
 /// Typed result returned by an application live-document handler.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LiveDocumentResponse {
@@ -155,52 +131,6 @@ pub enum LiveDocumentResponse {
     Document(LiveDocument),
     /// Response to [`LiveDocumentRequest::Preview`].
     Preview(LiveDocumentPreview),
-}
-
-struct LiveDocumentHost {
-    enabled: bool,
-    handler: RefCell<Option<LiveDocumentHandler>>,
-}
-
-impl LiveDocumentHost {
-    fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            handler: RefCell::new(None),
-        }
-    }
-
-    fn handle(
-        &self,
-        request: LiveDocumentRequest,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Result<LiveDocumentResponse, BridgeError> {
-        if !self.enabled {
-            return Err(BridgeError::new(
-                ErrorCode::Unsupported,
-                "live document preview is not enabled for this application",
-            ));
-        }
-        let handler = self.handler.borrow().clone().ok_or_else(|| {
-            BridgeError::new(
-                ErrorCode::Unsupported,
-                "live document host is not registered",
-            )
-        })?;
-        handler(request, window, cx)
-    }
-}
-
-/// Failure to register an application live-document host.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum LiveDocumentHostError {
-    /// The bridge was not configured to expose document operations.
-    #[error("live document preview is not enabled in BridgeConfig")]
-    Disabled,
-    /// One handler is already registered for this window.
-    #[error("a live document handler is already registered")]
-    AlreadyRegistered,
 }
 
 /// App-side request delivered to an opt-in context-resource handler on the GPUI thread.
@@ -222,60 +152,6 @@ pub enum ContextResourceResponse {
     List(Vec<ContextResourceDescriptor>),
     /// Response to [`ContextResourceRequest::Read`].
     Resource(ContextResource),
-}
-
-type ContextResourceHandler = Rc<
-    dyn Fn(
-        ContextResourceRequest,
-        &mut Window,
-        &mut App,
-    ) -> Result<ContextResourceResponse, BridgeError>,
->;
-
-struct ContextResourceHost {
-    enabled: bool,
-    handler: RefCell<Option<ContextResourceHandler>>,
-}
-
-impl ContextResourceHost {
-    fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            handler: RefCell::new(None),
-        }
-    }
-
-    fn handle(
-        &self,
-        request: ContextResourceRequest,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Result<ContextResourceResponse, BridgeError> {
-        if !self.enabled {
-            return Err(BridgeError::new(
-                ErrorCode::Unsupported,
-                "context resources are not enabled for this application",
-            ));
-        }
-        let handler = self.handler.borrow().clone().ok_or_else(|| {
-            BridgeError::new(
-                ErrorCode::Unsupported,
-                "context resource host is not registered",
-            )
-        })?;
-        handler(request, window, cx)
-    }
-}
-
-/// Failure to register an application context-resource host.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum ContextResourceHostError {
-    /// The bridge was not configured to expose context resources.
-    #[error("context resources are not enabled in BridgeConfig")]
-    Disabled,
-    /// One handler is already registered for this window.
-    #[error("a context resource handler is already registered")]
-    AlreadyRegistered,
 }
 
 /// App-side request delivered to an opt-in structured command handler on the GPUI thread.
@@ -301,58 +177,73 @@ pub enum ApplicationCommandResponse {
     Result(ApplicationCommandResult),
 }
 
-type ApplicationCommandHandler = Rc<
-    dyn Fn(
-        ApplicationCommandRequest,
-        &mut Window,
-        &mut App,
-    ) -> Result<ApplicationCommandResponse, BridgeError>,
->;
+type Handler<Request, Response> =
+    Rc<dyn Fn(Request, &mut Window, &mut App) -> Result<Response, BridgeError>>;
 
-struct ApplicationCommandHost {
-    enabled: bool,
-    handler: RefCell<Option<ApplicationCommandHandler>>,
+struct Host<Request, Response> {
+    name: &'static str,
+    handler: RefCell<Option<Handler<Request, Response>>>,
 }
 
-impl ApplicationCommandHost {
-    fn new(enabled: bool) -> Self {
+impl<Request, Response> Host<Request, Response> {
+    fn new(name: &'static str) -> Self {
         Self {
-            enabled,
+            name,
             handler: RefCell::new(None),
         }
     }
 
+    fn register(&self, handler: Handler<Request, Response>) -> Result<(), HostError> {
+        let mut slot = self.handler.borrow_mut();
+        if slot.is_some() {
+            return Err(HostError::AlreadyRegistered { host: self.name });
+        }
+        *slot = Some(handler);
+        Ok(())
+    }
+
+    fn clear(&self) {
+        self.handler.borrow_mut().take();
+    }
+
     fn handle(
         &self,
-        request: ApplicationCommandRequest,
+        request: Request,
         window: &mut Window,
         cx: &mut App,
-    ) -> Result<ApplicationCommandResponse, BridgeError> {
-        if !self.enabled {
-            return Err(BridgeError::new(
-                ErrorCode::Unsupported,
-                "application commands are not enabled for this application",
-            ));
-        }
+    ) -> Result<Response, BridgeError> {
         let handler = self.handler.borrow().clone().ok_or_else(|| {
             BridgeError::new(
                 ErrorCode::Unsupported,
-                "application command host is not registered",
+                format!("{} host is not registered", self.name),
             )
         })?;
         handler(request, window, cx)
     }
 }
 
-/// Failure to register an application command host.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum ApplicationCommandHostError {
-    /// The bridge was not configured to expose application commands.
-    #[error("application commands are not enabled in BridgeConfig")]
-    Disabled,
-    /// One handler is already registered for this window.
-    #[error("an application command handler is already registered")]
-    AlreadyRegistered,
+type DocumentHost = Host<LiveDocumentRequest, LiveDocumentResponse>;
+type ResourceHost = Host<ContextResourceRequest, ContextResourceResponse>;
+type CommandHost = Host<ApplicationCommandRequest, ApplicationCommandResponse>;
+
+/// Failure to register and publish one application-owned MCP host.
+#[derive(Debug, Error)]
+pub enum HostError {
+    /// One callback already owns the host.
+    #[error("the {host} host is already registered")]
+    AlreadyRegistered {
+        /// Duplicate host name.
+        host: &'static str,
+    },
+    /// The updated endpoint descriptor could not be published.
+    #[error("could not publish the {host} host: {source}")]
+    Publish {
+        /// Host whose capability could not be published.
+        host: &'static str,
+        /// Descriptor update failure.
+        #[source]
+        source: StartError,
+    },
 }
 
 /// Failure while installing the local bridge.
@@ -361,24 +252,39 @@ pub enum StartError {
     /// Configuration did not meet hardening constraints.
     #[error("invalid bridge configuration: {0}")]
     InvalidConfig(&'static str),
+    /// The operating system returned process identifier zero.
+    #[error("the operating system returned an invalid process identifier")]
+    InvalidProcessId,
     /// Local IPC or endpoint-file setup failed.
     #[error("could not initialize local bridge: {0}")]
     Io(#[from] io::Error),
     /// Endpoint serialization failed.
     #[error("could not serialize endpoint descriptor: {0}")]
     Serialize(#[from] serde_json::Error),
+    /// The operating system did not expose the required private runtime root.
+    #[error("could not resolve the local bridge runtime directory: {0}")]
+    RuntimePath(#[from] gpui_mcp_protocol::RuntimePathError),
+}
+
+fn random_instance_id() -> InstanceId {
+    loop {
+        if let Some(id) = InstanceId::new(rand::random()) {
+            return id;
+        }
+    }
 }
 
 /// Owned service lifetime. Dropping it stops the listener and removes its descriptor.
 pub struct BridgeHandle {
     automation: Automation,
     endpoint_path: PathBuf,
+    descriptor: RefCell<EndpointDescriptor>,
     token: String,
     cancellation: CancellationToken,
     network_thread: Option<thread::JoinHandle<()>>,
-    live_document_host: Rc<LiveDocumentHost>,
-    context_resource_host: Rc<ContextResourceHost>,
-    application_command_host: Rc<ApplicationCommandHost>,
+    document_host: Rc<DocumentHost>,
+    resource_host: Rc<ResourceHost>,
+    command_host: Rc<CommandHost>,
 }
 
 impl BridgeHandle {
@@ -390,26 +296,29 @@ impl BridgeHandle {
     ///
     /// Returns [`StartError`] when configuration validation, the private endpoint
     /// directory, native local listener, descriptor serialization, or runtime setup fails.
-    pub fn install(window: &Window, cx: &App, config: BridgeConfig) -> Result<Self, StartError> {
+    pub fn install(
+        window: &mut Window,
+        cx: &App,
+        config: BridgeConfig,
+    ) -> Result<Self, StartError> {
         validate_config(&config)?;
 
         let mut token_bytes = [0_u8; 32];
         rand::rng().fill_bytes(&mut token_bytes);
         let token = encode_hex(&token_bytes);
-        let instance_id: u64 = rand::random();
-        let state = SharedState::new(instance_id);
-        let automation = Automation {
-            state: state.clone(),
+        let instance_id = random_instance_id();
+        let state = SharedState::new();
+        let automation = Automation::new(state.clone());
+        automation.attach(window);
+        let pid = ProcessId::new(std::process::id()).ok_or(StartError::InvalidProcessId)?;
+        let native_window_id = window.native_window_id().and_then(NativeWindowId::new);
+        let document_host = Rc::new(DocumentHost::new("document"));
+        let resource_host = Rc::new(ResourceHost::new("resource"));
+        let command_host = Rc::new(CommandHost::new("command"));
+        let endpoint_dir = match config.endpoint_dir.clone() {
+            Some(directory) => directory,
+            None => default_endpoint_dir()?,
         };
-        let pid = std::process::id();
-        let live_document_host = Rc::new(LiveDocumentHost::new(config.live_document));
-        let context_resource_host = Rc::new(ContextResourceHost::new(config.context_resources));
-        let application_command_host =
-            Rc::new(ApplicationCommandHost::new(config.application_commands));
-        let endpoint_dir = config
-            .endpoint_dir
-            .clone()
-            .unwrap_or_else(default_endpoint_dir);
         secure_directory(&endpoint_dir)?;
         let endpoint_dir = endpoint_dir.canonicalize()?;
         #[cfg(unix)]
@@ -438,8 +347,8 @@ impl BridgeHandle {
             pid,
             endpoint,
             token: token.clone(),
-            window_title: config.window_title.clone(),
-            capabilities: endpoint_capabilities(&config),
+            native_window_id,
+            capabilities: endpoint_capabilities(native_window_id),
         };
         write_descriptor(&endpoint_path, &descriptor)?;
 
@@ -449,16 +358,15 @@ impl BridgeHandle {
             cx,
             command_rx,
             state.clone(),
-            live_document_host.clone(),
-            context_resource_host.clone(),
-            application_command_host.clone(),
+            document_host.clone(),
+            resource_host.clone(),
+            command_host.clone(),
         );
 
         let cancellation = CancellationToken::new();
         let thread_cancellation = cancellation.clone();
         let listener_state = state;
         let listener_token = token.clone();
-        let title = config.window_title;
         let operation_timeout = config.operation_timeout;
         let network_thread = thread::Builder::new()
             .name("gpui-mcp-listener".to_owned())
@@ -469,7 +377,6 @@ impl BridgeHandle {
                     listener_state,
                     listener_token,
                     pid,
-                    title,
                     config.app_id,
                     operation_timeout,
                     owner_uid,
@@ -487,16 +394,17 @@ impl BridgeHandle {
         Ok(Self {
             automation,
             endpoint_path,
+            descriptor: RefCell::new(descriptor),
             token,
             cancellation,
             network_thread: Some(network_thread),
-            live_document_host,
-            context_resource_host,
-            application_command_host,
+            document_host,
+            resource_host,
+            command_host,
         })
     }
 
-    /// Clone the annotation and logging handle.
+    /// Clone the semantic snapshot and logging handle.
     #[must_use]
     pub fn automation(&self) -> Automation {
         self.automation.clone()
@@ -521,15 +429,15 @@ impl BridgeHandle {
         remove_owned_descriptor(&self.endpoint_path, &self.token);
     }
 
-    /// Register the sole app-side live-document handler for this window.
+    /// Register and advertise the app-side live-document handler for this window.
     ///
     /// The callback always runs on GPUI's foreground executor. Registering does
     /// not grant filesystem access; source persistence remains an application decision.
     ///
     /// # Errors
     ///
-    /// Returns an error when the capability was not enabled or a handler already exists.
-    pub fn register_live_document_handler(
+    /// Returns an error when a handler already exists or the updated descriptor cannot be written.
+    pub fn on_document(
         &self,
         handler: impl Fn(
             LiveDocumentRequest,
@@ -537,27 +445,20 @@ impl BridgeHandle {
             &mut App,
         ) -> Result<LiveDocumentResponse, BridgeError>
         + 'static,
-    ) -> Result<(), LiveDocumentHostError> {
-        if !self.live_document_host.enabled {
-            return Err(LiveDocumentHostError::Disabled);
-        }
-        let mut slot = self.live_document_host.handler.borrow_mut();
-        if slot.is_some() {
-            return Err(LiveDocumentHostError::AlreadyRegistered);
-        }
-        *slot = Some(Rc::new(handler));
-        Ok(())
+    ) -> Result<(), HostError> {
+        self.document_host.register(Rc::new(handler))?;
+        self.publish(Capability::LiveDocument, &self.document_host)
     }
 
-    /// Register the sole app-side context-resource handler for this window.
+    /// Register and advertise the app-side context-resource handler for this window.
     ///
     /// The callback runs on GPUI's foreground executor. The bridge validates and
     /// bounds all returned metadata and text before it reaches an MCP client.
     ///
     /// # Errors
     ///
-    /// Returns an error when the capability was not enabled or a handler already exists.
-    pub fn register_context_resource_handler(
+    /// Returns an error when a handler already exists or the updated descriptor cannot be written.
+    pub fn on_resource(
         &self,
         handler: impl Fn(
             ContextResourceRequest,
@@ -565,27 +466,20 @@ impl BridgeHandle {
             &mut App,
         ) -> Result<ContextResourceResponse, BridgeError>
         + 'static,
-    ) -> Result<(), ContextResourceHostError> {
-        if !self.context_resource_host.enabled {
-            return Err(ContextResourceHostError::Disabled);
-        }
-        let mut slot = self.context_resource_host.handler.borrow_mut();
-        if slot.is_some() {
-            return Err(ContextResourceHostError::AlreadyRegistered);
-        }
-        *slot = Some(Rc::new(handler));
-        Ok(())
+    ) -> Result<(), HostError> {
+        self.resource_host.register(Rc::new(handler))?;
+        self.publish(Capability::ContextResources, &self.resource_host)
     }
 
-    /// Register the sole app-side structured command handler for this window.
+    /// Register and advertise the app-side structured command handler for this window.
     ///
     /// The callback runs on GPUI's foreground executor. The bridge bounds descriptors,
     /// schemas, arguments, and results before they cross the authenticated local endpoint.
     ///
     /// # Errors
     ///
-    /// Returns an error when the capability was not enabled or a handler already exists.
-    pub fn register_application_command_handler(
+    /// Returns an error when a handler already exists or the updated descriptor cannot be written.
+    pub fn on_command(
         &self,
         handler: impl Fn(
             ApplicationCommandRequest,
@@ -593,20 +487,31 @@ impl BridgeHandle {
             &mut App,
         ) -> Result<ApplicationCommandResponse, BridgeError>
         + 'static,
-    ) -> Result<(), ApplicationCommandHostError> {
-        if !self.application_command_host.enabled {
-            return Err(ApplicationCommandHostError::Disabled);
+    ) -> Result<(), HostError> {
+        self.command_host.register(Rc::new(handler))?;
+        self.publish(Capability::ApplicationCommands, &self.command_host)
+    }
+
+    fn publish<Request, Response>(
+        &self,
+        capability: Capability,
+        host: &Host<Request, Response>,
+    ) -> Result<(), HostError> {
+        let mut descriptor = self.descriptor.borrow().clone();
+        descriptor.capabilities.available.insert(capability);
+        if let Err(source) = write_descriptor(&self.endpoint_path, &descriptor) {
+            host.clear();
+            return Err(HostError::Publish {
+                host: host.name,
+                source,
+            });
         }
-        let mut slot = self.application_command_host.handler.borrow_mut();
-        if slot.is_some() {
-            return Err(ApplicationCommandHostError::AlreadyRegistered);
-        }
-        *slot = Some(Rc::new(handler));
+        *self.descriptor.borrow_mut() = descriptor;
         Ok(())
     }
 }
 
-fn endpoint_capabilities(config: &BridgeConfig) -> Capabilities {
+fn endpoint_capabilities(native_window_id: Option<NativeWindowId>) -> Capabilities {
     Capabilities::new(
         [
             Capability::SemanticTree,
@@ -616,18 +521,7 @@ fn endpoint_capabilities(config: &BridgeConfig) -> Capabilities {
             Capability::Logs,
         ]
         .into_iter()
-        .chain(cfg!(feature = "native-screenshot").then_some(Capability::Screenshot))
-        .chain(config.live_document.then_some(Capability::LiveDocument))
-        .chain(
-            config
-                .context_resources
-                .then_some(Capability::ContextResources),
-        )
-        .chain(
-            config
-                .application_commands
-                .then_some(Capability::ApplicationCommands),
-        ),
+        .chain(native_window_id.is_some().then_some(Capability::Screenshot)),
     )
 }
 
@@ -647,9 +541,9 @@ fn spawn_ui_pump(
     cx: &App,
     receiver: Receiver<UiCommand>,
     state: Arc<SharedState>,
-    live_document_host: Rc<LiveDocumentHost>,
-    context_resource_host: Rc<ContextResourceHost>,
-    application_command_host: Rc<ApplicationCommandHost>,
+    document_host: Rc<DocumentHost>,
+    resource_host: Rc<ResourceHost>,
+    command_host: Rc<CommandHost>,
 ) {
     window
         .spawn(cx, async move |cx| {
@@ -659,9 +553,9 @@ fn spawn_ui_pump(
                         handle_ui_operation(
                             command.operation,
                             &state,
-                            &live_document_host,
-                            &context_resource_host,
-                            &application_command_host,
+                            &document_host,
+                            &resource_host,
+                            &command_host,
                             window,
                             cx,
                         )
@@ -683,38 +577,33 @@ fn spawn_ui_pump(
 fn handle_ui_operation(
     operation: Operation,
     state: &SharedState,
-    live_document_host: &LiveDocumentHost,
-    context_resource_host: &ContextResourceHost,
-    application_command_host: &ApplicationCommandHost,
+    document_host: &DocumentHost,
+    resource_host: &ResourceHost,
+    command_host: &CommandHost,
     window: &mut Window,
     cx: &mut App,
 ) -> Result<BridgeResult, BridgeError> {
     match operation {
-        Operation::NativeInput { command } => {
-            input::dispatch_native(&command, window, cx)?;
-            // Each primitive native event completes through the same painted-frame contract as
-            // semantic input. Compound gestures issue one operation per event, so callers can
+        Operation::PointerInput { command } => {
+            input::dispatch_pointer(&command, window, cx)?;
+            // Each primitive pointer event completes through the same painted-frame contract as
+            // keyboard input. Compound gestures issue one operation per event, so callers can
             // deterministically settle a frame between drag moves without sleeping.
             window.refresh();
             Ok(BridgeResult::Ack)
         }
         Operation::Input { command } => {
-            match &command {
-                gpui_mcp_protocol::InputCommand::Key { .. }
-                | gpui_mcp_protocol::InputCommand::TypeText { .. }
-                | gpui_mcp_protocol::InputCommand::ReplaceText { .. } => {
-                    input::dispatch_keyboard(command, window, cx)?;
-                }
-                _ => match state.dispatch_pointer(&command, window, cx)? {
-                    ActionOutcome::Handled => {}
-                    ActionOutcome::Rejected { reason } => {
-                        return Err(BridgeError::new(ErrorCode::Rejected, reason));
-                    }
-                },
-            }
-            // Raw coordinate and keyboard input has the same completion contract as semantic
-            // actions: callers may observe the fully painted result once the operation returns.
+            input::dispatch_keyboard(command, window, cx)?;
             window.refresh();
+            Ok(BridgeResult::Ack)
+        }
+        Operation::Focus { node_id } => {
+            if !window.focus_semantic_element(&node_id) {
+                return Err(BridgeError::new(
+                    ErrorCode::NotFound,
+                    "semantic node is not focusable in the current frame",
+                ));
+            }
             Ok(BridgeResult::Ack)
         }
         Operation::Refresh => {
@@ -729,25 +618,10 @@ fn handle_ui_operation(
             window.refresh();
             Ok(BridgeResult::Ack)
         }
-        Operation::Invoke {
-            node_id,
-            expected_generation,
-            action,
-        } => {
-            let outcome =
-                state.dispatch_action(&node_id, expected_generation, &action, window, cx)?;
-            if matches!(outcome, ActionOutcome::Handled) {
-                // A successful semantic mutation is not complete for automation until GPUI has
-                // been asked to publish the resulting frame. Application handlers may refresh
-                // too; duplicate refresh requests are coalesced by GPUI.
-                window.refresh();
-            }
-            Ok(BridgeResult::Action(outcome))
-        }
         Operation::GetLiveDocument => {
-            let response = live_document_host.handle(LiveDocumentRequest::Get, window, cx)?;
+            let response = document_host.handle(LiveDocumentRequest::Get, window, cx)?;
             let LiveDocumentResponse::Document(document) = response else {
-                return Err(invalid_live_document_host_result());
+                return Err(invalid_host_result("document"));
             };
             validate_live_document_result(document).map(BridgeResult::LiveDocument)
         }
@@ -755,7 +629,7 @@ fn handle_ui_operation(
             expected_revision,
             source,
         } => {
-            let response = live_document_host.handle(
+            let response = document_host.handle(
                 LiveDocumentRequest::Preview {
                     expected_revision,
                     source,
@@ -764,7 +638,7 @@ fn handle_ui_operation(
                 cx,
             )?;
             let LiveDocumentResponse::Preview(preview) = response else {
-                return Err(invalid_live_document_host_result());
+                return Err(invalid_host_result("document"));
             };
             let preview = validate_live_document_preview(preview)?;
             if preview.applied {
@@ -773,37 +647,35 @@ fn handle_ui_operation(
             Ok(BridgeResult::LiveDocumentPreview(preview))
         }
         Operation::ListContextResources => {
-            let response =
-                context_resource_host.handle(ContextResourceRequest::List, window, cx)?;
+            let response = resource_host.handle(ContextResourceRequest::List, window, cx)?;
             let ContextResourceResponse::List(resources) = response else {
-                return Err(invalid_context_resource_host_result());
+                return Err(invalid_host_result("resource"));
             };
             validate_context_resource_list(resources).map(BridgeResult::ContextResources)
         }
         Operation::ReadContextResource { uri } => {
-            let response = context_resource_host.handle(
+            let response = resource_host.handle(
                 ContextResourceRequest::Read { uri: uri.clone() },
                 window,
                 cx,
             )?;
             let ContextResourceResponse::Resource(resource) = response else {
-                return Err(invalid_context_resource_host_result());
+                return Err(invalid_host_result("resource"));
             };
             if resource.descriptor.uri != uri {
-                return Err(invalid_context_resource_host_result());
+                return Err(invalid_host_result("resource"));
             }
             validate_context_resource(resource).map(BridgeResult::ContextResource)
         }
         Operation::ListApplicationCommands => {
-            let response =
-                application_command_host.handle(ApplicationCommandRequest::List, window, cx)?;
+            let response = command_host.handle(ApplicationCommandRequest::List, window, cx)?;
             let ApplicationCommandResponse::List(commands) = response else {
-                return Err(invalid_application_command_host_result());
+                return Err(invalid_host_result("command"));
             };
             validate_application_command_list(commands).map(BridgeResult::ApplicationCommands)
         }
         Operation::ExecuteApplicationCommand { name, arguments } => {
-            let response = application_command_host.handle(
+            let response = command_host.handle(
                 ApplicationCommandRequest::Execute {
                     name: name.clone(),
                     arguments,
@@ -812,10 +684,10 @@ fn handle_ui_operation(
                 cx,
             )?;
             let ApplicationCommandResponse::Result(result) = response else {
-                return Err(invalid_application_command_host_result());
+                return Err(invalid_host_result("command"));
             };
             if result.name != name {
-                return Err(invalid_application_command_host_result());
+                return Err(invalid_host_result("command"));
             }
             let result = validate_application_command_result(result)?;
             window.refresh();
@@ -834,9 +706,8 @@ async fn run_listener(
     command_tx: Sender<UiCommand>,
     state: Arc<SharedState>,
     token: String,
-    pid: u32,
-    window_title: String,
-    app_id: String,
+    pid: ProcessId,
+    app_id: AppId,
     operation_timeout: Duration,
     owner_uid: Option<u32>,
     cancellation: CancellationToken,
@@ -868,7 +739,6 @@ async fn run_listener(
                     state: state.clone(),
                     token: token.clone(),
                     pid,
-                    window_title: window_title.clone(),
                     app_id: app_id.clone(),
                     operation_timeout,
                 };
@@ -895,9 +765,8 @@ struct ConnectionContext {
     command_tx: Sender<UiCommand>,
     state: Arc<SharedState>,
     token: String,
-    pid: u32,
-    window_title: String,
-    app_id: String,
+    pid: ProcessId,
+    app_id: AppId,
     operation_timeout: Duration,
 }
 
@@ -1011,7 +880,16 @@ async fn process_request(request: WireRequest, context: ConnectionContext) -> Wi
             .wait_for_frame(after_frame_count, Duration::from_millis(timeout_ms))
             .await
             .map(BridgeResult::FrameStats),
-        Operation::Screenshot { target } => capture_after_refresh(target, &context).await,
+        Operation::GetWindowGeometry => context
+            .state
+            .window_geometry()
+            .map(BridgeResult::WindowGeometry)
+            .ok_or_else(|| {
+                BridgeError::new(
+                    ErrorCode::NotFound,
+                    "GPUI window geometry is not available before the first completed root frame",
+                )
+            }),
         Operation::SetHighlights { highlights } => {
             context.state.set_highlights(highlights);
             request_ui_refresh(&context.command_tx, context.operation_timeout).await
@@ -1037,8 +915,8 @@ async fn process_request(request: WireRequest, context: ConnectionContext) -> Wi
             Ok(BridgeResult::Ack)
         }
         operation @ (Operation::Input { .. }
-        | Operation::NativeInput { .. }
-        | Operation::Invoke { .. }
+        | Operation::PointerInput { .. }
+        | Operation::Focus { .. }
         | Operation::Refresh
         | Operation::GetLiveDocument
         | Operation::PreviewLiveDocument { .. }
@@ -1052,58 +930,6 @@ async fn process_request(request: WireRequest, context: ConnectionContext) -> Wi
     match result {
         Ok(result) => WireResponse::success(request.request_id, result),
         Err(error) => WireResponse::failure(request.request_id, error),
-    }
-}
-
-async fn capture_after_refresh(
-    target: ScreenshotTarget,
-    context: &ConnectionContext,
-) -> Result<BridgeResult, BridgeError> {
-    // A mutation can commit the changed GPUI surface before unchanged shell surfaces are
-    // re-presented to the native compositor. Require two completed root paints before capture:
-    // the first flushes the mutation and the second presents one coherent complete window.
-    for _ in 0..2 {
-        let BridgeResult::FrameStats(before_refresh) = dispatch_to_ui(
-            Operation::Refresh,
-            &context.command_tx,
-            context.operation_timeout,
-        )
-        .await?
-        else {
-            return Err(BridgeError::new(
-                ErrorCode::Internal,
-                "refresh returned the wrong completed-frame token",
-            ));
-        };
-        context
-            .state
-            .wait_for_frame(before_refresh.frame_count, context.operation_timeout)
-            .await?;
-    }
-
-    let state = context.state.clone();
-    let title = context.window_title.clone();
-    let pid = context.pid;
-    match timeout(
-        context.operation_timeout,
-        tokio::task::spawn_blocking(move || {
-            capture::capture(pid, &title, target, &state).map(BridgeResult::Screenshot)
-        }),
-    )
-    .await
-    {
-        Err(_) => Err(BridgeError::new(
-            ErrorCode::Timeout,
-            "screenshot worker timed out",
-        )),
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "screenshot worker failed");
-            Err(BridgeError::new(
-                ErrorCode::Internal,
-                "screenshot worker failed",
-            ))
-        }
-        Ok(Ok(result)) => result,
     }
 }
 
@@ -1145,17 +971,15 @@ async fn dispatch_to_ui(
 fn validate_operation(operation: &Operation) -> Result<(), BridgeError> {
     match operation {
         Operation::Input { command } => input::validate(command),
-        Operation::NativeInput { command } => input::validate_native(command),
-        Operation::Invoke {
-            node_id, action, ..
-        } => {
+        Operation::PointerInput { command } => input::validate_pointer(command),
+        Operation::Focus { node_id } => {
             if node_id.is_empty()
                 || node_id.len() > MAX_ID_BYTES
                 || node_id.chars().any(char::is_control)
             {
                 return Err(invalid("semantic node identifier is invalid"));
             }
-            input::validate_semantic(action)
+            Ok(())
         }
         Operation::WaitForTree { timeout_ms, .. }
             if *timeout_ms == 0 || *timeout_ms > MAX_WAIT_MS =>
@@ -1182,9 +1006,6 @@ fn validate_operation(operation: &Operation) -> Result<(), BridgeError> {
             }
             Ok(())
         }
-        Operation::Screenshot {
-            target: gpui_mcp_protocol::ScreenshotTarget::Region { rect },
-        } if !rect.is_valid() => Err(invalid("screenshot rectangle is invalid")),
         Operation::PreviewLiveDocument {
             expected_revision,
             source,
@@ -1253,7 +1074,7 @@ fn validate_context_resource_descriptor(
             .size
             .is_some_and(|size| size > MAX_CONTEXT_RESOURCE_BYTES as u64)
     {
-        return Err(invalid_context_resource_host_result());
+        return Err(invalid_host_result("resource"));
     }
     Ok(())
 }
@@ -1262,13 +1083,13 @@ fn validate_context_resource_list(
     resources: Vec<ContextResourceDescriptor>,
 ) -> Result<Vec<ContextResourceDescriptor>, BridgeError> {
     if resources.len() > MAX_CONTEXT_RESOURCES {
-        return Err(invalid_context_resource_host_result());
+        return Err(invalid_host_result("resource"));
     }
     let mut uris = std::collections::BTreeSet::new();
     for descriptor in &resources {
         validate_context_resource_descriptor(descriptor)?;
         if !uris.insert(descriptor.uri.as_str()) {
-            return Err(invalid_context_resource_host_result());
+            return Err(invalid_host_result("resource"));
         }
     }
     Ok(resources)
@@ -1282,30 +1103,23 @@ fn validate_context_resource(resource: ContextResource) -> Result<ContextResourc
             .size
             .is_some_and(|size| size != resource.text.len() as u64)
     {
-        return Err(invalid_context_resource_host_result());
+        return Err(invalid_host_result("resource"));
     }
     Ok(resource)
-}
-
-fn invalid_context_resource_host_result() -> BridgeError {
-    BridgeError::new(
-        ErrorCode::Internal,
-        "context resource host returned an invalid result",
-    )
 }
 
 fn validate_application_command_list(
     commands: Vec<ApplicationCommandDescriptor>,
 ) -> Result<Vec<ApplicationCommandDescriptor>, BridgeError> {
     if commands.len() > MAX_APPLICATION_COMMANDS {
-        return Err(invalid_application_command_host_result());
+        return Err(invalid_host_result("command"));
     }
     let mut names = std::collections::BTreeSet::new();
     for command in &commands {
         validate_application_command_name(&command.name)
-            .map_err(|_| invalid_application_command_host_result())?;
+            .map_err(|_| invalid_host_result("command"))?;
         let schema_size = serde_json::to_vec(&command.input_schema)
-            .map_err(|_| invalid_application_command_host_result())?
+            .map_err(|_| invalid_host_result("command"))?
             .len();
         if command.title.is_empty()
             || command.title.len() > MAX_LABEL_BYTES
@@ -1314,7 +1128,7 @@ fn validate_application_command_list(
             || schema_size > MAX_APPLICATION_COMMAND_SCHEMA_BYTES
             || !names.insert(command.name.as_str())
         {
-            return Err(invalid_application_command_host_result());
+            return Err(invalid_host_result("command"));
         }
     }
     Ok(commands)
@@ -1323,21 +1137,13 @@ fn validate_application_command_list(
 fn validate_application_command_result(
     result: ApplicationCommandResult,
 ) -> Result<ApplicationCommandResult, BridgeError> {
-    validate_application_command_name(&result.name)
-        .map_err(|_| invalid_application_command_host_result())?;
+    validate_application_command_name(&result.name).map_err(|_| invalid_host_result("command"))?;
     if serde_json::to_vec(&result.output).map_or(true, |value| {
         value.len() > MAX_APPLICATION_COMMAND_OUTPUT_BYTES
     }) {
-        return Err(invalid_application_command_host_result());
+        return Err(invalid_host_result("command"));
     }
     Ok(result)
-}
-
-fn invalid_application_command_host_result() -> BridgeError {
-    BridgeError::new(
-        ErrorCode::Internal,
-        "application command host returned an invalid result",
-    )
 }
 
 fn validate_live_document_source(source: &LiveDocumentSource) -> Result<(), BridgeError> {
@@ -1359,7 +1165,7 @@ fn validate_live_document_result(document: LiveDocument) -> Result<LiveDocument,
                 || diagnostic.message.len() > MAX_LABEL_BYTES
         })
     {
-        return Err(invalid_live_document_host_result());
+        return Err(invalid_host_result("document"));
     }
     Ok(document)
 }
@@ -1374,15 +1180,15 @@ fn validate_live_document_preview(
                 || diagnostic.message.len() > MAX_LABEL_BYTES
         })
     {
-        return Err(invalid_live_document_host_result());
+        return Err(invalid_host_result("document"));
     }
     Ok(preview)
 }
 
-fn invalid_live_document_host_result() -> BridgeError {
+fn invalid_host_result(host: &str) -> BridgeError {
     BridgeError::new(
         ErrorCode::Internal,
-        "live document host returned an invalid result",
+        format!("{host} host returned an invalid result"),
     )
 }
 
@@ -1434,9 +1240,9 @@ async fn write_response(
 
 fn make_local_endpoint(
     endpoint_dir: &Path,
-    app_id: &str,
-    pid: u32,
-    instance_id: u64,
+    app_id: &AppId,
+    pid: ProcessId,
+    instance_id: InstanceId,
 ) -> LocalEndpoint {
     #[cfg(unix)]
     {
@@ -1538,29 +1344,9 @@ fn endpoint_owner_uid(path: &Path) -> io::Result<Option<u32>> {
 }
 
 fn validate_config(config: &BridgeConfig) -> Result<(), StartError> {
-    if config.app_id.is_empty()
-        || config.app_id.len() > 64
-        || !config
-            .app_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    {
+    if invalid_display_text(&config.app_name) {
         return Err(StartError::InvalidConfig(
-            "app_id must contain 1-64 ASCII letters, digits, '.', '_' or '-'",
-        ));
-    }
-    if invalid_display_text(&config.app_name) || invalid_display_text(&config.window_title) {
-        return Err(StartError::InvalidConfig(
-            "app name and window title must be 1-256 bytes without control characters",
-        ));
-    }
-    if config
-        .endpoint_dir
-        .as_ref()
-        .is_some_and(|directory| !directory.is_absolute())
-    {
-        return Err(StartError::InvalidConfig(
-            "custom endpoint directory must be absolute",
+            "app name must be 1-256 bytes without control characters",
         ));
     }
     Ok(())
@@ -1570,15 +1356,8 @@ fn invalid_display_text(value: &str) -> bool {
     value.is_empty() || value.len() > 256 || value.chars().any(char::is_control)
 }
 
-fn default_endpoint_dir() -> PathBuf {
-    if let Some(base) = BaseDirs::new() {
-        return base
-            .runtime_dir()
-            .unwrap_or_else(|| base.data_local_dir())
-            .join("gpui-mcp")
-            .join("run");
-    }
-    std::env::temp_dir().join("gpui-mcp").join("run")
+fn default_endpoint_dir() -> Result<PathBuf, gpui_mcp_protocol::RuntimePathError> {
+    gpui_mcp_protocol::runtime_root().map(|root| root.join("run"))
 }
 
 fn secure_directory(path: &Path) -> io::Result<()> {
@@ -1643,30 +1422,23 @@ fn invalid(message: &'static str) -> BridgeError {
 
 #[cfg(test)]
 mod tests {
-    use gpui_mcp_protocol::{ContextResource, ContextResourceDescriptor};
+    use gpui_mcp_protocol::{AppId, ContextResource, ContextResourceDescriptor};
 
     use super::{
-        BridgeConfig, encode_hex, validate_config, validate_context_resource,
-        validate_context_resource_list,
+        BridgeConfig, encode_hex, validate_context_resource, validate_context_resource_list,
     };
 
     #[test]
     fn application_identifier_blocks_path_traversal() {
-        let config = BridgeConfig::new("../unsafe", "App");
-        assert!(validate_config(&config).is_err());
+        assert!(AppId::new("../unsafe").is_err());
     }
 
     #[test]
-    fn application_name_is_the_default_window_title() {
-        let config = BridgeConfig::new("app", "My App");
-        assert_eq!(config.window_title, "My App");
-    }
-
-    #[test]
-    fn window_title_can_be_overridden() {
-        let config = BridgeConfig::new("app", "My App").window_title("My App — Settings");
+    fn bridge_config_retains_validated_identity() -> Result<(), gpui_mcp_protocol::InvalidAppId> {
+        let config = BridgeConfig::new(AppId::new("app")?, "My App");
+        assert_eq!(config.app_id.as_str(), "app");
         assert_eq!(config.app_name, "My App");
-        assert_eq!(config.window_title, "My App — Settings");
+        Ok(())
     }
 
     #[test]
