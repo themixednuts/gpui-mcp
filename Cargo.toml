@@ -8,6 +8,7 @@ members = [
     "examples/demo",
     "examples/runtime-showcase",
 ]
+exclude = ["vendor/gpui"]
 default-members = ["crates/gpui-mcp-server"]
 resolver = "3"
 
@@ -72,6 +73,6 @@ opt-level = 2
 
 [patch.crates-io]
 # GPUI 0.2.2 does not yet expose the rendered semantic frame, direct text-input bridge, or
-# native window identity needed by the MCP bridge. The vendored patch also contains two focused
+# native window identity needed by the MCP bridge. The vendored patch also contains three focused
 # upstream fixes. See vendor/README.md for the exact scope and removal conditions.
 gpui = { path = "vendor/gpui" }

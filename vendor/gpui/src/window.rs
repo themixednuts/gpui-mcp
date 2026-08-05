@@ -862,7 +862,7 @@ pub struct Window {
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     default_prevented: bool,
-    mouse_position: Point<Pixels>,
+    pointer: PointerState,
     mouse_hit_test: HitTest,
     modifiers: Modifiers,
     capslock: Capslock,
@@ -885,6 +885,92 @@ pub struct Window {
     pub(crate) client_inset: Option<Pixels>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputSource {
+    Platform,
+    Programmatic,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PointerState {
+    position: Point<Pixels>,
+    platform_position: Point<Pixels>,
+    programmatic: bool,
+}
+
+impl PointerState {
+    fn new(platform_position: Point<Pixels>) -> Self {
+        Self {
+            position: platform_position,
+            platform_position,
+            programmatic: false,
+        }
+    }
+
+    fn move_to(&mut self, position: Point<Pixels>, source: InputSource) -> bool {
+        match source {
+            InputSource::Programmatic => {
+                self.position = position;
+                self.programmatic = true;
+                true
+            }
+            InputSource::Platform if self.programmatic && position == self.platform_position => {
+                false
+            }
+            InputSource::Platform => {
+                self.position = position;
+                self.platform_position = position;
+                self.programmatic = false;
+                true
+            }
+        }
+    }
+
+    fn set_position(&mut self, position: Point<Pixels>, source: InputSource) {
+        self.position = position;
+        match source {
+            InputSource::Platform => {
+                self.platform_position = position;
+                self.programmatic = false;
+            }
+            InputSource::Programmatic => self.programmatic = true,
+        }
+    }
+
+    fn clear_programmatic(&mut self) {
+        self.programmatic = false;
+    }
+}
+
+#[cfg(test)]
+mod pointer_state_tests {
+    use super::{InputSource, PointerState};
+    use crate::{point, px};
+
+    #[test]
+    fn unchanged_platform_position_does_not_override_programmatic_pointer() {
+        let platform = point(px(10.0), px(20.0));
+        let programmatic = point(px(100.0), px(200.0));
+        let mut pointer = PointerState::new(platform);
+
+        assert!(pointer.move_to(programmatic, InputSource::Programmatic));
+        assert!(!pointer.move_to(platform, InputSource::Platform));
+        assert_eq!(pointer.position, programmatic);
+    }
+
+    #[test]
+    fn actual_platform_move_takes_pointer_ownership() {
+        let platform = point(px(10.0), px(20.0));
+        let moved = point(px(11.0), px(20.0));
+        let mut pointer = PointerState::new(platform);
+
+        assert!(pointer.move_to(point(px(100.0), px(200.0)), InputSource::Programmatic));
+        assert!(pointer.move_to(moved, InputSource::Platform));
+        assert_eq!(pointer.position, moved);
+        assert!(!pointer.programmatic);
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1136,7 +1222,9 @@ impl Window {
             let mut cx = cx.to_async();
             Box::new(move |event| {
                 handle
-                    .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
+                    .update(&mut cx, |_, window, cx| {
+                        window.dispatch_platform_event(event, cx)
+                    })
                     .log_err()
                     .unwrap_or(DispatchEventResult::default())
             })
@@ -1246,7 +1334,7 @@ impl Window {
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             default_prevented: true,
-            mouse_position,
+            pointer: PointerState::new(mouse_position),
             mouse_hit_test: HitTest::default(),
             modifiers,
             capslock,
@@ -1960,7 +2048,7 @@ impl Window {
 
     /// The position of the mouse relative to the window.
     pub fn mouse_position(&self) -> Point<Pixels> {
-        self.mouse_position
+        self.pointer.position
     }
 
     /// The current state of the keyboard's modifiers
@@ -2136,7 +2224,7 @@ impl Window {
             tooltip_element = self.prepaint_tooltip(cx);
         }
 
-        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position());
 
         self.next_frame.semantics.finish();
         let frame_observers = self.frame_observers();
@@ -3705,6 +3793,31 @@ impl Window {
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        self.dispatch_event_from(event, InputSource::Programmatic, cx)
+    }
+
+    fn dispatch_platform_event(
+        &mut self,
+        event: PlatformInput,
+        cx: &mut App,
+    ) -> DispatchEventResult {
+        self.dispatch_event_from(event, InputSource::Platform, cx)
+    }
+
+    fn dispatch_event_from(
+        &mut self,
+        event: PlatformInput,
+        source: InputSource,
+        cx: &mut App,
+    ) -> DispatchEventResult {
+        if let PlatformInput::MouseMove(mouse_move) = &event
+            && !self.pointer.move_to(mouse_move.position, source)
+        {
+            return DispatchEventResult {
+                propagate: true,
+                default_prevented: false,
+            };
+        }
         self.last_input_timestamp.set(Instant::now());
         // Handlers may set this to false by calling `stop_propagation`.
         cx.propagate_event = true;
@@ -3715,21 +3828,23 @@ impl Window {
             // Track the mouse position with our own state, since accessing the platform
             // API for the mouse position can only occur on the main thread.
             PlatformInput::MouseMove(mouse_move) => {
-                self.mouse_position = mouse_move.position;
                 self.modifiers = mouse_move.modifiers;
                 PlatformInput::MouseMove(mouse_move)
             }
             PlatformInput::MouseDown(mouse_down) => {
-                self.mouse_position = mouse_down.position;
+                self.pointer.set_position(mouse_down.position, source);
                 self.modifiers = mouse_down.modifiers;
                 PlatformInput::MouseDown(mouse_down)
             }
             PlatformInput::MouseUp(mouse_up) => {
-                self.mouse_position = mouse_up.position;
+                self.pointer.set_position(mouse_up.position, source);
                 self.modifiers = mouse_up.modifiers;
                 PlatformInput::MouseUp(mouse_up)
             }
             PlatformInput::MouseExited(mouse_exited) => {
+                if source == InputSource::Platform {
+                    self.pointer.clear_programmatic();
+                }
                 self.modifiers = mouse_exited.modifiers;
                 PlatformInput::MouseExited(mouse_exited)
             }
@@ -3739,7 +3854,7 @@ impl Window {
                 PlatformInput::ModifiersChanged(modifiers_changed)
             }
             PlatformInput::ScrollWheel(scroll_wheel) => {
-                self.mouse_position = scroll_wheel.position;
+                self.pointer.set_position(scroll_wheel.position, source);
                 self.modifiers = scroll_wheel.modifiers;
                 PlatformInput::ScrollWheel(scroll_wheel)
             }
@@ -3747,7 +3862,7 @@ impl Window {
             // to internal drag and drop events.
             PlatformInput::FileDrop(file_drop) => match file_drop {
                 FileDropEvent::Entered { position, paths } => {
-                    self.mouse_position = position;
+                    self.pointer.set_position(position, source);
                     if cx.active_drag.is_none() {
                         cx.active_drag = Some(AnyDrag {
                             value: Arc::new(paths.clone()),
@@ -3763,7 +3878,7 @@ impl Window {
                     })
                 }
                 FileDropEvent::Pending { position } => {
-                    self.mouse_position = position;
+                    self.pointer.set_position(position, source);
                     PlatformInput::MouseMove(MouseMoveEvent {
                         position,
                         pressed_button: Some(MouseButton::Left),
@@ -3772,7 +3887,7 @@ impl Window {
                 }
                 FileDropEvent::Submit { position } => {
                     cx.activate(true);
-                    self.mouse_position = position;
+                    self.pointer.set_position(position, source);
                     PlatformInput::MouseUp(MouseUpEvent {
                         button: MouseButton::Left,
                         position,
