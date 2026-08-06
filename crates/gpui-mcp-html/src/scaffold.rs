@@ -8,6 +8,8 @@ use crate::{
 };
 
 const GPUI_MCP_REPOSITORY: &str = "https://github.com/themixednuts/gpui-mcp";
+const ZED_REPOSITORY: &str = "https://github.com/zed-industries/zed";
+const ZED_REVISION: &str = "82878540b5410b288a2c92cb9ee5675533e4d807";
 
 /// Inputs for a new standalone GPUI HTML project.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -261,19 +263,27 @@ fn cargo_manifest(name: &str, dependencies: &ManifestDependencies<'_>) -> String
             );
             format!(
                 r#"gpui = "=0.2.2"
+gpui_platform = {{ git = "{ZED_REPOSITORY}", rev = "{ZED_REVISION}", features = ["font-kit", "wayland", "x11"] }}
 gpui-mcp = {{ git = "{GPUI_MCP_REPOSITORY}", {selector} }}
 gpui-mcp-html = {{ git = "{GPUI_MCP_REPOSITORY}", {selector}, features = ["dev-watch"] }}
 
 [patch.crates-io]
+gpui = {{ git = "{GPUI_MCP_REPOSITORY}", {selector} }}
+
+[patch."{ZED_REPOSITORY}"]
 gpui = {{ git = "{GPUI_MCP_REPOSITORY}", {selector} }}"#
             )
         }
         ManifestDependencies::LocalWorkspace(root) => format!(
             r#"gpui = "=0.2.2"
+gpui_platform = {{ git = "{ZED_REPOSITORY}", rev = "{ZED_REVISION}", features = ["font-kit", "wayland", "x11"] }}
 gpui-mcp = {{ path = "{root}/crates/gpui-mcp" }}
 gpui-mcp-html = {{ path = "{root}/crates/gpui-mcp-html", features = ["dev-watch"] }}
 
 [patch.crates-io]
+gpui = {{ path = "{root}/vendor/gpui" }}
+
+[patch."{ZED_REPOSITORY}"]
 gpui = {{ path = "{root}/vendor/gpui" }}"#
         ),
     };
@@ -297,9 +307,7 @@ fn main_rs(app_id: &str, title: &str) -> String {
         r#"use std::path::PathBuf;
 use std::time::Duration;
 
-use gpui::{{
-    App, AppContext, Application, Bounds, Context, IntoElement, Render, Timer, Window, px, size,
-}};
+use gpui::{{App, AppContext, Bounds, Context, IntoElement, Render, Window, px, size}};
 use gpui_mcp::{{AppId, BridgeConfig, BridgeHandle}};
 use gpui_mcp_html::{{
     HandlerId, HookOutcome, HookRegistry, LiveHtmlSession, ProjectPaths, ProjectSnapshot,
@@ -381,7 +389,7 @@ fn build_live(window: &mut Window, cx: &App) -> Result<AppView, String> {{
 }}
 
 fn main() {{
-    Application::new().run(|cx: &mut App| {{
+    gpui_platform::application().run(|cx: &mut App| {{
         gpui_mcp_html::init(cx);
         let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
         let opened = cx.open_window(
@@ -397,7 +405,9 @@ fn main() {{
                 window
                     .spawn(cx, async move |cx| {{
                         loop {{
-                            Timer::after(Duration::from_millis(50)).await;
+                            cx.background_executor()
+                                .timer(Duration::from_millis(50))
+                                .await;
                             if weak_view
                                 .update(cx, |view, cx| {{
                                     view.poll_project();
@@ -410,7 +420,7 @@ fn main() {{
                         }}
                     }})
                     .detach();
-                cx.new(|cx| gpui_mcp_html::NativeRoot::new(view, window, cx))
+                view
             }},
         );
         if let Err(error) = opened {{
@@ -641,12 +651,17 @@ mod tests {
         assert!(manifest.contains("features = [\"dev-watch\"]"));
         assert!(manifest.contains("gpui = \"=0.2.2\""));
         assert!(manifest.contains("https://github.com/themixednuts/gpui-mcp"));
+        assert!(manifest.contains("https://github.com/zed-industries/zed"));
         assert!(manifest.contains("[patch.crates-io]"));
+        assert!(manifest.contains("[patch.\"https://github.com/zed-industries/zed\"]"));
         assert!(!manifest.contains("path ="));
         let main = std::fs::read_to_string(destination.join("src/main.rs"))?;
         assert!(main.contains("ProjectWatcher"));
         assert!(main.contains("serve_mcp"));
-        assert!(main.contains("NativeRoot::new"));
+        assert!(!main.contains("NativeRoot"));
+        assert!(!main.contains("Application::new"));
+        assert!(!main.contains("Timer::after"));
+        assert!(main.contains("gpui_platform::application()"));
         assert!(main.contains("window::output_window_options(bounds)"));
         let window = std::fs::read_to_string(destination.join("src/window.rs"))?;
         assert!(window.contains("appears_transparent: false"));
@@ -682,7 +697,7 @@ mod tests {
         assert!(manifest.contains("gpui = \"=0.2.2\""));
         assert!(manifest.contains("path ="));
         assert!(manifest.contains("vendor/gpui"));
-        assert!(!manifest.contains("git ="));
+        assert!(!manifest.contains("git = \"https://github.com/themixednuts/gpui-mcp\""));
         Ok(())
     }
 

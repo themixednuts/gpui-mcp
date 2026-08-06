@@ -311,7 +311,7 @@ impl BridgeHandle {
         let automation = Automation::new(state.clone());
         automation.attach(window);
         let pid = ProcessId::new(std::process::id()).ok_or(StartError::InvalidProcessId)?;
-        let native_window_id = window.native_window_id().and_then(NativeWindowId::new);
+        let native_window_id = crate::native_window_id(window);
         let document_host = Rc::new(DocumentHost::new("document"));
         let resource_host = Rc::new(ResourceHost::new("resource"));
         let command_host = Rc::new(CommandHost::new("command"));
@@ -598,7 +598,7 @@ fn handle_ui_operation(
             Ok(BridgeResult::Ack)
         }
         Operation::Focus { node_id } => {
-            if !window.focus_semantic_element(&node_id) {
+            if !window.focus_observed_element(&node_id, cx) {
                 return Err(BridgeError::new(
                     ErrorCode::NotFound,
                     "semantic node is not focusable in the current frame",

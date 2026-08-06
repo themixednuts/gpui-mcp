@@ -27,8 +27,8 @@ base64 = "0.22.1"
 bytes = "1.11.1"
 clap = { version = "4.6.1", features = ["derive"] }
 directories = "6.0.0"
-gpui = "=0.2.2"
-gpui-component = "0.5.1"
+gpui = { path = "vendor/gpui", version = "=0.2.2" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "82878540b5410b288a2c92cb9ee5675533e4d807", features = ["font-kit", "wayland", "x11"] }
 htmlswap = { git = "https://github.com/themixednuts/htmlswap", rev = "7b6bd0f0c73cef241819c707615684fd2c066341" }
 image = { version = "0.25.10", default-features = false, features = ["png", "gif"] }
 interprocess = { version = "2.4.2", features = ["tokio"] }
@@ -36,6 +36,7 @@ notify = "8.2.0"
 mp4 = "0.14.0"
 openh264 = "0.9.7"
 rand = "0.9.2"
+raw-window-handle = "0.6.2"
 ron = "0.12.2"
 rmcp = { version = "3.1.0", features = ["server", "transport-io"] }
 schemars = "1.2.1"
@@ -53,7 +54,7 @@ xcap = { version = "0.9.8", features = ["wgc"] }
 widestring = "1.2.1"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 missing_docs = "warn"
 unreachable_pub = "warn"
 
@@ -72,7 +73,7 @@ strip = "symbols"
 opt-level = 2
 
 [patch.crates-io]
-# GPUI 0.2.2 does not yet expose the rendered semantic frame, direct text-input bridge, or
-# native window identity needed by the MCP bridge. The vendored patch also contains three focused
-# upstream fixes. See vendor/README.md for the exact scope and removal conditions.
+gpui = { path = "vendor/gpui" }
+
+[patch."https://github.com/zed-industries/zed"]
 gpui = { path = "vendor/gpui" }

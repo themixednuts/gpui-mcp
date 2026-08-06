@@ -6,8 +6,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext, Application, Bounds, Context, IntoElement, Render, Timer, Window,
-    WindowBounds, WindowOptions, px, size,
+    App, AppContext, Bounds, Context, IntoElement, Render, Window, WindowBounds, WindowOptions, px,
+    size,
 };
 use gpui_mcp::{AppId, BridgeConfig, BridgeHandle};
 use gpui_mcp_html::{
@@ -263,7 +263,7 @@ fn build_live(window: &mut Window, cx: &App) -> Result<AppView, String> {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    gpui_platform::application().run(|cx: &mut App| {
         gpui_mcp_html::init(cx);
         let bounds = Bounds::centered(None, size(px(1200.0), px(760.0)), cx);
         let opened = cx.open_window(
@@ -282,7 +282,9 @@ fn main() {
                 window
                     .spawn(cx, async move |cx| {
                         loop {
-                            Timer::after(Duration::from_millis(50)).await;
+                            cx.background_executor()
+                                .timer(Duration::from_millis(50))
+                                .await;
                             if weak_view
                                 .update(cx, |view, cx| {
                                     view.poll_project();
@@ -295,7 +297,7 @@ fn main() {
                         }
                     })
                     .detach();
-                cx.new(|cx| gpui_mcp_html::NativeRoot::new(view, window, cx))
+                view
             },
         );
         if let Err(error) = opened {

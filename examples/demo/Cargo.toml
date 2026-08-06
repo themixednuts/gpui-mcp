@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 gpui.workspace = true
+gpui_platform.workspace = true
 gpui-mcp = { path = "../../crates/gpui-mcp" }
 tracing-subscriber.workspace = true
 

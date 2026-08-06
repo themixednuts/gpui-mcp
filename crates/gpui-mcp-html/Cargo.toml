@@ -10,7 +10,7 @@ homepage.workspace = true
 
 [features]
 default = ["runtime", "json", "ron"]
-runtime = ["dep:gpui", "dep:gpui-component", "dep:gpui-mcp", "dep:htmlswap"]
+runtime = ["dep:gpui", "dep:gpui-mcp", "dep:htmlswap"]
 dev-watch = ["runtime", "dep:notify", "ron"]
 json = ["dep:serde_json"]
 ron = ["dep:ron"]
@@ -19,6 +19,7 @@ visual-parity = [
     "dep:anyhow",
     "dep:clap",
     "dep:gpui-mcp-capture",
+    "dep:gpui_platform",
     "dep:image",
     "gpui-mcp/test-support",
 ]
@@ -27,7 +28,7 @@ visual-parity = [
 anyhow = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 gpui = { workspace = true, optional = true }
-gpui-component = { workspace = true, optional = true }
+gpui_platform = { workspace = true, optional = true }
 gpui-mcp = { path = "../gpui-mcp", default-features = false, optional = true }
 gpui-mcp-capture = { path = "../gpui-mcp-capture", optional = true }
 htmlswap = { workspace = true, optional = true }

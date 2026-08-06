@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 gpui.workspace = true
+gpui_platform.workspace = true
 gpui-mcp = { path = "../../crates/gpui-mcp" }
 gpui-mcp-html = { path = "../../crates/gpui-mcp-html", features = ["dev-watch"] }
 

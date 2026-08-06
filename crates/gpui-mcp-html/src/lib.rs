@@ -30,12 +30,6 @@ pub use binding::{
 pub use components::{ComponentNode, ComponentRegistry, ComponentRegistryError};
 #[cfg(feature = "runtime")]
 pub use document::{HtmlDiagnostic, HtmlUi, HtmlUiError};
-/// Native window root required by the shared text-input backend.
-///
-/// Wrap the application view in this root when a live document can render
-/// `input` or `textarea` elements. The project scaffolder does this by default.
-#[cfg(feature = "runtime")]
-pub use gpui_component::Root as NativeRoot;
 #[cfg(feature = "runtime")]
 pub use hooks::{HookEvent, HookOutcome, HookRegistry, HookRegistryError, StateValue};
 #[cfg(feature = "runtime")]

@@ -4,9 +4,9 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gpui::{
-    App, AppContext as _, Context, IntoElement, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PlatformInput, Render, ScrollDelta, ScrollWheelEvent,
-    Styled as _, TestAppContext, TouchPhase, Window, div, point, px, size,
+    App, Context, IntoElement, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PlatformInput, Render, ScrollDelta, ScrollWheelEvent, Styled as _,
+    TestAppContext, TouchPhase, Window, div, point, px, size,
 };
 use gpui_mcp::{Automation, NodeAction, Role, UiTree, ValueInfo};
 use gpui_mcp_html::{
@@ -244,7 +244,7 @@ fn dispatch_test_input(
     }
     if let TestInput::Focus = action {
         return window
-            .focus_semantic_element(node_id)
+            .focus_observed_element(node_id, cx)
             .then_some(HookOutcome::Handled)
             .ok_or_else(|| {
                 gpui_mcp::BridgeError::new(gpui_mcp::ErrorCode::NotFound, "node is not focusable")
@@ -518,12 +518,8 @@ fn build_fixture() -> Option<Fixture> {
 }
 
 fn assert_initial_tree(tree: &UiTree, state: &TestState) {
-    assert_eq!(tree.roots, ["window-backdrop"]);
-    assert_eq!(
-        tree.nodes["root"].parent.as_deref(),
-        Some("window-backdrop")
-    );
-    assert_eq!(tree.nodes["html-root"].parent.as_deref(), Some("root"));
+    assert_eq!(tree.roots, ["html-root"]);
+    assert_eq!(tree.nodes["html-root"].parent, None);
     assert_eq!(tree.nodes["workspace"].parent.as_deref(), Some("html-root"));
     assert_eq!(
         tree.nodes["workspace"]
@@ -648,10 +644,7 @@ fn html_renders_to_gpui_and_uses_real_input(cx: &mut TestAppContext) {
         automation,
         state,
     } = fixture;
-    let (view, visual) = cx.add_window_view(|window, cx| {
-        let runtime = cx.new(|_| RuntimeView { live });
-        gpui_mcp_html::NativeRoot::new(runtime, window, cx)
-    });
+    let (view, visual) = cx.add_window_view(|_, _| RuntimeView { live });
     visual.run_until_parked();
 
     let tree = automation.snapshot();
@@ -715,10 +708,7 @@ fn complex_layout_and_interactive_states_round_trip(cx: &mut TestAppContext) {
     };
     assert!(live.diagnostics().is_empty(), "{:?}", live.diagnostics());
 
-    let (view, visual) = cx.add_window_view(|window, cx| {
-        let runtime = cx.new(|_| RuntimeView { live });
-        gpui_mcp_html::NativeRoot::new(runtime, window, cx)
-    });
+    let (view, visual) = cx.add_window_view(|_, _| RuntimeView { live });
     visual.run_until_parked();
     let initial = automation.snapshot();
     assert_eq!(initial.nodes["dropdown"].state.expanded, Some(false));
@@ -797,10 +787,7 @@ fn disclosure_only_toggles_from_its_summary(cx: &mut TestAppContext) {
     ) else {
         return;
     };
-    let (_view, visual) = cx.add_window_view(|window, cx| {
-        let runtime = cx.new(|_| RuntimeView { live });
-        gpui_mcp_html::NativeRoot::new(runtime, window, cx)
-    });
+    let (_view, visual) = cx.add_window_view(|_, _| RuntimeView { live });
     visual.run_until_parked();
 
     let initial = automation.snapshot();
@@ -857,10 +844,7 @@ fn overflow_elements_expose_and_handle_semantic_scroll(cx: &mut TestAppContext) 
     ) else {
         return;
     };
-    let (view, visual) = cx.add_window_view(|window, cx| {
-        let runtime = cx.new(|_| RuntimeView { live });
-        gpui_mcp_html::NativeRoot::new(runtime, window, cx)
-    });
+    let (view, visual) = cx.add_window_view(|_, _| RuntimeView { live });
     visual.run_until_parked();
 
     let initial = automation.snapshot();
@@ -920,10 +904,7 @@ fn percentage_height_and_flex_content_track_window_resizes(cx: &mut TestAppConte
     ) else {
         return;
     };
-    let (view, visual) = cx.add_window_view(|window, cx| {
-        let runtime = cx.new(|_| RuntimeView { live });
-        gpui_mcp_html::NativeRoot::new(runtime, window, cx)
-    });
+    let (view, visual) = cx.add_window_view(|_, _| RuntimeView { live });
 
     for height in [600.0, 420.0, 760.0] {
         visual.simulate_resize(size(px(800.), px(height)));
@@ -1003,10 +984,7 @@ fn embedded_component_height_tracks_its_flex_host(cx: &mut TestAppContext) {
     .map(|live| live.with_components(components)) else {
         return;
     };
-    let (view, visual) = cx.add_window_view(|window, cx| {
-        let runtime = cx.new(|_| RuntimeView { live: outer });
-        gpui_mcp_html::NativeRoot::new(runtime, window, cx)
-    });
+    let (view, visual) = cx.add_window_view(|_, _| RuntimeView { live: outer });
 
     for height in [600.0, 420.0, 760.0] {
         visual.simulate_resize(size(px(800.), px(height)));

@@ -8,10 +8,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use gpui::{
-    App, AppContext as _, Application, AsyncWindowContext, Bounds, Context, IntoElement, Modifiers,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, Render, Timer,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, point, px,
-    size,
+    App, AppContext as _, AsyncWindowContext, Bounds, Context, IntoElement, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, Render, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, point, px, size,
 };
 use gpui_mcp::{Automation, NativeWindowId, ProcessId};
 use gpui_mcp_capture::CaptureFailure;
@@ -168,7 +167,7 @@ fn run_fixture(fixture: FixtureName, state: FixtureState) -> Result<()> {
         live.diagnostics()
     );
 
-    Application::new().run(move |cx: &mut App| {
+    gpui_platform::application().run(move |cx: &mut App| {
         gpui_mcp_html::init(cx);
         let bounds = Bounds::centered(None, fixture_content_size(), cx);
         let opened = cx.open_window(
@@ -185,7 +184,7 @@ fn run_fixture(fixture: FixtureName, state: FixtureState) -> Result<()> {
             },
             |window, cx| {
                 window.set_window_title(WINDOW_TITLE);
-                let Some(native_window_id) = window.native_window_id() else {
+                let Some(native_window_id) = gpui_mcp::native_window_id(window) else {
                     eprintln!("the active platform does not expose a native window identifier");
                     cx.quit();
                     return cx.new(|_| FixtureView { live });
@@ -220,14 +219,14 @@ fn run_fixture(fixture: FixtureName, state: FixtureState) -> Result<()> {
                                 }
                             }
                             if let Err(error) =
-                                wait_for_completed_frame(&automation, completed_frame).await
+                                wait_for_completed_frame(&automation, completed_frame, cx).await
                             {
                                 eprintln!("could not present fixture state: {error:#}");
                                 let _ = cx.update(|_, cx| cx.quit());
                                 return;
                             }
                         }
-                        print_ready(native_window_id);
+                        print_ready(native_window_id.get());
                     })
                     .detach();
                 cx.new(|_| FixtureView { live })
@@ -262,7 +261,7 @@ fn apply_fixture_action(
             )
         })?;
     if matches!(action, FixtureAction::Focus) {
-        if window.focus_semantic_element(&node.id) {
+        if window.focus_observed_element(&node.id, cx) {
             return Ok(());
         }
         return Err(gpui_mcp::BridgeError::new(
@@ -329,24 +328,28 @@ async fn wait_for_content_surface(
             let completed_frame = automation.completed_frames();
             cx.update(|window, _| window.refresh())
                 .context("refresh resized fixture")?;
-            return wait_for_completed_frame(automation, completed_frame).await;
+            return wait_for_completed_frame(automation, completed_frame, cx).await;
         }
         ensure!(
             started.elapsed() < FIXTURE_READY_TIMEOUT,
             "fixture viewport remained {viewport:?}; expected {target:?} within {FIXTURE_READY_TIMEOUT:?}"
         );
-        Timer::after(FRAME_POLL_INTERVAL).await;
+        cx.background_executor().timer(FRAME_POLL_INTERVAL).await;
     }
 }
 
-async fn wait_for_completed_frame(automation: &Automation, after_frame: u64) -> Result<()> {
+async fn wait_for_completed_frame(
+    automation: &Automation,
+    after_frame: u64,
+    cx: &AsyncWindowContext,
+) -> Result<()> {
     let started = Instant::now();
     while automation.completed_frames() <= after_frame {
         ensure!(
             started.elapsed() < FIXTURE_READY_TIMEOUT,
             "fixture did not complete a root-paint frame within {FIXTURE_READY_TIMEOUT:?}"
         );
-        Timer::after(FRAME_POLL_INTERVAL).await;
+        cx.background_executor().timer(FRAME_POLL_INTERVAL).await;
     }
     Ok(())
 }

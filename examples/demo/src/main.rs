@@ -1,8 +1,8 @@
 //! Small instrumented GPUI application used to exercise the MCP bridge.
 
 use gpui::{
-    App, Application, Bounds, Context, IntoElement, Render, SemanticRole, Window, WindowBounds,
-    WindowOptions, div, prelude::*, px, rgb, size,
+    App, Bounds, Context, IntoElement, Render, Role, StatefulInteractiveElement as _, Window,
+    WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
 use gpui_mcp::{Automation, BridgeConfig, BridgeHandle};
 
@@ -80,8 +80,8 @@ impl Render for Demo {
                             .on_click(cx.listener(|this, _, _, cx| this.reset(cx))),
                     ),
             )
-            .semantic_role(SemanticRole::Application)
-            .accessible_name(TITLE)
+            .role(Role::Application)
+            .aria_label(TITLE)
     }
 }
 
@@ -90,7 +90,7 @@ fn main() {
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .init();
-    Application::new().run(|cx: &mut App| {
+    gpui_platform::application().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(640.0), px(420.0)), cx);
         let opened = cx.open_window(
             WindowOptions {

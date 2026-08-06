@@ -18,6 +18,7 @@ gpui.workspace = true
 gpui-mcp-protocol = { path = "../gpui-mcp-protocol" }
 interprocess.workspace = true
 rand.workspace = true
+raw-window-handle.workspace = true
 serde_json.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
@@ -27,6 +28,9 @@ tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 widestring.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSResponder", "NSView", "NSWindow"] }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

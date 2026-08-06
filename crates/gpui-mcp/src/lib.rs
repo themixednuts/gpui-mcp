@@ -2,11 +2,12 @@
 //!
 //! Install [`BridgeHandle`] for a window and retain it for that window's
 //! lifetime. GPUI emits semantics automatically from stable element IDs,
-//! registered interaction behavior, and optional semantic extension traits.
+//! registered interaction behavior, and its standard `Role` and `aria_*` APIs.
 //! Control stays on owner-restricted native local IPC and authenticated
 //! requests are dispatched through GPUI's foreground executor.
 
 mod input;
+mod native_window;
 mod observer;
 mod registry;
 mod service;
@@ -30,6 +31,15 @@ pub use service::{
 
 use observer::BridgeObserver;
 use registry::SharedState;
+
+/// Return the operating system identifier used by window capture APIs.
+///
+/// Wayland and other platforms without a stable system window identifier
+/// return `None`.
+#[must_use]
+pub fn native_window_id(window: &gpui::Window) -> Option<NativeWindowId> {
+    native_window::id(window).and_then(NativeWindowId::new)
+}
 
 /// Cloneable application-side handle for semantic snapshots and diagnostic logs.
 #[derive(Clone)]

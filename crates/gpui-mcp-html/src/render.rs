@@ -5,11 +5,10 @@ use std::rc::Rc;
 
 use gpui::{
     AlignItems, AlignSelf, AnyElement, App, AppContext as _, BoxShadow, Context, DefiniteLength,
-    Div, Entity, FocusHandle, FontFallbacks, FontWeight, GridPlacement, InteractiveElement as _,
-    IntoElement, Length, Overflow, ParentElement as _, Render, ScrollHandle,
-    SemanticElementExt as _, SemanticRole, SemanticState, SemanticText, SemanticValue,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled, Window, div, point, px,
-    relative, rgba,
+    Div, Entity, FocusHandle, FontFallbacks, FontWeight, FrameAction, GridPlacement,
+    InteractiveElement as _, IntoElement, Length, Overflow, ParentElement as _, Render,
+    Role as AccessibleRole, ScrollHandle, SharedString, Stateful, StatefulInteractiveElement as _,
+    Styled, Toggled, Window, div, point, px, relative, rgba,
 };
 use gpui_mcp::{Automation, MAX_LABEL_BYTES, MAX_TEXT_BYTES};
 use htmlswap::{
@@ -28,6 +27,38 @@ use crate::{
 /// Minimal hover tooltip view that renders an element's `title` attribute text.
 struct TitleTooltip {
     text: SharedString,
+}
+
+#[derive(Clone, Debug)]
+struct ElementState {
+    visible: bool,
+    enabled: bool,
+    checked: Option<bool>,
+    selected: Option<bool>,
+    expanded: Option<bool>,
+}
+
+impl Default for ElementState {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            enabled: true,
+            checked: None,
+            selected: None,
+            expanded: None,
+        }
+    }
+}
+
+struct ElementText {
+    text: String,
+    redacted: bool,
+    editable: bool,
+}
+
+struct ElementValue {
+    value: String,
+    editable: bool,
 }
 
 impl Render for TitleTooltip {
@@ -350,7 +381,7 @@ impl LiveHtml {
         );
         let rendered = root
             .id(SharedString::from(self.scoped_id("html-root")))
-            .semantic_role(SemanticRole::Application)
+            .role(AccessibleRole::Application)
             .into_any_element();
         self.viewport_override.set(None);
         rendered
@@ -412,7 +443,7 @@ impl LiveHtml {
         let property_values = read_properties(&bindings, &self.hooks, window, cx);
         let is_disclosure = element.source_tag == "details";
         let disclosure_open = self.disclosure_open(element, &element_id, is_disclosure);
-        let mut state = semantic_state(element, &property_values);
+        let mut state = element_state(element, &property_values);
         state.expanded = disclosure_open;
         let runtime = ElementRuntime {
             element_id: &element_id,
@@ -430,6 +461,7 @@ impl LiveHtml {
             cx,
         );
         let mut host = self.render_styled_host(element, &id, children, available_fonts, window, cx);
+        host = apply_native_state(host, element, &state);
         if !state.visible {
             host = host.hidden();
         }
@@ -479,7 +511,6 @@ impl LiveHtml {
         let hoverable = has_interactive_style(element, InteractiveStyle::Hover);
         let focus_handle = self.resolve_focus_handle(element, runtime, text_input.as_ref(), cx);
         if let Some(focus_handle) = &focus_handle {
-            state.focused = focus_handle.is_focused(window);
             host = host.track_focus(focus_handle);
         }
         let forced_hover = self.hovered_element.borrow().as_ref() == Some(&element_id);
@@ -504,31 +535,41 @@ impl LiveHtml {
             });
         }
 
+        let role = accessible_role(element);
+        if let Some(role) = role {
+            host = host.role(role);
+        }
         host = host
-            .semantic_role(semantic_role(element))
-            .semantic_visible(state.visible)
-            .semantic_enabled(state.enabled)
-            .semantic_metadata("html_tag", element.source_tag.to_string());
+            .aria_hidden(!state.visible)
+            .aria_disabled(!state.enabled)
+            .frame_metadata("html_tag", element.source_tag.to_string());
+        if let UiRole::Heading(level) = element.role {
+            host = host.aria_level(level.into());
+        }
         if let Some(checked) = state.checked {
-            host = host.semantic_checked(checked);
+            host = host.aria_toggled(if checked {
+                Toggled::True
+            } else {
+                Toggled::False
+            });
         }
         if let Some(selected) = state.selected {
-            host = host.semantic_selected(selected);
+            host = host.aria_selected(selected);
         }
         if let Some(expanded) = state.expanded {
-            host = host.semantic_expanded(expanded);
+            host = host.aria_expanded(expanded);
         }
         if let Some(authored_id) = attribute(element, "id") {
-            host = host.semantic_metadata("authored_id", authored_id);
+            host = host.frame_metadata("authored_id", authored_id);
         }
         if let Some(component_id) = attribute(element, "component") {
-            host = host.semantic_metadata("component_id", component_id);
+            host = host.frame_metadata("component_id", component_id);
         }
         if let Some(label) = accessible_label(element, &property_values) {
-            host = host.accessible_name(label);
+            host = host.aria_label(label);
         }
         if let Some(title) = attribute(element, "title") {
-            host = host.accessible_description(title);
+            host = host.aria_description(title);
             let tooltip_text = SharedString::from(title.to_owned());
             host = host.tooltip(move |_window, cx| {
                 cx.new(|_| TitleTooltip {
@@ -537,11 +578,23 @@ impl LiveHtml {
                 .into()
             });
         }
-        if let Some(text) = semantic_text(element, &property_values, &bindings) {
-            host = host.semantic_text(text);
+        if let Some(text) = element_text(element, &property_values, &bindings) {
+            if text.redacted {
+                host = host.frame_redacted(true);
+            } else if is_editable_role(role) {
+                host = host.aria_value(text.text);
+            }
+            if text.editable && !text.redacted {
+                host = host.frame_action(FrameAction::SetText);
+            }
         }
-        if let Some(value) = semantic_value(element, &property_values, &bindings) {
-            host = host.semantic_value(value);
+        if let Some(value) = element_value(element, &property_values, &bindings) {
+            if !is_editable_role(role) {
+                host = host.aria_value(value.value);
+            }
+            if value.editable {
+                host = host.frame_action(FrameAction::SetValue);
+            }
         }
 
         host.into_any_element()
@@ -758,7 +811,7 @@ impl LiveHtml {
     ) -> Div {
         let viewport = self.media_viewport(window);
         apply_styles(
-            self.render_host(element, id, children, window, cx),
+            apply_native_defaults(self.render_host(element, id, children, window, cx), element),
             element,
             viewport,
             available_fonts,
@@ -787,6 +840,49 @@ impl LiveHtml {
         } else {
             children.into_iter().fold(div(), gpui::ParentElement::child)
         }
+    }
+}
+
+fn apply_native_defaults(host: Div, element: &RenderElement) -> Div {
+    if element.source_tag != "input" {
+        return host;
+    }
+    match attribute(element, "type") {
+        Some("checkbox") => host
+            .flex_none()
+            .size(px(16.))
+            .items_center()
+            .justify_center()
+            .rounded(px(3.))
+            .border_1()
+            .border_color(rgba(0x6873_8499)),
+        Some("radio") => host
+            .flex_none()
+            .size(px(16.))
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .border_1()
+            .border_color(rgba(0x6873_8499)),
+        _ => host,
+    }
+}
+
+fn apply_native_state(host: Div, element: &RenderElement, state: &ElementState) -> Div {
+    if !state.checked.unwrap_or(false) || element.source_tag != "input" {
+        return host;
+    }
+    match attribute(element, "type") {
+        Some("checkbox") => host
+            .bg(rgba(0x4f7d_ffff))
+            .text_color(rgba(0xffff_ffff))
+            .text_size(px(12.))
+            .child("✓"),
+        Some("radio") => host
+            .text_color(rgba(0x4f7d_ffff))
+            .text_size(px(10.))
+            .child("●"),
+        _ => host,
     }
 }
 
@@ -866,10 +962,10 @@ fn read_properties(
         .collect()
 }
 
-fn semantic_state(
+fn element_state(
     element: &RenderElement,
     properties: &HashMap<UiProperty, StateValue>,
-) -> SemanticState {
+) -> ElementState {
     let disabled = properties
         .get(&UiProperty::Disabled)
         .and_then(StateValue::as_boolean)
@@ -879,7 +975,7 @@ fn semantic_state(
                 .as_ref()
                 .is_some_and(|control| control.disabled)
         });
-    SemanticState {
+    ElementState {
         visible: properties
             .get(&UiProperty::Visible)
             .and_then(StateValue::as_boolean)
@@ -893,69 +989,99 @@ fn semantic_state(
             .get(&UiProperty::Selected)
             .and_then(StateValue::as_boolean)
             .or_else(|| attribute(element, "selected").map(|_| true)),
-        ..SemanticState::default()
+        ..ElementState::default()
     }
 }
 
-fn semantic_role(element: &RenderElement) -> SemanticRole {
-    if let Some(role) = attribute(element, "role").and_then(aria_role) {
-        return role;
+fn accessible_role(element: &RenderElement) -> Option<AccessibleRole> {
+    if let Some(role) = attribute(element, "role") {
+        return aria_role(role);
+    }
+    if attribute(element, "tabindex").is_some() {
+        return Some(AccessibleRole::Group);
     }
     if element.source_tag == "input" {
         match attribute(element, "type") {
-            Some("checkbox") => return SemanticRole::Checkbox,
-            Some("radio") => return SemanticRole::Radio,
-            Some("search") => return SemanticRole::SearchInput,
+            Some("checkbox") => return Some(AccessibleRole::CheckBox),
+            Some("radio") => return Some(AccessibleRole::RadioButton),
+            Some("search") => return Some(AccessibleRole::SearchInput),
+            Some("password") => return Some(AccessibleRole::PasswordInput),
             _ => {}
         }
     }
-    match element.role {
-        UiRole::Container | UiRole::Form | UiRole::Fieldset | UiRole::Select => SemanticRole::Group,
-        UiRole::Inline
-        | UiRole::Paragraph
-        | UiRole::Heading(_)
-        | UiRole::Label
-        | UiRole::Legend => SemanticRole::Text,
-        UiRole::Button => SemanticRole::Button,
-        UiRole::TextInput => SemanticRole::TextInput,
-        UiRole::Option | UiRole::ListItem => SemanticRole::ListItem,
-        UiRole::Link => SemanticRole::Link,
-        UiRole::Image => SemanticRole::Image,
-        UiRole::List { .. } => SemanticRole::List,
-        UiRole::Unknown => SemanticRole::Generic,
+    match element.source_tag.as_ref() {
+        "article" => return Some(AccessibleRole::Article),
+        "aside" => return Some(AccessibleRole::Complementary),
+        "details" => return Some(AccessibleRole::Details),
+        "footer" => return Some(AccessibleRole::Footer),
+        "header" => return Some(AccessibleRole::Header),
+        "main" => return Some(AccessibleRole::Main),
+        "nav" => return Some(AccessibleRole::Navigation),
+        "section" => return Some(AccessibleRole::Section),
+        "summary" => return Some(AccessibleRole::DisclosureTriangle),
+        _ => {}
     }
+    Some(match element.role {
+        UiRole::Container | UiRole::Unknown => return None,
+        UiRole::Inline | UiRole::Label => AccessibleRole::Label,
+        UiRole::Form => AccessibleRole::Form,
+        UiRole::Fieldset => AccessibleRole::Group,
+        UiRole::Select => AccessibleRole::ComboBox,
+        UiRole::Paragraph => AccessibleRole::Paragraph,
+        UiRole::Heading(_) => AccessibleRole::Heading,
+        UiRole::Legend => AccessibleRole::Legend,
+        UiRole::Button => AccessibleRole::Button,
+        UiRole::TextInput => {
+            if element.source_tag == "textarea" {
+                AccessibleRole::MultilineTextInput
+            } else {
+                AccessibleRole::TextInput
+            }
+        }
+        UiRole::Option => AccessibleRole::ListBoxOption,
+        UiRole::ListItem => AccessibleRole::ListItem,
+        UiRole::Link => AccessibleRole::Link,
+        UiRole::Image => AccessibleRole::Image,
+        UiRole::List { .. } => AccessibleRole::List,
+    })
 }
 
-fn aria_role(role: &str) -> Option<SemanticRole> {
+fn aria_role(role: &str) -> Option<AccessibleRole> {
     Some(match role.trim().to_ascii_lowercase().as_str() {
-        "application" => SemanticRole::Application,
-        "alert" => SemanticRole::Alert,
-        "button" => SemanticRole::Button,
-        "checkbox" => SemanticRole::Checkbox,
-        "combobox" => SemanticRole::Combobox,
-        "dialog" => SemanticRole::Dialog,
-        "group" => SemanticRole::Group,
-        "img" => SemanticRole::Image,
-        "link" => SemanticRole::Link,
-        "list" | "listbox" => SemanticRole::List,
-        "listitem" => SemanticRole::ListItem,
-        "menu" | "menubar" => SemanticRole::Menu,
-        "menuitem" | "menuitemcheckbox" | "menuitemradio" => SemanticRole::MenuItem,
-        "option" => SemanticRole::Option,
-        "progressbar" => SemanticRole::Progress,
-        "radio" => SemanticRole::Radio,
-        "scrollbar" => SemanticRole::ScrollArea,
-        "searchbox" => SemanticRole::SearchInput,
-        "separator" => SemanticRole::Separator,
-        "slider" => SemanticRole::Slider,
-        "switch" => SemanticRole::Switch,
-        "tab" => SemanticRole::Tab,
-        "table" | "grid" | "treegrid" => SemanticRole::Table,
-        "tablist" => SemanticRole::TabList,
-        "toolbar" => SemanticRole::Toolbar,
-        "tooltip" => SemanticRole::Tooltip,
-        "tree" => SemanticRole::Tree,
-        "treeitem" => SemanticRole::TreeItem,
+        "application" => AccessibleRole::Application,
+        "alert" => AccessibleRole::Alert,
+        "button" => AccessibleRole::Button,
+        "checkbox" => AccessibleRole::CheckBox,
+        "combobox" => AccessibleRole::ComboBox,
+        "dialog" => AccessibleRole::Dialog,
+        "group" => AccessibleRole::Group,
+        "img" => AccessibleRole::Image,
+        "link" => AccessibleRole::Link,
+        "list" => AccessibleRole::List,
+        "listbox" => AccessibleRole::ListBox,
+        "listitem" => AccessibleRole::ListItem,
+        "menu" => AccessibleRole::Menu,
+        "menubar" => AccessibleRole::MenuBar,
+        "menuitem" => AccessibleRole::MenuItem,
+        "menuitemcheckbox" => AccessibleRole::MenuItemCheckBox,
+        "menuitemradio" => AccessibleRole::MenuItemRadio,
+        "option" => AccessibleRole::ListBoxOption,
+        "progressbar" => AccessibleRole::ProgressIndicator,
+        "radio" => AccessibleRole::RadioButton,
+        "scrollbar" => AccessibleRole::ScrollBar,
+        "searchbox" => AccessibleRole::SearchInput,
+        "separator" => AccessibleRole::Splitter,
+        "slider" => AccessibleRole::Slider,
+        "switch" => AccessibleRole::Switch,
+        "tab" => AccessibleRole::Tab,
+        "table" => AccessibleRole::Table,
+        "grid" => AccessibleRole::Grid,
+        "treegrid" => AccessibleRole::TreeGrid,
+        "tablist" => AccessibleRole::TabList,
+        "toolbar" => AccessibleRole::Toolbar,
+        "tooltip" => AccessibleRole::Tooltip,
+        "tree" => AccessibleRole::Tree,
+        "treeitem" => AccessibleRole::TreeItem,
         _ => return None,
     })
 }
@@ -990,17 +1116,17 @@ fn accessible_label(
         .map(|label| bounded_utf8(label, MAX_LABEL_BYTES))
 }
 
-fn semantic_text(
+fn element_text(
     element: &RenderElement,
     properties: &HashMap<UiProperty, StateValue>,
     bindings: &[Binding],
-) -> Option<SemanticText> {
+) -> Option<ElementText> {
     let editable = is_text_editable(element) && has_writable_text_binding(bindings);
     if is_password(element) {
-        return Some(SemanticText {
+        return Some(ElementText {
+            text: String::new(),
             redacted: true,
             editable,
-            ..SemanticText::default()
         });
     }
 
@@ -1019,27 +1145,26 @@ fn semantic_text(
         })
         .or_else(|| is_text_role(&element.role).then(|| element_text_content(element)))?;
     let text = bounded_utf8(text, MAX_TEXT_BYTES);
-    (!text.is_empty() || matches!(element.role, UiRole::TextInput)).then(|| SemanticText {
+    (!text.is_empty() || matches!(element.role, UiRole::TextInput)).then_some(ElementText {
         text,
+        redacted: false,
         editable,
-        ..SemanticText::default()
     })
 }
 
-fn semantic_value(
+fn element_value(
     element: &RenderElement,
     properties: &HashMap<UiProperty, StateValue>,
     bindings: &[Binding],
-) -> Option<SemanticValue> {
+) -> Option<ElementValue> {
     if is_password(element) {
         return None;
     }
     properties
         .get(&UiProperty::Value)
-        .map(|value| SemanticValue {
+        .map(|value| ElementValue {
             value: bounded_utf8(value.display(), MAX_TEXT_BYTES),
             editable: is_text_editable(element) && has_writable_text_binding(bindings),
-            ..SemanticValue::default()
         })
         .or_else(|| {
             element
@@ -1047,10 +1172,9 @@ fn semantic_value(
                 .as_ref()?
                 .value
                 .as_ref()
-                .map(|value| SemanticValue {
+                .map(|value| ElementValue {
                     value: bounded_utf8(value.to_string(), MAX_TEXT_BYTES),
                     editable: is_text_editable(element) && has_writable_text_binding(bindings),
-                    ..SemanticValue::default()
                 })
         })
 }
@@ -1073,6 +1197,21 @@ fn has_writable_text_binding(bindings: &[Binding]) -> bool {
 
 fn is_password(element: &RenderElement) -> bool {
     element.source_tag == "input" && attribute(element, "type") == Some("password")
+}
+
+const fn is_editable_role(role: Option<AccessibleRole>) -> bool {
+    matches!(
+        role,
+        Some(
+            AccessibleRole::TextInput
+                | AccessibleRole::MultilineTextInput
+                | AccessibleRole::SearchInput
+                | AccessibleRole::EmailInput
+                | AccessibleRole::PasswordInput
+                | AccessibleRole::PhoneNumberInput
+                | AccessibleRole::UrlInput
+        )
+    )
 }
 
 fn is_text_role(role: &UiRole) -> bool {
@@ -1189,15 +1328,17 @@ struct ToggleBinding {
 
 fn semantic_toggle(
     element: &RenderElement,
-    state: &SemanticState,
+    state: &ElementState,
     bindings: &[Binding],
 ) -> Option<ToggleBinding> {
-    let (property, value) = match semantic_role(element) {
-        SemanticRole::Checkbox | SemanticRole::Switch => {
+    let (property, value) = match accessible_role(element) {
+        Some(AccessibleRole::CheckBox | AccessibleRole::Switch) => {
             (UiProperty::Checked, !state.checked.unwrap_or(false))
         }
-        SemanticRole::Radio => (UiProperty::Checked, true),
-        SemanticRole::Option => (UiProperty::Selected, true),
+        Some(AccessibleRole::RadioButton) => (UiProperty::Checked, true),
+        Some(AccessibleRole::ListBoxOption | AccessibleRole::MenuListOption) => {
+            (UiProperty::Selected, true)
+        }
         _ => return None,
     };
     bindings
@@ -2295,6 +2436,7 @@ fn single_box_shadow(value: &str) -> Option<BoxShadow> {
         offset: point(px(lengths[0]), px(lengths[1])),
         blur_radius: px(lengths.get(2).copied().unwrap_or(0.)),
         spread_radius: px(lengths.get(3).copied().unwrap_or(0.)),
+        inset: false,
     })
 }
 
@@ -2472,7 +2614,7 @@ fn normalize_font_family(family: &str) -> String {
 }
 
 fn apply_font_family<T: Styled>(mut host: T, family: FontFamily) -> T {
-    let text_style = host.text_style().get_or_insert_with(Default::default);
+    let text_style = host.text_style();
     text_style.font_family = Some(SharedString::from(family.primary));
     text_style.font_fallbacks =
         (!family.fallbacks.is_empty()).then(|| FontFallbacks::from_fonts(family.fallbacks));
@@ -2922,7 +3064,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::rc::Rc;
 
-    use gpui::{GridPlacement, SemanticRole, px};
+    use gpui::{GridPlacement, Role as AccessibleRole, px};
     use gpui_mcp::Automation;
     use htmlswap::{RenderNode, StyleDeclaration, StyleProperty};
 
@@ -2957,11 +3099,14 @@ mod tests {
 
     #[test]
     fn aria_roles_preserve_tree_and_floating_surface_semantics() {
-        assert_eq!(aria_role("tree"), Some(SemanticRole::Tree));
-        assert_eq!(aria_role("TREEITEM"), Some(SemanticRole::TreeItem));
-        assert_eq!(aria_role("menuitemcheckbox"), Some(SemanticRole::MenuItem));
-        assert_eq!(aria_role("combobox"), Some(SemanticRole::Combobox));
-        assert_eq!(aria_role("option"), Some(SemanticRole::Option));
+        assert_eq!(aria_role("tree"), Some(AccessibleRole::Tree));
+        assert_eq!(aria_role("TREEITEM"), Some(AccessibleRole::TreeItem));
+        assert_eq!(
+            aria_role("menuitemcheckbox"),
+            Some(AccessibleRole::MenuItemCheckBox)
+        );
+        assert_eq!(aria_role("combobox"), Some(AccessibleRole::ComboBox));
+        assert_eq!(aria_role("option"), Some(AccessibleRole::ListBoxOption));
         assert_eq!(aria_role("presentation"), None);
     }
 
