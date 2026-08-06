@@ -15,6 +15,7 @@ const executableName = process.platform === 'win32'
   ? 'gpui-mcp-html-visual.exe'
   : 'gpui-mcp-html-visual';
 const structuralBlurRadius = 2;
+const fixtureErrorPrefix = 'GPUI_VISUAL_ERROR: ';
 const cases = [
   { name: 'reference layout', fixture: 'parity', file: 'parity.html', state: 'baseline' },
   {
@@ -95,6 +96,14 @@ async function stopFixture(child) {
   if (child.exitCode === null && child.signalCode === null) {
     child.kill('SIGKILL');
   }
+}
+
+function fixtureDiagnostics(stderr) {
+  return stderr
+    .split(/\r?\n/u)
+    .filter((line) => line.startsWith(fixtureErrorPrefix))
+    .map((line) => line.slice(fixtureErrorPrefix.length))
+    .join('\n');
 }
 
 async function applyBrowserState(page, testCase) {
@@ -282,7 +291,7 @@ for (const testCase of cases) {
     } finally {
       await stopFixture(fixture);
     }
-    expect(stderr, 'GPUI fixture diagnostics').toBe('');
+    expect(fixtureDiagnostics(stderr), 'GPUI fixture diagnostics').toBe('');
 
     const gpui = PNG.sync.read(await readFile(gpuiPath));
     const scaleFactor = gpui.width / 640;

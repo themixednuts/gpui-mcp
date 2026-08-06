@@ -27,6 +27,7 @@ const VIEWPORT_HEIGHT: u32 = 480;
 const FIXTURE_BACKGROUND: Rgba<u8> = Rgba([16, 20, 28, 255]);
 const FIXTURE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const ERROR_PREFIX: &str = "GPUI_VISUAL_ERROR: ";
 
 #[derive(Debug, Parser)]
 #[command(about = "Run and capture the gpui-mcp HTML visual parity fixture")]
@@ -119,7 +120,14 @@ impl Render for FixtureView {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(error) = run() {
+        print_error(format_args!("{error:#}"));
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     match Arguments::parse().command {
         Command::Fixture { fixture, state } => run_fixture(fixture, state),
         Command::Capture {
@@ -185,7 +193,7 @@ fn run_fixture(fixture: FixtureName, state: FixtureState) -> Result<()> {
             |window, cx| {
                 window.set_window_title(WINDOW_TITLE);
                 let Some(native_window_id) = gpui_mcp::native_window_id(window) else {
-                    eprintln!("the active platform does not expose a native window identifier");
+                    print_error("the active platform does not expose a native window identifier");
                     cx.quit();
                     return cx.new(|_| FixtureView { live });
                 };
@@ -196,7 +204,9 @@ fn run_fixture(fixture: FixtureName, state: FixtureState) -> Result<()> {
                 window
                     .spawn(cx, async move |cx| {
                         if let Err(error) = wait_for_content_surface(&automation, cx).await {
-                            eprintln!("could not present fixture window: {error:#}");
+                            print_error(format_args!(
+                                "could not present fixture window: {error:#}"
+                            ));
                             let _ = cx.update(|_, cx| cx.quit());
                             return;
                         }
@@ -209,19 +219,26 @@ fn run_fixture(fixture: FixtureName, state: FixtureState) -> Result<()> {
                             match result {
                                 Ok(Ok(())) => {}
                                 Ok(Err(error)) => {
-                                    eprintln!("could not apply fixture state: {}", error.message);
+                                    print_error(format_args!(
+                                        "could not apply fixture state: {}",
+                                        error.message
+                                    ));
                                     let _ = cx.update(|_, cx| cx.quit());
                                     return;
                                 }
                                 Err(error) => {
-                                    eprintln!("could not update fixture window: {error}");
+                                    print_error(format_args!(
+                                        "could not update fixture window: {error}"
+                                    ));
                                     return;
                                 }
                             }
                             if let Err(error) =
                                 wait_for_completed_frame(&automation, completed_frame, cx).await
                             {
-                                eprintln!("could not present fixture state: {error:#}");
+                                print_error(format_args!(
+                                    "could not present fixture state: {error:#}"
+                                ));
                                 let _ = cx.update(|_, cx| cx.quit());
                                 return;
                             }
@@ -233,7 +250,9 @@ fn run_fixture(fixture: FixtureName, state: FixtureState) -> Result<()> {
             },
         );
         if let Err(error) = opened {
-            eprintln!("could not open visual parity fixture: {error:#}");
+            print_error(format_args!(
+                "could not open visual parity fixture: {error:#}"
+            ));
             cx.quit();
             return;
         }
@@ -357,6 +376,12 @@ async fn wait_for_completed_frame(
 fn print_ready(window_id: u32) {
     println!("READY {} {window_id}", std::process::id());
     let _ = std::io::stdout().flush();
+}
+
+fn print_error(error: impl std::fmt::Display) {
+    for line in error.to_string().lines() {
+        eprintln!("{ERROR_PREFIX}{line}");
+    }
 }
 
 struct CaptureRequest {
