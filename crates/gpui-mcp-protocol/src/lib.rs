@@ -14,7 +14,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Current wire protocol version.
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 /// Maximum accepted request frame, including its four-byte length prefix.
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// Maximum accepted response frame. Screenshots are base64 encoded inside it.
@@ -53,6 +53,10 @@ pub const MAX_APPLICATION_COMMAND_SCHEMA_BYTES: usize = 32 * 1024;
 pub const MAX_APPLICATION_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 /// Maximum key events accepted in one foreground input operation.
 pub const MAX_KEY_SEQUENCE: usize = 1_024;
+/// Maximum completed frames the bridge retains for per-frame reports.
+pub const MAX_FRAME_SAMPLES: usize = 512;
+/// Maximum views itemized for one retained frame. Counts stay exact beyond it.
+pub const MAX_FRAME_VIEWS: usize = 256;
 
 /// A syntactically valid application identifier used for local discovery.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, JsonSchema)]
@@ -650,29 +654,212 @@ pub struct LogEntry {
 }
 
 /// Frame timing summary produced by the application integration.
+///
+/// Averages and maxima cover at most the last 240 frames completed after the most recent
+/// [`Operation::MarkFrames`], or since the bridge started when no mark was set.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct FrameStats {
-    /// Monotonic token of the most recently completed root-paint frame.
+    /// Monotonic token of the most recently completed frame.
     pub frame_count: u64,
     /// Number of retained interval samples.
     pub sample_count: u32,
-    /// Mean time between semantic-root prepaint starts.
+    /// Mean time between frame starts.
     pub frame_interval_average_ms: f64,
-    /// Longest retained time between semantic-root prepaint starts.
+    /// Longest retained time between frame starts.
     pub frame_interval_max_ms: f64,
-    /// Mean elapsed prepaint phase from the semantic root through deferred prepaint.
+    /// Mean time from the start of a frame to its finished accessibility tree: rendering,
+    /// layout, and prepaint, including deferred draws and GPUI finishing that tree.
     pub prepaint_average_ms: f64,
-    /// Longest retained semantic prepaint phase.
+    /// Longest retained prepaint phase.
     pub prepaint_max_ms: f64,
-    /// Mean time spent painting the semantic root subtree.
+    /// Mean time spent painting the frame, including deferred draws and overlays.
     pub root_paint_average_ms: f64,
-    /// Longest retained semantic root-subtree paint time.
+    /// Longest retained paint time.
     pub root_paint_max_ms: f64,
+    /// Mean wall time of GPUI's whole `Window::draw`: render, layout, prepaint, and paint.
+    ///
+    /// This is the interval GPUI's profiler records as `FrameTiming::draw_duration`.
+    #[serde(default)]
+    pub draw_average_ms: f64,
+    /// Longest retained `Window::draw`.
+    #[serde(default)]
+    pub draw_max_ms: f64,
+    /// Mean part of each draw spent only because the bridge observes the window.
+    ///
+    /// See [`FrameSample::bridge_ms`] for what is and is not included.
+    #[serde(default)]
+    pub bridge_average_ms: f64,
+    /// Longest retained bridge observation overhead.
+    #[serde(default)]
+    pub bridge_max_ms: f64,
+    /// Completed-frame token of the most recent mark; statistics cover later frames.
+    #[serde(default)]
+    pub mark_frame_count: u64,
     /// Observed repaint cadence from retained frame intervals.
     ///
     /// This is not rendering capacity for an event-driven UI: an idle application intentionally
     /// has a low value because it does not continuously request frames.
     pub estimated_fps: f64,
+}
+
+/// Why a view called `render` in a frame instead of replaying its previous output.
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewRenderCause {
+    /// The view is not embedded with `cached`, so it renders whenever the element tree
+    /// containing it is built.
+    Uncached,
+    /// GPUI's inspector was picking, which disables view caching.
+    CachingDisabled,
+    /// `Window::refresh` was pending, which renders every cached view.
+    Refresh,
+    /// The view had no output from the previous frame to replay.
+    FirstDraw,
+    /// The view, or a view drawn inside it, was notified.
+    Notified,
+    /// A containing cached view rendered, which renders every cached view inside it.
+    AncestorRendered,
+    /// The view's bounds, content mask, or text style changed.
+    LayoutChanged,
+}
+
+/// Whether a view rendered or replayed its previous output from cache.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewOutcome {
+    /// The view called `render`.
+    Rendered,
+    /// The view replayed its previous prepaint and paint without calling `render`.
+    Reused,
+}
+
+/// One view drawn in one frame.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ViewDraw {
+    /// GPUI entity that backs the view.
+    pub entity_id: u64,
+    /// The view's `Render` type name, empty when it has not rendered since observation began.
+    pub type_name: String,
+    /// Whether the view rendered or replayed from cache.
+    pub outcome: ViewOutcome,
+    /// Why the view rendered; absent when it was reused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<ViewRenderCause>,
+}
+
+/// Cost and view-cache activity of one completed frame.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct FrameSample {
+    /// Completed-frame token of this frame.
+    pub frame_count: u64,
+    /// Time since the previous frame began, when one was observed.
+    pub interval_ms: Option<f64>,
+    /// Wall time of GPUI's whole `Window::draw`: render, layout, prepaint, and paint.
+    pub draw_ms: f64,
+    /// `draw_ms` less `bridge_ms`.
+    pub app_draw_ms: f64,
+    /// Time from the start of the frame to its finished accessibility tree.
+    pub prepaint_ms: f64,
+    /// Time spent painting.
+    pub root_paint_ms: f64,
+    /// Part of the draw spent only because the bridge observes the window: finishing the
+    /// accessibility tree when no platform adapter wanted it, building the observed frame, and
+    /// the bridge's own callbacks, including painting highlights. Recording each element's
+    /// accessibility node during prepaint is interleaved with the application's own work and
+    /// stays in `app_draw_ms`. The semantic tree is converted when a client reads it, off the
+    /// UI thread, so that cost is in neither.
+    pub bridge_ms: f64,
+    /// Views that called `render`.
+    pub views_rendered: u32,
+    /// Cached views that replayed their previous output.
+    pub views_reused: u32,
+    /// Views that rendered, in draw order, up to the per-frame itemization bound.
+    pub rendered_views: Vec<ViewDraw>,
+}
+
+/// Mean, median, 95th percentile, and maximum of one per-frame quantity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Distribution {
+    /// Number of frames that contributed a value.
+    pub count: u32,
+    /// Arithmetic mean.
+    pub mean: f64,
+    /// Nearest-rank median.
+    pub p50: f64,
+    /// Nearest-rank 95th percentile.
+    pub p95: f64,
+    /// Largest value.
+    pub max: f64,
+}
+
+/// Aggregate of every frame in a [`FrameReport`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct FrameSummary {
+    /// Frames summarized.
+    pub frames: u32,
+    /// Distribution of [`FrameSample::draw_ms`].
+    pub draw_ms: Distribution,
+    /// Distribution of [`FrameSample::app_draw_ms`].
+    pub app_draw_ms: Distribution,
+    /// Distribution of [`FrameSample::prepaint_ms`].
+    pub prepaint_ms: Distribution,
+    /// Distribution of [`FrameSample::root_paint_ms`].
+    pub root_paint_ms: Distribution,
+    /// Distribution of [`FrameSample::bridge_ms`].
+    pub bridge_ms: Distribution,
+    /// Distribution of [`FrameSample::interval_ms`] over frames that have one.
+    pub interval_ms: Distribution,
+    /// Total view renders across the summarized frames.
+    pub views_rendered: u64,
+    /// Total cached view replays across the summarized frames.
+    pub views_reused: u64,
+}
+
+/// What one view did across the frames of a [`FrameReport`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ViewActivity {
+    /// GPUI entity that backs the view.
+    pub entity_id: u64,
+    /// The view's `Render` type name, empty when it never rendered in the report.
+    pub type_name: String,
+    /// Frames in which the view rendered.
+    pub rendered: u32,
+    /// Frames in which the view replayed its previous output from cache.
+    pub reused: u32,
+    /// Render counts by cause.
+    pub causes: BTreeMap<ViewRenderCause, u32>,
+}
+
+/// Per-frame samples, percentiles, and view-cache activity after one completed frame.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct FrameReport {
+    /// Frames completed after this token are reported.
+    pub after_frame_count: u64,
+    /// Most recent completed-frame token.
+    pub latest_frame_count: u64,
+    /// Whether frames after `after_frame_count` had already left the bounded history, so the
+    /// report covers only the most recent of them.
+    pub truncated: bool,
+    /// Aggregate over every reported frame.
+    pub summary: FrameSummary,
+    /// Per-frame samples, oldest first. When more frames were retained than requested, these
+    /// are the most recent; the summary still covers them all.
+    pub frames: Vec<FrameSample>,
+    /// Activity of every view drawn in the reported frames, busiest first.
+    pub views: Vec<ViewActivity>,
+    /// Every view drawn in the most recent reported frame, in draw order.
+    pub last_frame_views: Vec<ViewDraw>,
+}
+
+/// Whether a window will draw another frame without further invalidation.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PendingFrame {
+    /// The window is invalidated and GPUI will draw it.
+    pub pending: bool,
+    /// Last completed frame when the question was answered.
+    pub completed: FrameStats,
 }
 
 /// Current GPUI client-area geometry needed to map logical regions into a native window capture.
@@ -959,9 +1146,31 @@ pub enum Operation {
         /// Maximum wait duration from one through 30,000 milliseconds.
         timeout_ms: u64,
     },
-    /// Request a new GPUI frame and return the last completed-frame token observed before the
-    /// refresh was scheduled.
+    /// Invalidate every cached view, request a new GPUI frame, and return the last
+    /// completed-frame token observed before the refresh was scheduled.
+    ///
+    /// The frame renders every view, so it costs far more than an ordinary update. Use
+    /// [`Operation::RequestFrame`] to settle a frame without that cost.
     Refresh,
+    /// Request a new GPUI frame that replays every cached view that was not notified, and
+    /// return the last completed-frame token observed before the frame was scheduled.
+    RequestFrame,
+    /// Report whether the window is invalidated, so GPUI will draw another frame without
+    /// further invalidation, together with the last completed-frame token.
+    GetPendingFrame,
+    /// Start a frame measurement window at the most recently completed frame.
+    ///
+    /// Frame statistics and reports then cover only frames completed afterwards. Returns the
+    /// reset statistics.
+    MarkFrames,
+    /// Return per-frame samples, percentiles, and view-cache activity.
+    GetFrameReport {
+        /// Report frames completed after this token, or after the most recent mark when absent.
+        after_frame_count: Option<u64>,
+        /// Maximum per-frame samples returned, from 1 through 512; the summary covers every
+        /// retained frame regardless.
+        frame_limit: u16,
+    },
     /// Return current GPUI client-area geometry for native region capture.
     GetWindowGeometry,
     /// Replace the current highlight set.
@@ -1032,6 +1241,10 @@ pub enum BridgeResult {
     WindowGeometry(WindowGeometry),
     /// Frame timing statistics.
     FrameStats(FrameStats),
+    /// Whether another frame is pending.
+    PendingFrame(PendingFrame),
+    /// Per-frame samples and view-cache activity.
+    FrameReport(FrameReport),
     /// Current window-relative logical pointer position.
     PointerLocation(Point),
     /// Retained log entries.

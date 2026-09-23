@@ -1,12 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use gpui::AccessibilityFrame;
 use gpui_mcp_protocol::{
-    BridgeError, ErrorCode, FrameStats, Highlight, LogEntry, MAX_ID_BYTES, MAX_LABEL_BYTES,
+    BridgeError, Distribution, ErrorCode, FrameReport, FrameSample, FrameStats, FrameSummary,
+    Highlight, LogEntry, MAX_FRAME_SAMPLES, MAX_FRAME_VIEWS, MAX_ID_BYTES, MAX_LABEL_BYTES,
     MAX_METADATA_FIELDS, MAX_METADATA_KEY_BYTES, MAX_METADATA_VALUE_BYTES, MAX_TEXT_BYTES,
-    MAX_TREE_NODES, Rect, SemanticDiagnostic, SemanticDiagnosticCode, UiNode, UiTree,
-    WindowGeometry,
+    MAX_TREE_NODES, Rect, SemanticDiagnostic, SemanticDiagnosticCode, UiNode, UiTree, ViewActivity,
+    ViewDraw, ViewOutcome, ViewRenderCause, WindowGeometry,
 };
 use tokio::sync::watch;
 use tokio::time::timeout;
@@ -14,63 +16,148 @@ use tokio::time::timeout;
 const MAX_TIMING_SAMPLES: usize = 240;
 const MAX_DIAGNOSTICS: usize = 128;
 
+/// The newest accessibility frame GPUI handed over, not yet converted.
+///
+/// Converting a frame into a [`UiTree`] costs time in proportion to the tree, so
+/// the draw only keeps GPUI's shared handle and the conversion runs when a
+/// client reads the tree, on the thread that reads it. An unread frame is simply
+/// replaced by the next one.
+#[derive(Default)]
+struct SemanticIntake {
+    pending: Option<PendingSemantics>,
+    /// A frame started and has not delivered its accessibility tree yet.
+    awaiting: bool,
+    /// A started frame never delivered its accessibility tree.
+    incomplete: bool,
+}
+
+struct PendingSemantics {
+    frame: Arc<AccessibilityFrame>,
+    /// Whether a frame since the last converted tree failed to deliver one.
+    incomplete: bool,
+}
+
+/// Nodes of one frame being validated into a tree.
 #[derive(Debug, Default)]
-struct PendingFrame {
-    active: bool,
+struct TreeBuilder {
     nodes: BTreeMap<String, UiNode>,
     order: Vec<String>,
     invalid_ids: BTreeSet<String>,
     diagnostics: Vec<SemanticDiagnostic>,
 }
 
+/// One view drawn in a retained frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ViewRecord {
+    pub(crate) entity_id: u64,
+    pub(crate) type_name: &'static str,
+    /// Why the view rendered, or `None` when it replayed from cache.
+    pub(crate) cause: Option<ViewRenderCause>,
+}
+
+/// The frame GPUI is drawing now.
+#[derive(Debug)]
+struct FrameInProgress {
+    started: Instant,
+    interval: Option<Duration>,
+    prepaint: Option<Duration>,
+    root_paint_started: Option<Instant>,
+    root_paint: Option<Duration>,
+}
+
+/// One completed frame, retained for reports.
+#[derive(Clone, Debug)]
+struct FrameRecord {
+    frame_count: u64,
+    interval: Option<Duration>,
+    draw: Duration,
+    prepaint: Duration,
+    root_paint: Duration,
+    bridge: Duration,
+    views_rendered: u32,
+    views_reused: u32,
+    views: Arc<[ViewRecord]>,
+}
+
 #[derive(Debug)]
 struct TimingState {
     previous_frame: Option<Instant>,
-    prepaint_started: Option<Instant>,
-    root_paint_started: Option<Instant>,
+    current: Option<FrameInProgress>,
     frame_count: u64,
+    mark: u64,
     intervals: VecDeque<Duration>,
     prepaint: VecDeque<Duration>,
     root_paint: VecDeque<Duration>,
+    draw: VecDeque<Duration>,
+    bridge: VecDeque<Duration>,
+    history: VecDeque<FrameRecord>,
 }
 
 impl Default for TimingState {
     fn default() -> Self {
         Self {
             previous_frame: None,
-            prepaint_started: None,
-            root_paint_started: None,
+            current: None,
             frame_count: 0,
+            mark: 0,
             intervals: VecDeque::with_capacity(MAX_TIMING_SAMPLES),
             prepaint: VecDeque::with_capacity(MAX_TIMING_SAMPLES),
             root_paint: VecDeque::with_capacity(MAX_TIMING_SAMPLES),
+            draw: VecDeque::with_capacity(MAX_TIMING_SAMPLES),
+            bridge: VecDeque::with_capacity(MAX_TIMING_SAMPLES),
+            history: VecDeque::with_capacity(MAX_FRAME_SAMPLES),
         }
+    }
+}
+
+impl TimingState {
+    fn clear_samples(&mut self) {
+        self.intervals.clear();
+        self.prepaint.clear();
+        self.root_paint.clear();
+        self.draw.clear();
+        self.bridge.clear();
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct SharedState {
     tree: RwLock<UiTree>,
-    pending: Mutex<PendingFrame>,
+    intake: Mutex<SemanticIntake>,
+    /// Serializes conversions so two readers never convert one frame twice.
+    converting: Mutex<()>,
+    /// Counts accessibility frames handed over, to wake tree waiters.
+    semantic_frames: watch::Sender<u64>,
     highlights: RwLock<Vec<Highlight>>,
     timings: Mutex<TimingState>,
     logs: Mutex<VecDeque<LogEntry>>,
-    generation: watch::Sender<u64>,
     completed_frame: watch::Sender<FrameStats>,
     window_geometry: RwLock<Option<WindowGeometry>>,
 }
 
+impl std::fmt::Debug for SemanticIntake {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SemanticIntake")
+            .field("pending", &self.pending.is_some())
+            .field("awaiting", &self.awaiting)
+            .field("incomplete", &self.incomplete)
+            .finish()
+    }
+}
+
 impl SharedState {
     pub(crate) fn new() -> Arc<Self> {
-        let (generation, _) = watch::channel(0);
+        let (semantic_frames, _) = watch::channel(0);
         let (completed_frame, _) = watch::channel(FrameStats::default());
         Arc::new(Self {
             tree: RwLock::new(UiTree::default()),
-            pending: Mutex::new(PendingFrame::default()),
+            intake: Mutex::new(SemanticIntake::default()),
+            converting: Mutex::new(()),
+            semantic_frames,
             highlights: RwLock::new(Vec::new()),
             timings: Mutex::new(TimingState::default()),
             logs: Mutex::new(VecDeque::with_capacity(512)),
-            generation,
             completed_frame,
             window_geometry: RwLock::new(None),
         })
@@ -83,74 +170,187 @@ impl SharedState {
                 .timings
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            timings.frame_count = timings.frame_count.saturating_add(1);
-            if let Some(previous) = timings.previous_frame.replace(now) {
-                push_sample(
-                    &mut timings.intervals,
-                    now.saturating_duration_since(previous),
-                );
+            let interval = timings
+                .previous_frame
+                .replace(now)
+                .map(|previous| now.saturating_duration_since(previous));
+            if let Some(interval) = interval {
+                push_sample(&mut timings.intervals, interval);
             }
-            timings.prepaint_started = Some(now);
-            timings.root_paint_started = None;
+            timings.current = Some(FrameInProgress {
+                started: now,
+                interval,
+                prepaint: None,
+                root_paint_started: None,
+                root_paint: None,
+            });
         }
 
-        let mut pending = self
-            .pending
+        let mut intake = self
+            .intake
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous_was_incomplete = pending.active;
-        pending.active = true;
-        pending.nodes.clear();
-        pending.order.clear();
-        pending.invalid_ids.clear();
-        pending.diagnostics.clear();
-        if previous_was_incomplete {
-            push_diagnostic(
-                &mut pending,
-                SemanticDiagnosticCode::InvalidNode,
-                None,
-                "the previous semantic frame did not reach root paint",
-            );
+        if intake.awaiting {
+            intake.incomplete = true;
+        }
+        intake.awaiting = true;
+    }
+
+    /// Keep GPUI's finished accessibility frame for conversion when it is read.
+    pub(crate) fn observe_semantics(&self, frame: &Arc<AccessibilityFrame>) {
+        let now = Instant::now();
+        {
+            let mut timings = self
+                .timings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(current) = timings.current.as_mut() {
+                current.prepaint = Some(now.saturating_duration_since(current.started));
+            }
+        }
+
+        let replaced = {
+            let mut intake = self
+                .intake
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            intake.awaiting = false;
+            let carried = intake
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.incomplete);
+            let incomplete = std::mem::take(&mut intake.incomplete) || carried;
+            intake.pending.replace(PendingSemantics {
+                frame: frame.clone(),
+                incomplete,
+            })
+        };
+        // Release the lock before an unread frame is freed.
+        drop(replaced);
+        self.semantic_frames.send_modify(|count| *count += 1);
+    }
+
+    pub(crate) fn begin_root_paint(&self) {
+        let mut timings = self
+            .timings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(current) = timings.current.as_mut() {
+            current.root_paint_started = Some(Instant::now());
         }
     }
 
-    pub(crate) fn finish_prepaint(&self) {
+    pub(crate) fn finish_root_paint(&self) {
         let now = Instant::now();
         let mut timings = self
             .timings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(started) = timings.prepaint_started.take() {
-            push_sample(
-                &mut timings.prepaint,
-                now.saturating_duration_since(started),
-            );
+        if let Some(current) = timings.current.as_mut()
+            && let Some(started) = current.root_paint_started.take()
+        {
+            current.root_paint = Some(now.saturating_duration_since(started));
         }
     }
 
-    pub(crate) fn begin_root_paint(&self) {
-        self.timings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .root_paint_started = Some(Instant::now());
-    }
+    /// Complete the current frame with GPUI's measurement of the whole draw and
+    /// what each view did, then publish it to frame waiters.
+    pub(crate) fn finish_draw(
+        &self,
+        draw: Duration,
+        bridge: Duration,
+        views: impl IntoIterator<Item = ViewRecord>,
+    ) {
+        let mut views_rendered = 0_u32;
+        let mut views_reused = 0_u32;
+        let mut itemized = Vec::new();
+        for view in views {
+            if view.cause.is_some() {
+                views_rendered = views_rendered.saturating_add(1);
+            } else {
+                views_reused = views_reused.saturating_add(1);
+            }
+            if itemized.len() < MAX_FRAME_VIEWS {
+                itemized.push(view);
+            }
+        }
 
-    pub(crate) fn finish_root_paint(&self) {
-        let now = Instant::now();
         let stats = {
             let mut timings = self
                 .timings
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(started) = timings.root_paint_started.take() {
-                push_sample(
-                    &mut timings.root_paint,
-                    now.saturating_duration_since(started),
-                );
+            let current = timings.current.take();
+            timings.frame_count = timings.frame_count.saturating_add(1);
+            let prepaint = current
+                .as_ref()
+                .and_then(|current| current.prepaint)
+                .unwrap_or_default();
+            let root_paint = current
+                .as_ref()
+                .and_then(|current| current.root_paint)
+                .unwrap_or_default();
+            push_sample(&mut timings.prepaint, prepaint);
+            push_sample(&mut timings.root_paint, root_paint);
+            push_sample(&mut timings.draw, draw);
+            push_sample(&mut timings.bridge, bridge);
+            if timings.history.len() == MAX_FRAME_SAMPLES {
+                timings.history.pop_front();
             }
+            let record = FrameRecord {
+                frame_count: timings.frame_count,
+                interval: current.and_then(|current| current.interval),
+                draw,
+                prepaint,
+                root_paint,
+                bridge,
+                views_rendered,
+                views_reused,
+                views: itemized.into(),
+            };
+            timings.history.push_back(record);
             frame_stats_from_timings(&timings)
         };
         self.completed_frame.send_replace(stats);
+    }
+
+    /// Start a measurement window at the last completed frame.
+    pub(crate) fn mark_frames(&self) -> FrameStats {
+        let stats = {
+            let mut timings = self
+                .timings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            timings.mark = timings.frame_count;
+            timings.clear_samples();
+            frame_stats_from_timings(&timings)
+        };
+        self.completed_frame.send_replace(stats.clone());
+        stats
+    }
+
+    /// Report the retained frames completed after `after_frame_count`, or after
+    /// the last mark, returning at most `frame_limit` per-frame samples.
+    pub(crate) fn frame_report(
+        &self,
+        after_frame_count: Option<u64>,
+        frame_limit: usize,
+    ) -> FrameReport {
+        let (after_frame_count, latest_frame_count, records) = {
+            let timings = self
+                .timings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let after = after_frame_count.unwrap_or(timings.mark);
+            let records = timings
+                .history
+                .iter()
+                .filter(|record| record.frame_count > after)
+                .cloned()
+                .collect::<Vec<_>>();
+            (after, timings.frame_count, records)
+        };
+        build_report(after_frame_count, latest_frame_count, &records, frame_limit)
     }
 
     pub(crate) fn set_window_geometry(&self, content_bounds: Rect, scale_factor: f32) {
@@ -174,79 +374,41 @@ impl SharedState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn record(&self, mut node: UiNode) -> bool {
-        node.children.clear();
-
-        let mut pending = self
-            .pending
+    /// Convert the newest handed-over accessibility frame, if it has not been.
+    fn convert_pending(&self) {
+        let _converting = self
+            .converting
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !pending.active {
-            return false;
-        }
-        if let Err(message) = validate_node(&node) {
-            let node_id = valid_diagnostic_id(&node.id).then(|| node.id.clone());
-            push_diagnostic(
-                &mut pending,
-                SemanticDiagnosticCode::InvalidNode,
-                node_id,
-                message,
-            );
-            return false;
-        }
-        if pending.invalid_ids.contains(&node.id) {
-            return false;
-        }
-        if pending.nodes.remove(&node.id).is_some() {
-            pending.order.retain(|id| id != &node.id);
-            pending.invalid_ids.insert(node.id.clone());
-            push_diagnostic(
-                &mut pending,
-                SemanticDiagnosticCode::DuplicateId,
-                Some(node.id),
-                "every node with this duplicate semantic identifier was omitted",
-            );
-            return false;
-        }
-        if pending.nodes.len() >= MAX_TREE_NODES {
-            push_diagnostic(
-                &mut pending,
-                SemanticDiagnosticCode::CapacityExceeded,
-                None,
-                "semantic tree capacity was exceeded",
-            );
-            return false;
-        }
-        pending.order.push(node.id.clone());
-        pending.nodes.insert(node.id.clone(), node);
-        true
-    }
-
-    pub(crate) fn publish_frame(&self, nodes: impl IntoIterator<Item = UiNode>) {
-        for node in nodes {
-            self.record(node);
-        }
-        self.finish_prepaint();
-        self.finish_frame();
-    }
-
-    pub(crate) fn finish_frame(&self) {
-        let mut pending = self
-            .pending
+        let pending = self
+            .intake
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !pending.active {
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .take();
+        let Some(pending) = pending else {
             return;
-        }
-        pending.active = false;
+        };
+        let nodes = crate::observer::semantic_nodes(&pending.frame);
+        drop(pending.frame);
+        self.publish_nodes(nodes, pending.incomplete);
+    }
 
-        discard_invalid_relationships(&mut pending);
-        let roots = build_relationships(&mut pending);
-        let nodes = std::mem::take(&mut pending.nodes);
-        pending.order.clear();
-        pending.invalid_ids.clear();
-        let diagnostics = std::mem::take(&mut pending.diagnostics);
-        drop(pending);
+    /// Validate one frame's nodes and publish them as the current tree,
+    /// advancing the generation only when the tree changed.
+    fn publish_nodes(&self, nodes: impl IntoIterator<Item = UiNode>, incomplete: bool) {
+        let mut builder = TreeBuilder::default();
+        if incomplete {
+            builder.push_diagnostic(
+                SemanticDiagnosticCode::InvalidNode,
+                None,
+                "a semantic frame since the previous tree did not reach root paint",
+            );
+        }
+        for node in nodes {
+            builder.record(node);
+        }
+        let (roots, nodes, diagnostics) = builder.finish();
 
         let mut tree = self
             .tree
@@ -259,15 +421,10 @@ impl SharedState {
         tree.roots = roots;
         tree.nodes = nodes;
         tree.diagnostics = diagnostics;
-        let generation = tree.generation;
-        drop(tree);
-
-        if changed {
-            self.generation.send_replace(generation);
-        }
     }
 
     pub(crate) fn tree(&self) -> UiTree {
+        self.convert_pending();
         self.tree
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -275,6 +432,7 @@ impl SharedState {
     }
 
     pub(crate) fn tree_generation(&self) -> u64 {
+        self.convert_pending();
         self.tree
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -286,16 +444,15 @@ impl SharedState {
         after_generation: u64,
         wait: Duration,
     ) -> Result<UiTree, BridgeError> {
-        let current = self.tree();
-        if current.generation > after_generation {
-            return Ok(current);
-        }
-
-        let mut receiver = self.generation.subscribe();
+        let mut receiver = self.semantic_frames.subscribe();
         let changed = async {
             loop {
-                if *receiver.borrow_and_update() > after_generation {
-                    return Ok(());
+                // Mark the current frame seen before converting it, so a frame
+                // handed over during the conversion still wakes the wait below.
+                receiver.borrow_and_update();
+                let current = self.tree();
+                if current.generation > after_generation {
+                    return Ok(current);
                 }
                 receiver.changed().await.map_err(|_| {
                     BridgeError::new(ErrorCode::Internal, "semantic tree publisher stopped")
@@ -304,8 +461,7 @@ impl SharedState {
         };
         timeout(wait, changed)
             .await
-            .map_err(|_| BridgeError::new(ErrorCode::Timeout, "semantic tree wait timed out"))??;
-        Ok(self.tree())
+            .map_err(|_| BridgeError::new(ErrorCode::Timeout, "semantic tree wait timed out"))?
     }
 
     pub(crate) async fn wait_for_frame(
@@ -398,6 +554,69 @@ impl SharedState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+    }
+}
+
+impl TreeBuilder {
+    fn record(&mut self, mut node: UiNode) -> bool {
+        node.children.clear();
+
+        if let Err(message) = validate_node(&node) {
+            let node_id = valid_diagnostic_id(&node.id).then(|| node.id.clone());
+            self.push_diagnostic(SemanticDiagnosticCode::InvalidNode, node_id, message);
+            return false;
+        }
+        if self.invalid_ids.contains(&node.id) {
+            return false;
+        }
+        if self.nodes.remove(&node.id).is_some() {
+            self.order.retain(|id| id != &node.id);
+            self.invalid_ids.insert(node.id.clone());
+            self.push_diagnostic(
+                SemanticDiagnosticCode::DuplicateId,
+                Some(node.id),
+                "every node with this duplicate semantic identifier was omitted",
+            );
+            return false;
+        }
+        if self.nodes.len() >= MAX_TREE_NODES {
+            self.push_diagnostic(
+                SemanticDiagnosticCode::CapacityExceeded,
+                None,
+                "semantic tree capacity was exceeded",
+            );
+            return false;
+        }
+        self.order.push(node.id.clone());
+        self.nodes.insert(node.id.clone(), node);
+        true
+    }
+
+    fn finish(
+        mut self,
+    ) -> (
+        Vec<String>,
+        BTreeMap<String, UiNode>,
+        Vec<SemanticDiagnostic>,
+    ) {
+        discard_invalid_relationships(&mut self);
+        let roots = build_relationships(&mut self);
+        (roots, self.nodes, self.diagnostics)
+    }
+
+    fn push_diagnostic(
+        &mut self,
+        code: SemanticDiagnosticCode,
+        node_id: Option<String>,
+        message: &'static str,
+    ) {
+        if self.diagnostics.len() < MAX_DIAGNOSTICS {
+            self.diagnostics.push(SemanticDiagnostic {
+                code,
+                node_id,
+                message: message.to_owned(),
+            });
+        }
     }
 }
 
@@ -497,26 +716,11 @@ fn valid_diagnostic_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= MAX_ID_BYTES && !id.chars().any(char::is_control)
 }
 
-fn push_diagnostic(
-    pending: &mut PendingFrame,
-    code: SemanticDiagnosticCode,
-    node_id: Option<String>,
-    message: &'static str,
-) {
-    if pending.diagnostics.len() < MAX_DIAGNOSTICS {
-        pending.diagnostics.push(SemanticDiagnostic {
-            code,
-            node_id,
-            message: message.to_owned(),
-        });
-    }
-}
+fn discard_invalid_relationships(builder: &mut TreeBuilder) {
+    let mut invalid = std::mem::take(&mut builder.invalid_ids);
+    discard_missing_parents(builder, &mut invalid);
 
-fn discard_invalid_relationships(pending: &mut PendingFrame) {
-    let mut invalid = std::mem::take(&mut pending.invalid_ids);
-    discard_missing_parents(pending, &mut invalid);
-
-    for start in pending.order.clone() {
+    for start in builder.order.clone() {
         if invalid.contains(&start) {
             continue;
         }
@@ -530,8 +734,7 @@ fn discard_invalid_relationships(pending: &mut PendingFrame) {
             if let Some(cycle_start) = positions.get(&current).copied() {
                 for id in &path[cycle_start..] {
                     if invalid.insert(id.clone()) {
-                        push_diagnostic(
-                            pending,
+                        builder.push_diagnostic(
                             SemanticDiagnosticCode::ParentCycle,
                             Some(id.clone()),
                             "semantic node in a parent cycle was omitted",
@@ -542,7 +745,7 @@ fn discard_invalid_relationships(pending: &mut PendingFrame) {
             }
             positions.insert(current.clone(), path.len());
             path.push(current.clone());
-            let Some(parent) = pending
+            let Some(parent) = builder
                 .nodes
                 .get(&current)
                 .and_then(|node| node.parent.clone())
@@ -553,20 +756,20 @@ fn discard_invalid_relationships(pending: &mut PendingFrame) {
         }
     }
 
-    discard_missing_parents(pending, &mut invalid);
-    pending.nodes.retain(|id, _| !invalid.contains(id));
-    pending.order.retain(|id| !invalid.contains(id));
+    discard_missing_parents(builder, &mut invalid);
+    builder.nodes.retain(|id, _| !invalid.contains(id));
+    builder.order.retain(|id| !invalid.contains(id));
 }
 
-fn discard_missing_parents(pending: &mut PendingFrame, invalid: &mut BTreeSet<String>) {
+fn discard_missing_parents(builder: &mut TreeBuilder, invalid: &mut BTreeSet<String>) {
     loop {
-        let missing = pending
+        let missing = builder
             .order
             .iter()
             .filter(|id| !invalid.contains(*id))
             .filter(|id| {
-                pending.nodes[*id].parent.as_ref().is_some_and(|parent| {
-                    invalid.contains(parent) || !pending.nodes.contains_key(parent)
+                builder.nodes[*id].parent.as_ref().is_some_and(|parent| {
+                    invalid.contains(parent) || !builder.nodes.contains_key(parent)
                 })
             })
             .cloned()
@@ -576,8 +779,7 @@ fn discard_missing_parents(pending: &mut PendingFrame, invalid: &mut BTreeSet<St
         }
         for id in missing {
             invalid.insert(id.clone());
-            push_diagnostic(
-                pending,
+            builder.push_diagnostic(
                 SemanticDiagnosticCode::MissingParent,
                 Some(id),
                 "semantic node whose parent was unavailable was omitted",
@@ -586,12 +788,12 @@ fn discard_missing_parents(pending: &mut PendingFrame, invalid: &mut BTreeSet<St
     }
 }
 
-fn build_relationships(pending: &mut PendingFrame) -> Vec<String> {
-    let relationships: Vec<_> = pending
+fn build_relationships(builder: &mut TreeBuilder) -> Vec<String> {
+    let relationships: Vec<_> = builder
         .order
         .iter()
         .filter_map(|id| {
-            pending
+            builder
                 .nodes
                 .get(id)
                 .map(|node| (id.clone(), node.parent.clone()))
@@ -600,7 +802,7 @@ fn build_relationships(pending: &mut PendingFrame) -> Vec<String> {
     let mut roots = Vec::new();
     for (child, parent) in relationships {
         if let Some(parent) = parent {
-            if let Some(parent_node) = pending.nodes.get_mut(&parent) {
+            if let Some(parent_node) = builder.nodes.get_mut(&parent) {
                 parent_node.children.push(child);
             }
         } else {
@@ -621,6 +823,8 @@ fn frame_stats_from_timings(timings: &TimingState) -> FrameStats {
     let (frame_interval_average_ms, frame_interval_max_ms) = timing_summary(&timings.intervals);
     let (prepaint_average_ms, prepaint_max_ms) = timing_summary(&timings.prepaint);
     let (root_paint_average_ms, root_paint_max_ms) = timing_summary(&timings.root_paint);
+    let (draw_average_ms, draw_max_ms) = timing_summary(&timings.draw);
+    let (bridge_average_ms, bridge_max_ms) = timing_summary(&timings.bridge);
     FrameStats {
         frame_count: timings.frame_count,
         sample_count: u32::try_from(timings.intervals.len()).unwrap_or(u32::MAX),
@@ -630,6 +834,11 @@ fn frame_stats_from_timings(timings: &TimingState) -> FrameStats {
         prepaint_max_ms,
         root_paint_average_ms,
         root_paint_max_ms,
+        draw_average_ms,
+        draw_max_ms,
+        bridge_average_ms,
+        bridge_max_ms,
+        mark_frame_count: timings.mark,
         estimated_fps: if frame_interval_average_ms > 0.0 {
             1000.0 / frame_interval_average_ms
         } else {
@@ -650,6 +859,152 @@ fn timing_summary(samples: &VecDeque<Duration>) -> (f64, f64) {
         .map(|duration| duration.as_secs_f64() * 1000.0)
         .fold(0.0, f64::max);
     (average_ms, max_ms)
+}
+
+fn milliseconds(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+/// Mean and nearest-rank percentiles of `values`.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn distribution(mut values: Vec<f64>) -> Distribution {
+    if values.is_empty() {
+        return Distribution::default();
+    }
+    values.sort_by(f64::total_cmp);
+    let count = values.len();
+    let rank = |quantile: f64| {
+        let position = (quantile * count as f64).ceil() as usize;
+        values[position.clamp(1, count) - 1]
+    };
+    Distribution {
+        count: u32::try_from(count).unwrap_or(u32::MAX),
+        mean: values.iter().sum::<f64>() / count as f64,
+        p50: rank(0.5),
+        p95: rank(0.95),
+        max: values[count - 1],
+    }
+}
+
+fn view_draw(view: &ViewRecord) -> ViewDraw {
+    ViewDraw {
+        entity_id: view.entity_id,
+        type_name: view.type_name.to_owned(),
+        outcome: if view.cause.is_some() {
+            ViewOutcome::Rendered
+        } else {
+            ViewOutcome::Reused
+        },
+        cause: view.cause,
+    }
+}
+
+fn frame_sample(record: &FrameRecord) -> FrameSample {
+    FrameSample {
+        frame_count: record.frame_count,
+        interval_ms: record.interval.map(milliseconds),
+        draw_ms: milliseconds(record.draw),
+        app_draw_ms: milliseconds(record.draw.saturating_sub(record.bridge)),
+        prepaint_ms: milliseconds(record.prepaint),
+        root_paint_ms: milliseconds(record.root_paint),
+        bridge_ms: milliseconds(record.bridge),
+        views_rendered: record.views_rendered,
+        views_reused: record.views_reused,
+        rendered_views: record
+            .views
+            .iter()
+            .filter(|view| view.cause.is_some())
+            .map(view_draw)
+            .collect(),
+    }
+}
+
+fn build_report(
+    after_frame_count: u64,
+    latest_frame_count: u64,
+    records: &[FrameRecord],
+    frame_limit: usize,
+) -> FrameReport {
+    // Every completed frame is retained in order, so a gap between the mark
+    // and the oldest retained frame means frames were evicted.
+    let truncated = records
+        .first()
+        .map_or(latest_frame_count > after_frame_count, |first| {
+            first.frame_count > after_frame_count.saturating_add(1)
+        });
+
+    let samples = records.iter().map(frame_sample).collect::<Vec<_>>();
+    let summary = FrameSummary {
+        frames: u32::try_from(samples.len()).unwrap_or(u32::MAX),
+        draw_ms: distribution(samples.iter().map(|sample| sample.draw_ms).collect()),
+        app_draw_ms: distribution(samples.iter().map(|sample| sample.app_draw_ms).collect()),
+        prepaint_ms: distribution(samples.iter().map(|sample| sample.prepaint_ms).collect()),
+        root_paint_ms: distribution(samples.iter().map(|sample| sample.root_paint_ms).collect()),
+        bridge_ms: distribution(samples.iter().map(|sample| sample.bridge_ms).collect()),
+        interval_ms: distribution(
+            samples
+                .iter()
+                .filter_map(|sample| sample.interval_ms)
+                .collect(),
+        ),
+        views_rendered: samples
+            .iter()
+            .map(|sample| u64::from(sample.views_rendered))
+            .sum(),
+        views_reused: samples
+            .iter()
+            .map(|sample| u64::from(sample.views_reused))
+            .sum(),
+    };
+
+    let mut positions = HashMap::<u64, usize>::new();
+    let mut views = Vec::<ViewActivity>::new();
+    for view in records.iter().flat_map(|record| record.views.iter()) {
+        let position = *positions.entry(view.entity_id).or_insert_with(|| {
+            views.push(ViewActivity {
+                entity_id: view.entity_id,
+                ..ViewActivity::default()
+            });
+            views.len() - 1
+        });
+        let activity = &mut views[position];
+        if activity.type_name.is_empty() {
+            view.type_name.clone_into(&mut activity.type_name);
+        }
+        if let Some(cause) = view.cause {
+            activity.rendered = activity.rendered.saturating_add(1);
+            let count = activity.causes.entry(cause).or_default();
+            *count = count.saturating_add(1);
+        } else {
+            activity.reused = activity.reused.saturating_add(1);
+        }
+    }
+    views.sort_by(|left, right| {
+        right
+            .rendered
+            .cmp(&left.rendered)
+            .then(right.reused.cmp(&left.reused))
+            .then(left.entity_id.cmp(&right.entity_id))
+    });
+
+    let last_frame_views = records
+        .last()
+        .map(|record| record.views.iter().map(view_draw).collect())
+        .unwrap_or_default();
+    let skip = samples.len().saturating_sub(frame_limit);
+    FrameReport {
+        after_frame_count,
+        latest_frame_count,
+        truncated,
+        summary,
+        frames: samples.into_iter().skip(skip).collect(),
+        views,
+        last_frame_views,
+    }
 }
 
 fn normalize_level(level: &str) -> &'static str {
@@ -686,9 +1041,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    use gpui_mcp_protocol::{NodeState, Role, SemanticDiagnosticCode, UiNode};
+    use gpui_mcp_protocol::{NodeState, Role, SemanticDiagnosticCode, UiNode, ViewRenderCause};
 
-    use super::SharedState;
+    use super::{SharedState, TreeBuilder, ViewRecord};
 
     fn node(id: &str, parent: Option<&str>) -> UiNode {
         UiNode {
@@ -707,14 +1062,34 @@ mod tests {
         }
     }
 
+    /// Complete one frame the way the observer does, without semantics.
+    fn draw_frame(state: &SharedState, draw_ms: u64, views: &[ViewRecord]) {
+        state.begin_frame();
+        state.begin_root_paint();
+        state.finish_root_paint();
+        state.finish_draw(
+            Duration::from_millis(draw_ms),
+            Duration::from_millis(1),
+            views.iter().copied(),
+        );
+    }
+
+    fn view(entity_id: u64, cause: Option<ViewRenderCause>) -> ViewRecord {
+        ViewRecord {
+            entity_id,
+            type_name: if entity_id == 1 { "Root" } else { "Panel" },
+            cause,
+        }
+    }
+
     #[test]
     fn duplicate_ids_are_omitted_and_reported() {
-        let state = SharedState::new();
-        state.begin_frame();
-        assert!(state.record(node("same", None)));
-        assert!(!state.record(node("same", None)));
-        state.finish_frame();
+        let mut builder = TreeBuilder::default();
+        assert!(builder.record(node("same", None)));
+        assert!(!builder.record(node("same", None)));
 
+        let state = SharedState::new();
+        state.publish_nodes([node("same", None), node("same", None)], false);
         let tree = state.tree();
         assert!(tree.nodes.is_empty());
         assert!(tree.diagnostics.iter().any(|diagnostic| {
@@ -726,11 +1101,14 @@ mod tests {
     #[test]
     fn missing_parents_and_cycles_are_rejected_without_rewriting_the_graph() {
         let state = SharedState::new();
-        state.begin_frame();
-        assert!(state.record(node("missing", Some("absent"))));
-        assert!(state.record(node("a", Some("b"))));
-        assert!(state.record(node("b", Some("a"))));
-        state.finish_frame();
+        state.publish_nodes(
+            [
+                node("missing", Some("absent")),
+                node("a", Some("b")),
+                node("b", Some("a")),
+            ],
+            false,
+        );
 
         let tree = state.tree();
         assert!(tree.nodes.is_empty());
@@ -751,11 +1129,22 @@ mod tests {
     fn unchanged_semantics_do_not_advance_generation() {
         let state = SharedState::new();
         for _ in 0..2 {
-            state.begin_frame();
-            assert!(state.record(node("stable", None)));
-            state.finish_frame();
+            state.publish_nodes([node("stable", None)], false);
         }
         assert_eq!(state.tree().generation, 1);
+    }
+
+    #[test]
+    fn an_incomplete_frame_is_reported_in_the_next_tree() {
+        let state = SharedState::new();
+        state.publish_nodes([node("stable", None)], true);
+        assert!(
+            state
+                .tree()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == SemanticDiagnosticCode::InvalidNode)
+        );
     }
 
     #[tokio::test]
@@ -768,9 +1157,8 @@ mod tests {
             );
         tokio::task::yield_now().await;
 
-        state.begin_frame();
-        assert!(state.record(node("published", None)));
-        state.finish_frame();
+        state.publish_nodes([node("published", None)], false);
+        state.semantic_frames.send_modify(|count| *count += 1);
 
         let tree = waiter
             .await
@@ -782,14 +1170,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frame_wait_wakes_after_unchanged_semantics_finish_paint() -> Result<(), String> {
+    async fn frame_wait_wakes_after_the_draw_completes() -> Result<(), String> {
         let state = SharedState::new();
-        state.begin_frame();
-        assert!(state.record(node("stable", None)));
-        state.finish_frame();
-        state.begin_root_paint();
-        state.finish_root_paint();
-        assert_eq!(state.tree().generation, 1);
+        draw_frame(&state, 2, &[]);
 
         let waiter_state = state.clone();
         let waiter =
@@ -798,34 +1181,24 @@ mod tests {
             );
         tokio::task::yield_now().await;
 
-        state.begin_frame();
-        assert!(state.record(node("stable", None)));
-        state.finish_frame();
-        state.begin_root_paint();
-        state.finish_root_paint();
+        draw_frame(&state, 2, &[]);
 
         let observed_frame = waiter
             .await
             .map_err(|error| error.to_string())?
             .map_err(|error| error.message)?;
         assert_eq!(observed_frame.frame_count, 2);
-        assert_eq!(state.tree().generation, 1);
         Ok(())
     }
 
     #[tokio::test]
     async fn frame_wait_never_returns_a_started_but_incomplete_frame() -> Result<(), String> {
         let state = SharedState::new();
-        state.begin_frame();
-        assert!(state.record(node("stable", None)));
-        state.finish_frame();
-        state.begin_root_paint();
-        state.finish_root_paint();
+        draw_frame(&state, 2, &[]);
 
         state.begin_frame();
-        assert!(state.record(node("stable", None)));
-        state.finish_frame();
         state.begin_root_paint();
+        state.finish_root_paint();
         assert_eq!(state.frame_stats().frame_count, 1);
 
         let wait = state.wait_for_frame(1, Duration::from_secs(1));
@@ -834,17 +1207,108 @@ mod tests {
             biased;
             result = &mut wait => {
                 return Err(format!(
-                    "frame wait completed before root paint: {:?}",
+                    "frame wait completed before the draw finished: {:?}",
                     result.map_err(|error| error.message)
                 ));
             }
             () = tokio::task::yield_now() => {}
         }
 
-        state.finish_root_paint();
+        state.finish_draw(Duration::from_millis(3), Duration::ZERO, []);
         let observed = wait.await.map_err(|error| error.message)?;
         assert_eq!(observed.frame_count, 2);
         assert_eq!(state.frame_stats(), observed);
         Ok(())
+    }
+
+    #[test]
+    fn a_mark_isolates_the_frames_drawn_after_it() {
+        let state = SharedState::new();
+        draw_frame(&state, 40, &[view(1, Some(ViewRenderCause::Refresh))]);
+        draw_frame(&state, 40, &[view(1, Some(ViewRenderCause::Refresh))]);
+
+        let marked = state.mark_frames();
+        assert_eq!(marked.mark_frame_count, 2);
+        assert!(
+            marked.draw_average_ms.abs() < f64::EPSILON,
+            "a mark resets the rolling averages"
+        );
+
+        for draw_ms in [2, 4, 6, 8] {
+            draw_frame(
+                &state,
+                draw_ms,
+                &[
+                    view(1, Some(ViewRenderCause::Uncached)),
+                    view(2, Some(ViewRenderCause::Notified)),
+                    view(3, None),
+                ],
+            );
+        }
+
+        let averages = state.frame_stats();
+        assert!((averages.draw_average_ms - 5.0).abs() < 1e-9);
+        assert!((averages.draw_max_ms - 8.0).abs() < 1e-9);
+
+        let report = state.frame_report(None, 2);
+        assert_eq!(report.after_frame_count, 2);
+        assert_eq!(report.latest_frame_count, 6);
+        assert!(!report.truncated);
+        assert_eq!(report.summary.frames, 4);
+        assert!((report.summary.draw_ms.p50 - 4.0).abs() < 1e-9);
+        assert!((report.summary.draw_ms.p95 - 8.0).abs() < 1e-9);
+        assert!((report.summary.app_draw_ms.max - 7.0).abs() < 1e-9);
+        assert_eq!(
+            report
+                .frames
+                .iter()
+                .map(|frame| frame.frame_count)
+                .collect::<Vec<_>>(),
+            [5, 6],
+            "the frame limit keeps the most recent samples"
+        );
+        assert_eq!(report.frames[0].views_rendered, 2);
+        assert_eq!(report.frames[0].views_reused, 1);
+
+        let reused = report
+            .views
+            .iter()
+            .find(|activity| activity.entity_id == 3)
+            .map(|activity| (activity.rendered, activity.reused));
+        assert_eq!(reused, Some((0, 4)));
+        let notified = report
+            .views
+            .iter()
+            .find(|activity| activity.entity_id == 2)
+            .and_then(|activity| activity.causes.get(&ViewRenderCause::Notified).copied());
+        assert_eq!(notified, Some(4));
+        assert!(
+            report
+                .views
+                .iter()
+                .all(|activity| !activity.causes.contains_key(&ViewRenderCause::Refresh)),
+            "frames before the mark must not leak into the report"
+        );
+        assert_eq!(report.last_frame_views.len(), 3);
+
+        let explicit = state.frame_report(Some(0), 10);
+        assert_eq!(explicit.summary.frames, 6);
+    }
+
+    #[test]
+    fn a_report_says_when_frames_after_its_mark_were_evicted() {
+        let state = SharedState::new();
+        for _ in 0..(super::MAX_FRAME_SAMPLES + 3) {
+            draw_frame(&state, 1, &[]);
+        }
+        let report = state.frame_report(Some(0), 1);
+        assert!(report.truncated);
+        assert_eq!(
+            usize::try_from(report.summary.frames).unwrap_or_default(),
+            super::MAX_FRAME_SAMPLES
+        );
+
+        let recent = state.frame_report(Some(4), 1);
+        assert!(!recent.truncated);
     }
 }

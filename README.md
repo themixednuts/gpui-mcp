@@ -98,6 +98,44 @@ type universe. They can go away once the small additions in the
 See the [demo](examples/demo/src/main.rs) for a complete window. For live
 HTML/CSS interfaces, see the [visual builder guide](docs/visual-builder.md).
 
+## Measuring frame cost
+
+Injected input costs what the same input from the operating system costs.
+Pointer and keyboard events invalidate only what their handlers notify, and the
+server waits for the frames that input caused without adding frames of its own.
+Screenshots request fresh frames, but those frames replay every cached view that
+was not notified, so they do not render the whole window.
+
+To measure an interaction, call `mark_frames`, perform it with `hover_element`,
+`pointer_move`, or a real mouse, then call `get_frame_report`. The report covers
+every frame completed after the mark. For each frame it gives GPUI's whole
+`Window::draw` time (`draw_ms`, the interval GPUI's profiler records as
+`FrameTiming::draw_duration`), split into the application's share
+(`app_draw_ms`) and the bridge's (`bridge_ms`). It also gives p50, p95, and
+maximum for each, and every view that rendered, with the reason:
+
+- `notified`: the view, or a view inside it, called `cx.notify()`
+- `ancestor_rendered`: a cached view around it rendered
+- `refresh`: the window was refreshed
+- `first_draw`: the view had nothing cached yet
+- `layout_changed`: its bounds, content mask, or text style changed
+- `uncached`: it is not embedded with `.cached(...)`
+
+It also lists the cached views that replayed instead. A hover inside a region
+drawn with `Entity::cached` should show that region rendering because it was
+`notified` and its siblings replaying. Anything else shows where a caching
+boundary leaks. `get_frame_stats` averages over the same window, and
+`record_performance` reports the frames drawn during a fixed interval. An app
+can read the same numbers in process with `Automation::mark_frames` and
+`Automation::frame_report`.
+
+`bridge_ms` covers the work the bridge adds to a draw: finishing the
+accessibility tree when no screen reader wants it, building the observed frame,
+and painting highlights. Recording each element's accessibility node during
+prepaint happens inside the application's own work and stays in `app_draw_ms`.
+The semantic tree is converted when a client reads it, off the UI thread, so
+that cost is in neither.
+
 Only enable automation in development, testing, or another explicitly trusted
 environment. See [SECURITY.md](SECURITY.md).
 

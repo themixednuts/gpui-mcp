@@ -1,9 +1,9 @@
 //! Small instrumented GPUI application used to exercise the MCP bridge.
 
 use gpui::{
-    App, Bounds, Context, Div, FocusHandle, IntoElement, Render, Role, Stateful,
-    StatefulInteractiveElement as _, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb,
-    size,
+    App, Bounds, Context, Div, Entity, FocusHandle, IntoElement, Render, Role, Stateful,
+    StatefulInteractiveElement as _, StyleRefinement, Window, WindowBounds, WindowOptions, div,
+    prelude::*, px, rgb, size,
 };
 use gpui_mcp::{Automation, BridgeConfig, BridgeHandle};
 
@@ -26,8 +26,36 @@ struct Demo {
     locked: bool,
     search: FocusHandle,
     filter: FocusHandle,
+    probes: [Entity<ProbeRegion>; 2],
     automation: Automation,
     _bridge: BridgeHandle,
+}
+
+/// One region drawn as its own cached view, the way a workbench draws each of
+/// its panels. Hovering its control notifies this view alone, so a frame report
+/// taken across the hover should show this region rendering and its sibling
+/// replaying from cache. Anything that renders both, such as a window refresh,
+/// is visible in the report as the cause of the sibling's render.
+struct ProbeRegion {
+    id: &'static str,
+    target: &'static str,
+    label: &'static str,
+}
+
+impl Render for ProbeRegion {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().id(self.id).size_full().flex().items_center().child(
+            div()
+                .id(self.target)
+                .px_4()
+                .py_2()
+                .rounded_md()
+                .bg(rgb(0x22_28_33))
+                .hover(|style| style.bg(rgb(0x39_42_53)))
+                .child(self.label)
+                .aria_label(self.label),
+        )
+    }
 }
 
 /// One keyboard-focusable field carrying the two shapes of visual change a
@@ -213,6 +241,16 @@ impl Render for Demo {
                     ),
             )
             .child(self.lock_row(cx))
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .children(self.probes.iter().map(|probe| {
+                        probe
+                            .clone()
+                            .cached(StyleRefinement::default().w(px(200.0)).h(px(40.0)))
+                    })),
+            )
             .role(Role::Application)
             .aria_label(TITLE)
     }
@@ -262,6 +300,18 @@ fn main() {
                     locked: true,
                     search: cx.focus_handle(),
                     filter: cx.focus_handle(),
+                    probes: [
+                        cx.new(|_| ProbeRegion {
+                            id: "probe-left",
+                            target: "probe-left-target",
+                            label: "Left probe",
+                        }),
+                        cx.new(|_| ProbeRegion {
+                            id: "probe-right",
+                            target: "probe-right-target",
+                            label: "Right probe",
+                        }),
+                    ],
                     automation,
                     _bridge: bridge,
                 })

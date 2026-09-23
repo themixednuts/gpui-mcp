@@ -17,11 +17,12 @@ use std::sync::Arc;
 pub use gpui_mcp_protocol::MouseButton;
 pub use gpui_mcp_protocol::{
     AppId, ApplicationCommandDescriptor, ApplicationCommandResult, BridgeError, ContextResource,
-    ContextResourceDescriptor, ErrorCode, InstanceId, LiveDocument, LiveDocumentDiagnostic,
-    LiveDocumentPreview, LiveDocumentSource, LogEntry, MAX_LABEL_BYTES,
+    ContextResourceDescriptor, Distribution, ErrorCode, FrameReport, FrameSample, FrameStats,
+    FrameSummary, InstanceId, LiveDocument, LiveDocumentDiagnostic, LiveDocumentPreview,
+    LiveDocumentSource, LogEntry, MAX_FRAME_SAMPLES, MAX_FRAME_VIEWS, MAX_LABEL_BYTES,
     MAX_LIVE_DOCUMENT_DIAGNOSTICS, MAX_LIVE_DOCUMENT_SOURCE_BYTES, MAX_TEXT_BYTES, NativeWindowId,
     NodeAction, NodeState, Point, ProcessId, Rect, RequestId, Role, TextInfo, TextRange, UiNode,
-    UiTree, ValueInfo,
+    UiTree, ValueInfo, ViewActivity, ViewDraw, ViewOutcome, ViewRenderCause,
 };
 pub use service::{
     ApplicationCommandRequest, ApplicationCommandResponse, BridgeConfig, BridgeConfigError,
@@ -83,6 +84,9 @@ impl Automation {
     }
 
     /// Return the most recently completed semantic frame.
+    ///
+    /// A frame is converted into a tree when it is first read rather than while it is drawn,
+    /// so the first read after a frame pays for that conversion.
     #[must_use]
     pub fn snapshot(&self) -> UiTree {
         self.state.tree()
@@ -90,11 +94,36 @@ impl Automation {
 
     /// Return the generation of the most recently completed semantic frame without cloning it.
     ///
-    /// Consumers that maintain a small derived view of the semantic tree can use this as a cheap
-    /// invalidation guard and call [`Self::snapshot`] only after the generation changes.
+    /// Consumers that maintain a small derived view of the semantic tree can use this as an
+    /// invalidation guard and call [`Self::snapshot`] only after the generation changes. The
+    /// first call after a frame converts that frame, as [`Self::snapshot`] would.
     #[must_use]
     pub fn semantic_generation(&self) -> u64 {
         self.state.tree_generation()
+    }
+
+    /// Return timing statistics for the frames completed since the last mark.
+    #[must_use]
+    pub fn frame_stats(&self) -> FrameStats {
+        self.state.frame_stats()
+    }
+
+    /// Start a measurement window at the last completed frame.
+    ///
+    /// [`Self::frame_stats`] and [`Self::frame_report`] then cover only later frames. Call this
+    /// between draws, for example from an event handler, so no frame straddles the mark.
+    pub fn mark_frames(&self) {
+        self.state.mark_frames();
+    }
+
+    /// Return per-frame samples, percentiles, and view-cache activity for retained frames
+    /// completed after `after_frame_count`, or after the last mark when it is `None`.
+    ///
+    /// At most `frame_limit` per-frame samples are returned, the most recent last; the summary
+    /// and view activity cover every retained frame.
+    #[must_use]
+    pub fn frame_report(&self, after_frame_count: Option<u64>, frame_limit: usize) -> FrameReport {
+        self.state.frame_report(after_frame_count, frame_limit)
     }
 
     /// Return the count of the most recently completed root-paint frame.

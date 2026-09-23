@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use gpui_mcp_protocol::{
-    BridgeResult, Capability, ContextResourceDescriptor, FrameStats, Highlight, InputCommand,
-    LiveDocumentSource, MouseButton, NodeAction, NodeState, Operation, Point, PointerCommand,
-    PointerScrollDelta, Rect, Role, Screenshot, ScreenshotTarget, UiNode, UiTree, ValueInfo,
+    BridgeResult, Capability, ContextResourceDescriptor, FrameReport, FrameStats, Highlight,
+    InputCommand, LiveDocumentSource, MouseButton, NodeAction, NodeState, Operation, Point,
+    PointerCommand, PointerScrollDelta, Rect, Role, Screenshot, ScreenshotTarget, UiNode, UiTree,
+    ValueInfo,
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use rmcp::{
@@ -365,6 +366,18 @@ struct RecordPerformanceArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct FrameReportArgs {
+    /// Report frames completed after this `frame_count` token instead of after the last
+    /// `mark_frames`.
+    since_frame_count: Option<u64>,
+    /// Maximum per-frame samples returned, most recent last, from 1 through 512. The summary
+    /// and view activity cover every retained frame either way.
+    #[serde(default = "default_frame_limit")]
+    #[schemars(range(min = 1, max = 512))]
+    frame_limit: u16,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct LogsArgs {
     /// Maximum entries, capped at 512.
     #[serde(default = "default_log_limit")]
@@ -417,7 +430,7 @@ impl GpuiMcp {
 
     async fn ack_after_frame(&self, operation: Operation) -> Result<(), String> {
         self.ack(operation).await?;
-        self.settle_after_refresh(Duration::from_secs(2)).await?;
+        self.settle_pending(Duration::from_secs(2)).await?;
         Ok(())
     }
 
@@ -631,12 +644,18 @@ impl GpuiMcp {
         }
     }
 
-    async fn settle_after_refresh(&self, wait: Duration) -> Result<FrameStats, String> {
-        settle_refresh_frames(wait, |operation| self.call(operation)).await
+    /// Wait for the frames already pending to be drawn, and for no others.
+    async fn settle_pending(&self, wait: Duration) -> Result<FrameStats, String> {
+        settle_pending_frames(wait, |operation| self.call(operation)).await
+    }
+
+    /// Draw fresh frames even if nothing is pending, replaying cached views.
+    async fn settle_requested_frames(&self, wait: Duration) -> Result<FrameStats, String> {
+        settle_requested_frames(wait, |operation| self.call(operation)).await
     }
 
     async fn capture(&self, target: ScreenshotTarget) -> Result<Screenshot, String> {
-        self.settle_after_refresh(Duration::from_secs(2)).await?;
+        self.settle_requested_frames(Duration::from_secs(2)).await?;
         let client = self.client().await?;
         crate::capture::capture(&client, target).await
     }
@@ -666,9 +685,68 @@ impl GpuiMcp {
             _ => Err("bridge returned the wrong result for frame statistics".to_owned()),
         }
     }
+
+    async fn frame_report(
+        &self,
+        after_frame_count: Option<u64>,
+        frame_limit: u16,
+    ) -> Result<FrameReport, String> {
+        match self
+            .call(Operation::GetFrameReport {
+                after_frame_count,
+                frame_limit,
+            })
+            .await?
+        {
+            BridgeResult::FrameReport(report) => Ok(report),
+            _ => Err("bridge returned the wrong result for the frame report".to_owned()),
+        }
+    }
 }
 
-async fn settle_refresh_frames<F, Fut>(wait: Duration, mut call: F) -> Result<FrameStats, String>
+/// Frames an input may cause before settlement stops waiting, so a window that
+/// animates, and is therefore always pending, still settles.
+const MAX_SETTLE_FRAMES: usize = 4;
+
+/// Wait until the window has drawn every frame that was pending, without asking
+/// for any frame itself.
+///
+/// Injected input invalidates only what the same input from the platform would,
+/// so the frames it causes are exactly the frames it costs. Settling by
+/// requesting frames instead would add frames the input never caused to every
+/// measurement.
+async fn settle_pending_frames<F, Fut>(wait: Duration, mut call: F) -> Result<FrameStats, String>
+where
+    F: FnMut(Operation) -> Fut,
+    Fut: Future<Output = Result<BridgeResult, String>>,
+{
+    let timeout_ms = u64::try_from(wait.as_millis())
+        .unwrap_or(MAX_WAIT_MS)
+        .clamp(1, MAX_WAIT_MS);
+    let mut completed = None;
+    for _ in 0..MAX_SETTLE_FRAMES {
+        let BridgeResult::PendingFrame(pending) = call(Operation::GetPendingFrame).await? else {
+            return Err("bridge returned the wrong result for the pending frame".to_owned());
+        };
+        if !pending.pending {
+            return Ok(pending.completed);
+        }
+        let BridgeResult::FrameStats(stats) = call(Operation::WaitForFrame {
+            after_frame_count: pending.completed.frame_count,
+            timeout_ms,
+        })
+        .await?
+        else {
+            return Err("bridge returned the wrong result for frame wait".to_owned());
+        };
+        completed = Some(stats);
+    }
+    completed.ok_or_else(|| "frame settlement did not observe a frame".to_owned())
+}
+
+/// Draw two fresh frames, whether or not anything is pending. Cached views that
+/// were not notified replay, so these frames cost what an idle frame costs.
+async fn settle_requested_frames<F, Fut>(wait: Duration, mut call: F) -> Result<FrameStats, String>
 where
     F: FnMut(Operation) -> Fut,
     Fut: Future<Output = Result<BridgeResult, String>>,
@@ -678,11 +756,13 @@ where
         .clamp(1, MAX_WAIT_MS);
     let mut completed = None;
     for _ in 0..2 {
-        let BridgeResult::FrameStats(before_refresh) = call(Operation::Refresh).await? else {
-            return Err("bridge returned the wrong completed-frame token for refresh".to_owned());
+        let BridgeResult::FrameStats(before_request) = call(Operation::RequestFrame).await? else {
+            return Err(
+                "bridge returned the wrong completed-frame token for a frame request".to_owned(),
+            );
         };
         let BridgeResult::FrameStats(stats) = call(Operation::WaitForFrame {
-            after_frame_count: before_refresh.frame_count,
+            after_frame_count: before_request.frame_count,
             timeout_ms,
         })
         .await?
@@ -691,7 +771,7 @@ where
         };
         completed = Some(stats);
     }
-    completed.ok_or_else(|| "frame settlement did not request a refresh".to_owned())
+    completed.ok_or_else(|| "frame settlement did not request a frame".to_owned())
 }
 
 /// SEP-2549 cache hints on the results a peer negotiating protocol version
@@ -896,6 +976,10 @@ fn default_highlight_color() -> String {
 
 fn default_log_limit() -> u16 {
     100
+}
+
+fn default_frame_limit() -> u16 {
+    64
 }
 
 fn validate_pointer_point(point: Point) -> Result<(), String> {
@@ -1149,12 +1233,23 @@ fn encode_image(image: RgbaImage) -> Result<Screenshot, String> {
     })
 }
 
+/// Mean application render work per frame: GPUI's whole draw less the bridge's
+/// own observation, or prepaint plus paint from a bridge that reports no draw.
+fn average_render_work_ms(stats: &FrameStats) -> f64 {
+    if stats.draw_average_ms > 0.0 {
+        (stats.draw_average_ms - stats.bridge_average_ms).max(0.0)
+    } else {
+        stats.prepaint_average_ms + stats.root_paint_average_ms
+    }
+}
+
 fn performance_assessment(stats: &FrameStats) -> &'static str {
+    let render_work_ms = average_render_work_ms(stats);
     if stats.sample_count == 0 {
         "no frame samples have been observed"
-    } else if stats.prepaint_average_ms + stats.root_paint_average_ms <= 16.67 {
+    } else if render_work_ms <= 16.67 {
         "average measured render work is within a 60 FPS frame budget"
-    } else if stats.prepaint_average_ms + stats.root_paint_average_ms <= 33.33 {
+    } else if render_work_ms <= 33.33 {
         "average measured render work is within a 30 FPS frame budget but above a 60 FPS budget"
     } else {
         "average measured render work is above a 30 FPS frame budget"
@@ -1197,56 +1292,82 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use gpui_mcp_protocol::{BridgeResult, FrameStats, NodeState, Operation, UiNode};
+    use gpui_mcp_protocol::{BridgeResult, FrameStats, NodeState, Operation, PendingFrame, UiNode};
     use serde_json::json;
 
     use super::{
-        FindArgs, Role, StartVideoRecordingArgs, UiTree, WaitStateArgs,
-        default_result_limit_for_test, find_nodes, settle_refresh_frames, state_matches, tree_diff,
+        FindArgs, MAX_SETTLE_FRAMES, Role, StartVideoRecordingArgs, UiTree, WaitStateArgs,
+        default_result_limit_for_test, find_nodes, settle_pending_frames, settle_requested_frames,
+        state_matches, tree_diff,
     };
 
-    #[tokio::test]
-    async fn mutation_settlement_waits_from_each_refresh_token() -> Result<(), String> {
-        let operations = Arc::new(Mutex::new(Vec::new()));
-        let responses = Arc::new(Mutex::new(VecDeque::from([
-            Ok(BridgeResult::FrameStats(FrameStats {
-                frame_count: 11,
+    fn stats(frame_count: u64) -> BridgeResult {
+        BridgeResult::FrameStats(FrameStats {
+            frame_count,
+            ..FrameStats::default()
+        })
+    }
+
+    fn pending(pending: bool, frame_count: u64) -> BridgeResult {
+        BridgeResult::PendingFrame(PendingFrame {
+            pending,
+            completed: FrameStats {
+                frame_count,
                 ..FrameStats::default()
-            })),
-            Ok(BridgeResult::FrameStats(FrameStats {
-                frame_count: 12,
-                ..FrameStats::default()
-            })),
-            Ok(BridgeResult::FrameStats(FrameStats {
-                frame_count: 14,
-                ..FrameStats::default()
-            })),
-            Ok(BridgeResult::FrameStats(FrameStats {
-                frame_count: 15,
-                ..FrameStats::default()
-            })),
-        ])));
-        let recorded = operations.clone();
-        let queued = responses.clone();
-        let settled = settle_refresh_frames(Duration::from_secs(2), move |operation| {
-            recorded
+            },
+        })
+    }
+
+    /// Records every operation and answers from a script.
+    #[derive(Clone)]
+    struct Script {
+        operations: Arc<Mutex<Vec<Operation>>>,
+        responses: Arc<Mutex<VecDeque<BridgeResult>>>,
+    }
+
+    impl Script {
+        fn new(responses: impl IntoIterator<Item = BridgeResult>) -> Self {
+            Self {
+                operations: Arc::new(Mutex::new(Vec::new())),
+                responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+            }
+        }
+
+        fn call(
+            &self,
+            operation: Operation,
+        ) -> impl std::future::Future<Output = Result<BridgeResult, String>> + use<> {
+            self.operations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(operation);
-            let response = queued
+            let response = self
+                .responses
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .pop_front()
-                .unwrap_or_else(|| Err("test response queue exhausted".to_owned()));
+                .ok_or_else(|| "test response queue exhausted".to_owned());
             async move { response }
-        })
-        .await?;
+        }
+
+        fn operations(&self) -> Vec<Operation> {
+            self.operations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn requested_settlement_waits_from_each_request_token() -> Result<(), String> {
+        let script = Script::new([stats(11), stats(12), stats(14), stats(15)]);
+        let settled =
+            settle_requested_frames(Duration::from_secs(2), |operation| script.call(operation))
+                .await?;
 
         assert_eq!(settled.frame_count, 15);
-        let operations = operations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(matches!(operations[0], Operation::Refresh));
+        let operations = script.operations();
+        assert!(matches!(operations[0], Operation::RequestFrame));
         assert!(matches!(
             operations[1],
             Operation::WaitForFrame {
@@ -1254,7 +1375,7 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(operations[2], Operation::Refresh));
+        assert!(matches!(operations[2], Operation::RequestFrame));
         assert!(matches!(
             operations[3],
             Operation::WaitForFrame {
@@ -1262,6 +1383,80 @@ mod tests {
                 ..
             }
         ));
+        assert!(
+            operations
+                .iter()
+                .all(|operation| !matches!(operation, Operation::Refresh)),
+            "settling must never discard every cached view"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_settlement_draws_nothing_when_nothing_is_pending() -> Result<(), String> {
+        let script = Script::new([pending(false, 7)]);
+        let settled =
+            settle_pending_frames(Duration::from_secs(2), |operation| script.call(operation))
+                .await?;
+
+        assert_eq!(settled.frame_count, 7);
+        assert!(matches!(
+            script.operations().as_slice(),
+            [Operation::GetPendingFrame]
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_settlement_waits_for_each_pending_frame() -> Result<(), String> {
+        let script = Script::new([
+            pending(true, 7),
+            stats(8),
+            pending(true, 8),
+            stats(9),
+            pending(false, 9),
+        ]);
+        let settled =
+            settle_pending_frames(Duration::from_secs(2), |operation| script.call(operation))
+                .await?;
+
+        assert_eq!(settled.frame_count, 9);
+        let operations = script.operations();
+        assert!(matches!(
+            operations[1],
+            Operation::WaitForFrame {
+                after_frame_count: 7,
+                ..
+            }
+        ));
+        assert!(matches!(
+            operations[3],
+            Operation::WaitForFrame {
+                after_frame_count: 8,
+                ..
+            }
+        ));
+        assert!(
+            operations.iter().all(|operation| !matches!(
+                operation,
+                Operation::Refresh | Operation::RequestFrame
+            ))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_settlement_gives_up_on_a_window_that_always_animates() -> Result<(), String> {
+        let script = Script::new(
+            (0..MAX_SETTLE_FRAMES as u64)
+                .flat_map(|frame| [pending(true, frame), stats(frame + 1)]),
+        );
+        let settled =
+            settle_pending_frames(Duration::from_secs(2), |operation| script.call(operation))
+                .await?;
+
+        assert_eq!(settled.frame_count, MAX_SETTLE_FRAMES as u64);
+        assert_eq!(script.operations().len(), MAX_SETTLE_FRAMES * 2);
         Ok(())
     }
 
@@ -1369,6 +1564,8 @@ mod tests {
                 "list_app_commands",
                 "execute_app_command",
                 "get_frame_stats",
+                "mark_frames",
+                "get_frame_report",
                 "record_performance",
                 "get_performance_report",
                 "get_logs",

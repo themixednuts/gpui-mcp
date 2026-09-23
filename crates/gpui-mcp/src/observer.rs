@@ -4,13 +4,16 @@ use std::{
 };
 
 use gpui::{
-    AccessibilityFrame, App, BorderStyle, FrameAction, FrameNode, FrameObserver, Window,
+    AccessibilityFrame, App, BorderStyle, DrawnFrame, FrameAction, FrameNode, FrameObserver,
+    ViewDrawOutcome, Window,
     accesskit::{self, Action, Role as AccessibleRole, Toggled},
     outline, point, px, rgba, size,
 };
-use gpui_mcp_protocol::{NodeAction, NodeState, Role, TextInfo, UiNode, ValueInfo};
+use gpui_mcp_protocol::{
+    NodeAction, NodeState, Role, TextInfo, UiNode, ValueInfo, ViewRenderCause,
+};
 
-use crate::registry::{SharedState, rect_from_gpui};
+use crate::registry::{SharedState, ViewRecord, rect_from_gpui};
 
 pub(crate) struct BridgeObserver {
     state: Weak<SharedState>,
@@ -35,27 +38,10 @@ impl FrameObserver for BridgeObserver {
         state.set_window_geometry(rect_from_gpui(content_bounds), window.scale_factor());
     }
 
-    fn accessibility_updated(&self, frame: &AccessibilityFrame) {
-        let Some(state) = self.state.upgrade() else {
-            return;
-        };
-        let mut nodes = frame.nodes().map(|(_, node)| node).collect::<Vec<_>>();
-        nodes.sort_by(|left, right| left.path().cmp(right.path()));
-        let mut hidden = HashSet::<String>::new();
-        state.publish_frame(nodes.into_iter().map(|node| {
-            let inherited_hidden = node.parent().is_some_and(|parent| hidden.contains(parent));
-            let own_hidden = frame
-                .accessibility_node(node)
-                .is_some_and(accesskit::Node::is_hidden);
-            let mut result = to_node(frame, node);
-            if inherited_hidden {
-                result.state.visible = false;
-            }
-            if inherited_hidden || own_hidden {
-                hidden.insert(result.id.clone());
-            }
-            result
-        }));
+    fn accessibility_frame(&self, frame: &Arc<AccessibilityFrame>) {
+        if let Some(state) = self.state.upgrade() {
+            state.observe_semantics(frame);
+        }
     }
 
     fn paint_started(&self) {
@@ -89,6 +75,62 @@ impl FrameObserver for BridgeObserver {
             state.finish_root_paint();
         }
     }
+
+    fn frame_drawn(&self, frame: &DrawnFrame<'_>) {
+        if let Some(state) = self.state.upgrade() {
+            state.finish_draw(
+                frame.draw_duration(),
+                frame.observation_duration(),
+                frame.views().iter().map(|view| ViewRecord {
+                    entity_id: view.entity_id().as_u64(),
+                    type_name: view.type_name(),
+                    cause: match view.outcome() {
+                        ViewDrawOutcome::Reused => None,
+                        ViewDrawOutcome::Rendered(cause) => Some(render_cause(cause)),
+                    },
+                }),
+            );
+        }
+    }
+}
+
+const fn render_cause(cause: gpui::ViewRenderCause) -> ViewRenderCause {
+    match cause {
+        gpui::ViewRenderCause::Uncached => ViewRenderCause::Uncached,
+        gpui::ViewRenderCause::CachingDisabled => ViewRenderCause::CachingDisabled,
+        gpui::ViewRenderCause::Refresh => ViewRenderCause::Refresh,
+        gpui::ViewRenderCause::FirstDraw => ViewRenderCause::FirstDraw,
+        gpui::ViewRenderCause::Notified => ViewRenderCause::Notified,
+        gpui::ViewRenderCause::AncestorRendered => ViewRenderCause::AncestorRendered,
+        gpui::ViewRenderCause::LayoutChanged => ViewRenderCause::LayoutChanged,
+    }
+}
+
+/// Convert one observed frame into semantic nodes, parents before children.
+///
+/// This runs when a client reads the tree rather than during the draw, so its
+/// cost never lands inside a measured frame.
+pub(crate) fn semantic_nodes(frame: &AccessibilityFrame) -> Vec<UiNode> {
+    let mut nodes = frame.nodes().map(|(_, node)| node).collect::<Vec<_>>();
+    nodes.sort_by(|left, right| left.path().cmp(right.path()));
+    let mut hidden = HashSet::<String>::new();
+    nodes
+        .into_iter()
+        .map(|node| {
+            let inherited_hidden = node.parent().is_some_and(|parent| hidden.contains(parent));
+            let own_hidden = frame
+                .accessibility_node(node)
+                .is_some_and(accesskit::Node::is_hidden);
+            let mut result = to_node(frame, node);
+            if inherited_hidden {
+                result.state.visible = false;
+            }
+            if inherited_hidden || own_hidden {
+                hidden.insert(result.id.clone());
+            }
+            result
+        })
+        .collect()
 }
 
 fn to_node(frame: &AccessibilityFrame, rendered: &FrameNode) -> UiNode {
@@ -356,10 +398,13 @@ mod tests {
 
     use gpui::{
         AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-        Render, Role, SharedString, StatefulInteractiveElement as _, Styled as _, StyledText,
-        TestAppContext, Window, div, px,
+        Render, Role, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
+        StyledText, TestAppContext, Window, div, px, rgb,
     };
-    use gpui_mcp_protocol::{MouseButton, NodeAction, Point, PointerCommand, Role as McpRole};
+    use gpui_mcp_protocol::{
+        MouseButton, NodeAction, Point, PointerCommand, Role as McpRole, ViewOutcome,
+        ViewRenderCause,
+    };
 
     use crate::{Automation, input::dispatch_pointer};
 
@@ -627,6 +672,358 @@ mod tests {
             .collect::<Vec<_>>();
         titles.sort();
         assert_eq!(titles, ["Console", "Hierarchy"]);
+    }
+
+    /// One workbench region drawn as its own cached view, with a control that
+    /// restyles itself on hover.
+    struct HoverPanel {
+        target: &'static str,
+        label: &'static str,
+    }
+
+    impl Render for HoverPanel {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                div()
+                    .id(self.target)
+                    .w(px(120.))
+                    .h(px(40.))
+                    .bg(rgb(0x20_20_20))
+                    .hover(|style| style.bg(rgb(0x40_40_40)))
+                    .active(|style| style.bg(rgb(0x60_60_60)))
+                    .on_click(|_, _, _| {})
+                    .tooltip(|_, cx| cx.new(|_| PanelTooltip).into())
+                    .child(self.label),
+            )
+        }
+    }
+
+    struct PanelTooltip;
+
+    impl Render for PanelTooltip {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().id("panel-tooltip").child("Tooltip")
+        }
+    }
+
+    /// Two cached regions, one of them inside a button whose label is the
+    /// region's text, so the label depends on text a replayed region supplies.
+    struct CachedRegions {
+        left: Entity<HoverPanel>,
+        right: Entity<HoverPanel>,
+    }
+
+    impl Render for CachedRegions {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let region = || StyleRefinement::default().w(px(200.)).h(px(100.));
+            div()
+                .id("root")
+                .role(Role::Application)
+                .size_full()
+                .flex()
+                .child(self.left.clone().cached(region()))
+                .child(
+                    div()
+                        .id("right-group")
+                        .role(Role::Button)
+                        .child(self.right.clone().cached(region())),
+                )
+                .child(div().id("parking").w(px(100.)).h(px(100.)))
+        }
+    }
+
+    fn move_pointer(visual: &mut gpui::VisualTestContext, point: Point) {
+        visual.update(|window, cx| {
+            assert_eq!(
+                dispatch_pointer(
+                    &PointerCommand::MouseMove {
+                        point,
+                        pressed_button: None,
+                    },
+                    window,
+                    cx,
+                ),
+                Ok(())
+            );
+        });
+        visual.run_until_parked();
+    }
+
+    fn outcome(
+        report: &gpui_mcp_protocol::FrameReport,
+        entity_id: gpui::EntityId,
+    ) -> Option<(ViewOutcome, Option<ViewRenderCause>)> {
+        report
+            .last_frame_views
+            .iter()
+            .find(|view| view.entity_id == entity_id.as_u64())
+            .map(|view| (view.outcome, view.cause))
+    }
+
+    fn press(visual: &mut gpui::VisualTestContext, point: Point, down: bool) {
+        visual.update(|window, cx| {
+            let command = if down {
+                PointerCommand::MouseDown {
+                    point,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                }
+            } else {
+                PointerCommand::MouseUp {
+                    point,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                }
+            };
+            assert_eq!(dispatch_pointer(&command, window, cx), Ok(()));
+        });
+        visual.run_until_parked();
+    }
+
+    /// Open the two-region fixture, park the pointer, and return the root and
+    /// the two region entities with the centers of the parking spot and the
+    /// left region's control.
+    fn open_cached_regions<'a>(
+        cx: &'a mut TestAppContext,
+        automation: &Automation,
+    ) -> (
+        &'a mut gpui::VisualTestContext,
+        [gpui::EntityId; 3],
+        Point,
+        Point,
+    ) {
+        let automation_for_window = automation.clone();
+        let (root, visual) = cx.add_window_view(move |window, cx| {
+            automation_for_window.attach(window);
+            CachedRegions {
+                left: cx.new(|_| HoverPanel {
+                    target: "left-target",
+                    label: "Left",
+                }),
+                right: cx.new(|_| HoverPanel {
+                    target: "right-target",
+                    label: "Right",
+                }),
+            }
+        });
+        visual.run_until_parked();
+        let (left, right) = root.read_with(visual, |regions, _| {
+            (regions.left.entity_id(), regions.right.entity_id())
+        });
+        let tree = automation.snapshot();
+        let center = |id: &str| tree.nodes[id].bounds.unwrap_or_default().center();
+        let parking = center("parking");
+        let target = center("left-target");
+        move_pointer(visual, parking);
+        (visual, [root.entity_id(), left, right], parking, target)
+    }
+
+    /// Every frame since the mark rendered `rendered` because it was notified
+    /// and replayed `reused`, and none refreshed the window.
+    fn only_notified(
+        report: &gpui_mcp_protocol::FrameReport,
+        rendered: gpui::EntityId,
+        reused: gpui::EntityId,
+    ) {
+        assert!(report.summary.frames > 0, "the interaction drew no frame");
+        let view = |entity: gpui::EntityId| {
+            report
+                .views
+                .iter()
+                .find(|view| view.entity_id == entity.as_u64())
+                .cloned()
+                .unwrap_or_default()
+        };
+        let rendered = view(rendered);
+        assert_eq!(
+            rendered.causes.keys().copied().collect::<Vec<_>>(),
+            [ViewRenderCause::Notified],
+            "{:?}",
+            report.views
+        );
+        let reused = view(reused);
+        assert_eq!(
+            (reused.rendered, reused.reused),
+            (0, report.summary.frames),
+            "the untouched region replays in every frame: {:?}",
+            report.views
+        );
+        assert!(
+            report
+                .views
+                .iter()
+                .all(|view| !view.causes.contains_key(&ViewRenderCause::Refresh)),
+            "{:?}",
+            report.views
+        );
+    }
+
+    #[gpui::test]
+    fn a_click_redraws_only_the_clicked_cached_view(cx: &mut TestAppContext) {
+        let automation = Automation::isolated();
+        let (visual, [_, left, right], _, target) = open_cached_regions(cx, &automation);
+        move_pointer(visual, target);
+
+        automation.mark_frames();
+        press(visual, target, true);
+        press(visual, target, false);
+        only_notified(&automation.frame_report(None, 16), left, right);
+    }
+
+    #[gpui::test]
+    fn a_tooltip_redraws_only_the_view_that_shows_it(cx: &mut TestAppContext) {
+        let executor = cx.executor();
+        let automation = Automation::isolated();
+        let (visual, [_, left, right], parking, target) = open_cached_regions(cx, &automation);
+        move_pointer(visual, target);
+
+        automation.mark_frames();
+        executor.advance_clock(std::time::Duration::from_secs(2));
+        visual.run_until_parked();
+        assert!(
+            automation.snapshot().nodes.contains_key("panel-tooltip"),
+            "the tooltip must have been shown"
+        );
+        only_notified(&automation.frame_report(None, 16), left, right);
+
+        automation.mark_frames();
+        move_pointer(visual, parking);
+        executor.advance_clock(std::time::Duration::from_secs(2));
+        visual.run_until_parked();
+        assert!(
+            !automation.snapshot().nodes.contains_key("panel-tooltip"),
+            "the tooltip must have been hidden"
+        );
+        only_notified(&automation.frame_report(None, 16), left, right);
+    }
+
+    #[gpui::test]
+    fn a_hover_redraws_only_the_hovered_cached_view(cx: &mut TestAppContext) {
+        let automation = Automation::isolated();
+        let automation_for_window = automation.clone();
+        let (root, visual) = cx.add_window_view(move |window, cx| {
+            automation_for_window.attach(window);
+            CachedRegions {
+                left: cx.new(|_| HoverPanel {
+                    target: "left-target",
+                    label: "Left",
+                }),
+                right: cx.new(|_| HoverPanel {
+                    target: "right-target",
+                    label: "Right",
+                }),
+            }
+        });
+        visual.run_until_parked();
+        let (left, right) = root.read_with(visual, |regions, _| {
+            (regions.left.entity_id(), regions.right.entity_id())
+        });
+
+        let tree = automation.snapshot();
+        let center = |id: &str| tree.nodes[id].bounds.unwrap_or_default().center();
+        let parking = center("parking");
+        let left_target = center("left-target");
+        assert_eq!(tree.nodes["right-group"].label.as_deref(), Some("Right"));
+
+        // Park the pointer inside the window first, so the measured move only
+        // changes which control is hovered.
+        move_pointer(visual, parking);
+        automation.mark_frames();
+        move_pointer(visual, left_target);
+
+        let report = automation.frame_report(None, 16);
+        assert_eq!(
+            report.summary.frames, 1,
+            "one hover is one frame, got {:?}",
+            report.frames
+        );
+        assert_eq!(
+            outcome(&report, left),
+            Some((ViewOutcome::Rendered, Some(ViewRenderCause::Notified))),
+            "the hovered region renders because its hover state changed"
+        );
+        assert_eq!(
+            outcome(&report, right),
+            Some((ViewOutcome::Reused, None)),
+            "the other region replays its previous frame: {:?}",
+            report.last_frame_views
+        );
+        assert_eq!(
+            outcome(&report, root.entity_id()),
+            Some((ViewOutcome::Rendered, Some(ViewRenderCause::Uncached)))
+        );
+        let frame = &report.frames[0];
+        assert_eq!(frame.views_rendered, 2);
+        assert_eq!(frame.views_reused, 1);
+        assert!(frame.draw_ms > 0.0);
+        assert!(frame.bridge_ms <= frame.draw_ms);
+        assert!(
+            report
+                .views
+                .iter()
+                .any(|view| view.entity_id == left.as_u64()
+                    && view.type_name.ends_with("HoverPanel")),
+            "views are named by their Render type: {:?}",
+            report.views
+        );
+
+        let tree = automation.snapshot();
+        assert_eq!(
+            tree.nodes["right-group"].label.as_deref(),
+            Some("Right"),
+            "a replayed region still supplies its text to the nodes around it"
+        );
+
+        // A full refresh, which injected input used to request, renders both.
+        automation.mark_frames();
+        visual.update(|window, _| window.refresh());
+        visual.run_until_parked();
+        let report = automation.frame_report(None, 16);
+        assert_eq!(
+            outcome(&report, right),
+            Some((ViewOutcome::Rendered, Some(ViewRenderCause::Refresh)))
+        );
+        assert_eq!(
+            automation.snapshot().nodes["right-group"].label.as_deref(),
+            Some("Right")
+        );
+    }
+
+    #[gpui::test]
+    fn a_requested_frame_replays_every_cached_view(cx: &mut TestAppContext) {
+        let automation = Automation::isolated();
+        let automation_for_window = automation.clone();
+        let (root, visual) = cx.add_window_view(move |window, cx| {
+            automation_for_window.attach(window);
+            CachedRegions {
+                left: cx.new(|_| HoverPanel {
+                    target: "left-target",
+                    label: "Left",
+                }),
+                right: cx.new(|_| HoverPanel {
+                    target: "right-target",
+                    label: "Right",
+                }),
+            }
+        });
+        visual.run_until_parked();
+        let (left, right) = root.read_with(visual, |regions, _| {
+            (regions.left.entity_id(), regions.right.entity_id())
+        });
+
+        automation.mark_frames();
+        visual.update(|window, _| {
+            assert!(!window.frame_pending());
+            window.request_frame();
+            assert!(window.frame_pending());
+        });
+        visual.run_until_parked();
+        visual.update(|window, _| assert!(!window.frame_pending()));
+
+        let report = automation.frame_report(None, 16);
+        assert_eq!(report.summary.frames, 1);
+        assert_eq!(outcome(&report, left), Some((ViewOutcome::Reused, None)));
+        assert_eq!(outcome(&report, right), Some((ViewOutcome::Reused, None)));
     }
 
     /// A view whose two nested element ids spell, when joined, an element id

@@ -15,9 +15,10 @@ use gpui_mcp_protocol::{
     ErrorCode, Highlight, InstanceId, LiveDocument, LiveDocumentPreview, LiveDocumentSource,
     LocalEndpoint, MAX_APPLICATION_COMMAND_OUTPUT_BYTES, MAX_APPLICATION_COMMAND_SCHEMA_BYTES,
     MAX_APPLICATION_COMMANDS, MAX_CONTEXT_RESOURCE_BYTES, MAX_CONTEXT_RESOURCE_URI_BYTES,
-    MAX_CONTEXT_RESOURCES, MAX_ID_BYTES, MAX_LABEL_BYTES, MAX_LIVE_DOCUMENT_DIAGNOSTICS,
-    MAX_LIVE_DOCUMENT_SOURCE_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MAX_WAIT_MS,
-    NativeWindowId, Operation, PROTOCOL_VERSION, ProcessId, WireRequest, WireResponse,
+    MAX_CONTEXT_RESOURCES, MAX_FRAME_SAMPLES, MAX_ID_BYTES, MAX_LABEL_BYTES,
+    MAX_LIVE_DOCUMENT_DIAGNOSTICS, MAX_LIVE_DOCUMENT_SOURCE_BYTES, MAX_REQUEST_BYTES,
+    MAX_RESPONSE_BYTES, MAX_WAIT_MS, NativeWindowId, Operation, PROTOCOL_VERSION, PendingFrame,
+    ProcessId, WireRequest, WireResponse,
 };
 use interprocess::local_socket::{
     GenericFilePath, GenericNamespaced, ListenerOptions, Name, ToFsName as _, ToNsName as _,
@@ -584,17 +585,16 @@ fn handle_ui_operation(
     cx: &mut App,
 ) -> Result<BridgeResult, BridgeError> {
     match operation {
+        // Injected input invalidates exactly what the same input from the platform would: its
+        // handlers notify the views they change, and nothing else. Refreshing the window here
+        // would render every cached view and report a whole-window redraw as the cost of, say,
+        // a hover. Callers settle the frames the input caused with `GetPendingFrame`.
         Operation::PointerInput { command } => {
             input::dispatch_pointer(&command, window, cx)?;
-            // Each primitive pointer event completes through the same painted-frame contract as
-            // keyboard input. Compound gestures issue one operation per event, so callers can
-            // deterministically settle a frame between drag moves without sleeping.
-            window.refresh();
             Ok(BridgeResult::Ack)
         }
         Operation::Input { command } => {
             input::dispatch_keyboard(command, window, cx)?;
-            window.refresh();
             Ok(BridgeResult::Ack)
         }
         Operation::Focus { node_id } => {
@@ -611,11 +611,24 @@ fn handle_ui_operation(
             window.refresh();
             Ok(BridgeResult::FrameStats(completed))
         }
+        Operation::RequestFrame => {
+            let completed = state.frame_stats();
+            window.request_frame();
+            Ok(BridgeResult::FrameStats(completed))
+        }
+        Operation::GetPendingFrame => Ok(BridgeResult::PendingFrame(PendingFrame {
+            pending: window.frame_pending(),
+            completed: state.frame_stats(),
+        })),
+        // Marked between draws, so no frame straddles the mark.
+        Operation::MarkFrames => Ok(BridgeResult::FrameStats(state.mark_frames())),
         Operation::GetPointerLocation => Ok(BridgeResult::PointerLocation(
             input::pointer_location(window),
         )),
+        // Highlights are painted by the observer's overlay pass, which runs after the scene on
+        // every frame whether or not views replay from cache, so a frame is all they need.
         Operation::ClearHighlights => {
-            window.refresh();
+            window.request_frame();
             Ok(BridgeResult::Ack)
         }
         Operation::GetLiveDocument => {
@@ -641,6 +654,8 @@ fn handle_ui_operation(
                 return Err(invalid_host_result("document"));
             };
             let preview = validate_live_document_preview(preview)?;
+            // A document host swaps state the bridge cannot see into, and need not notify the
+            // views that render it, so only a full refresh is sure to show the new revision.
             if preview.applied {
                 window.refresh();
             }
@@ -690,6 +705,7 @@ fn handle_ui_operation(
                 return Err(invalid_host_result("command"));
             }
             let result = validate_application_command_result(result)?;
+            // Like a document host, a command may change state no view was notified about.
             window.refresh();
             Ok(BridgeResult::ApplicationCommand(result))
         }
@@ -835,6 +851,7 @@ async fn read_request(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "request JSON is invalid"))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn process_request(request: WireRequest, context: ConnectionContext) -> WireResponse {
     if request.protocol_version != PROTOCOL_VERSION {
         return WireResponse::failure(
@@ -899,6 +916,14 @@ async fn process_request(request: WireRequest, context: ConnectionContext) -> Wi
             request_ui_refresh(&context.command_tx, context.operation_timeout).await
         }
         Operation::GetFrameStats => Ok(BridgeResult::FrameStats(context.state.frame_stats())),
+        Operation::GetFrameReport {
+            after_frame_count,
+            frame_limit,
+        } => Ok(BridgeResult::FrameReport(
+            context
+                .state
+                .frame_report(after_frame_count, usize::from(frame_limit)),
+        )),
         Operation::GetPointerLocation => {
             dispatch_to_ui(
                 Operation::GetPointerLocation,
@@ -918,6 +943,9 @@ async fn process_request(request: WireRequest, context: ConnectionContext) -> Wi
         | Operation::PointerInput { .. }
         | Operation::Focus { .. }
         | Operation::Refresh
+        | Operation::RequestFrame
+        | Operation::GetPendingFrame
+        | Operation::MarkFrames
         | Operation::GetLiveDocument
         | Operation::PreviewLiveDocument { .. }
         | Operation::ListContextResources
@@ -990,6 +1018,13 @@ fn validate_operation(operation: &Operation) -> Result<(), BridgeError> {
             if *timeout_ms == 0 || *timeout_ms > MAX_WAIT_MS =>
         {
             Err(invalid("frame wait timeout must be between 1 and 30000 ms"))
+        }
+        Operation::GetFrameReport { frame_limit, .. }
+            if *frame_limit == 0 || usize::from(*frame_limit) > MAX_FRAME_SAMPLES =>
+        {
+            Err(invalid(
+                "frame report limit must be between 1 and 512 frames",
+            ))
         }
         Operation::SetHighlights { highlights } => validate_highlights(highlights),
         Operation::GetLogs { limit, min_level } => {
