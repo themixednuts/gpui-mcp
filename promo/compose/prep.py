@@ -49,12 +49,43 @@ def speed(s):
 
 
 # integrate output frames
-INTRO, OUTRO = 7.0, 10.5
+BPM = float(sys.argv[3]) if len(sys.argv) > 3 else 122.0
+BEAT = 60.0 / BPM
+INTRO, OUTRO = 16 * BEAT, 20 * BEAT  # four bars in, five bars out
 session_map = []
 s = s_begin
 while s < s_end:
     session_map.append(round(s, 4))
     s += speed(s) / FPS
+
+
+def snap_to_grid(smap, cut_times, unit):
+    """Hold or drop frames just before each cut so it starts on the grid.
+
+    The frames before a chapter are the agent's idle pauses, so repeating or
+    skipping a few of them is invisible; no tool call is shortened.
+    """
+    out = list(smap)
+    for cut in cut_times:
+        i = next((k for k, v in enumerate(out) if v >= cut), None)
+        if i is None or i == 0:
+            continue
+        t = INTRO + i / FPS
+        target = INTRO + round((t - INTRO) / unit) * unit
+        delta = round((target - t) * FPS)
+        if delta > 0:
+            out[i:i] = [out[i - 1]] * delta
+        elif delta < 0:
+            del out[max(1, i + delta):i]
+    return out
+
+
+chapter_starts = [e["s"] for e in E if e["type"] == "chapter"]
+session_map = snap_to_grid(session_map, chapter_starts, BEAT)
+# end the session on a bar line
+bars = round(len(session_map) / FPS / (4 * BEAT))
+want = round(bars * 4 * BEAT * FPS)
+session_map = (session_map + [session_map[-1]] * want)[:want]
 
 chapters = [e for e in E if e["type"] == "chapter"]
 calls = [e for e in E if e["type"] == "call" and not e["quiet"]]
@@ -74,7 +105,7 @@ for c in calls:
             a[k] = v[:3] + [f"+{len(v) - 3} more"]
 
 T = {
-    "fps": FPS, "intro": INTRO, "outro": OUTRO, "session_map": session_map,
+    "fps": FPS, "bpm": BPM, "intro": INTRO, "outro": OUTRO, "session_map": session_map,
     "chapters": [{"s": c["s"], "n": c["n"], "title": c["title"], "sub": c["sub"]} for c in chapters],
     "calls": calls, "panels": [{k: v for k, v in p.items() if k != "t"} for p in panels],
     "pointer": pointer, "clicks": clicks, "quiet_count": quiet_count,
