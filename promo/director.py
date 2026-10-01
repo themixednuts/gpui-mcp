@@ -80,10 +80,6 @@ def audit(nodes):
     return unnamed, dead
 
 
-def status_text():
-    return m.call("get_element", {"id": "status-message"})["text"]["text"]
-
-
 # ---------------------------------------------------------------- session
 log("start")
 rec = call("start_video_recording", {"artifact_name": "ember-session.mp4", "overwrite": True},
@@ -98,11 +94,12 @@ log("chapter", n=1, title="See", sub="The agent reads the live UI as a semantic 
 beat(0.6)
 apps = call("list_apps", summary=lambda r: f"{r['count']} app · {r['apps'][0]['app_name']}")
 beat(1.2)
-t0 = time.time()
-nodes = tree()
-interactive = [k for k, n in nodes.items() if n["role"] in ("button", "text_input") and n["state"]["visible"]]
-EV.append({"t": t0, "t_end": time.time(), "type": "call", "tool": "get_ui_tree", "args": {},
-           "result": f"{len(nodes)} nodes · {len(interactive)} interactive", "quiet": False})
+def controls(nodes):
+    return [k for k, n in nodes.items() if n["role"] in ("button", "text_input") and n["state"]["visible"]]
+
+
+nodes = call("get_ui_tree", summary=lambda r: f"{len(r['nodes'])} nodes · {len(controls(r['nodes']))} interactive")["nodes"]
+interactive = controls(nodes)
 sample = []
 for nid in ["file-theme", "toggle-explorer", "code-editor", "run-project", "status-message"]:
     n = nodes[nid]
@@ -124,9 +121,7 @@ found = call("find_elements", {"query": "theme.rs", "role": "button"},
 beat(0.4)
 click("file-theme", nodes)
 call("wait_for_element", {"query": "theme.rs", "timeout_ms": 2000}, lambda r: "theme.rs tab is live")
-s = status_text()
-EV.append({"t": time.time(), "t_end": time.time() + 0.01, "type": "call", "tool": "get_element",
-           "args": {"id": "status-message"}, "result": f'text = "{s}"', "quiet": False})
+call("get_element", {"id": "status-message"}, lambda r: f'text = "{r["text"]["text"]}"')
 beat(1.0)
 click("toggle-panel", nodes)
 call("wait_for_state", {"id": "bottom-panel", "visible": False, "timeout_ms": 2000},
@@ -144,11 +139,15 @@ beat(0.2)
 typed = "\n\n// tuned by an agent over MCP\npub const ACCENT: u32 = 0x3b5ccc;"
 chunk = 6
 log("typing", text=typed)
+# Typed in small chunks so the text visibly appears; logged as one entry
+# spanning the real first-to-last call.
+t0, sent = time.time(), 0
 for i in range(0, len(typed), chunk):
     m.call("type_text", {"text": typed[i:i + chunk]})
+    sent += 1
     time.sleep(0.035)
-EV.append({"t": time.time() - 1.4, "t_end": time.time(), "type": "call", "tool": "type_text",
-           "args": {"text": typed.strip()}, "result": f"{len(typed)} chars typed", "quiet": False})
+EV.append({"t": t0, "t_end": time.time(), "type": "call", "tool": "type_text",
+           "args": {"text": typed.strip()}, "result": f"{len(typed)} chars · {sent} calls", "quiet": False})
 beat(0.6)
 info = call("get_text_info", {"id": "code-editor"}, lambda r: f"{r['text'].count(chr(10)) + 1} lines · ends with ACCENT ✓"
             if "ACCENT" in r["text"] else "text mismatch")
@@ -158,10 +157,9 @@ beat(1.4)
 log("chapter", n=3, title="Validate", sub="Audit the running app: names, handlers, layout, state")
 beat(0.5)
 call("save_ui_snapshot", {"name": "before-fix"}, lambda r: f"snapshot · {r['node_count']} nodes")
-nodes = tree()
+nodes = call("get_ui_tree", summary=lambda r: "audit: {} unnamed · {} no handler".format(
+    *map(len, audit(r["nodes"]))))["nodes"]
 unnamed, dead = audit(nodes)
-EV.append({"t": time.time(), "t_end": time.time() + 0.02, "type": "call", "tool": "get_ui_tree", "args": {},
-           "result": f"audit: {len(unnamed)} unnamed · {len(dead)} no handler", "quiet": False})
 log("panel", kind="audit", phase="before", unnamed=[{"id": k, "label": nodes[k].get("label")} for k in unnamed],
     dead=[{"id": k, "label": nodes[k].get("label")} for k in dead])
 beat(0.6)
@@ -190,11 +188,9 @@ call("capture_screenshot_snapshot", {"name": "after"}, lambda r: f"after {r['wid
 cmp = call("compare_screenshots", {"left": "before", "right": "after", "tolerance": 8},
            lambda r: f"{r.get('changed_pixel_ratio', r.get('changed_ratio', 0)) * 100:.1f}% pixels changed"
            if isinstance(r.get('changed_pixel_ratio', r.get('changed_ratio')), (int, float)) else json.dumps(r)[:80])
-nodes = tree()
-unnamed2, dead2 = audit(nodes)
 call("diff_current_ui", {"name": "before-fix"}, lambda r: f"{len(r.get('changed', []))} nodes changed")
-EV.append({"t": time.time(), "t_end": time.time() + 0.02, "type": "call", "tool": "get_ui_tree", "args": {},
-           "result": f"re-audit: {len(unnamed2)} unnamed ✓", "quiet": False})
+nodes = call("get_ui_tree", summary=lambda r: f"re-audit: {len(audit(r['nodes'])[0])} unnamed")["nodes"]
+unnamed2, dead2 = audit(nodes)
 log("panel", kind="audit", phase="after", unnamed=[{"id": k, "label": nodes[k].get("label")} for k in unnamed2],
     fixed=[{"id": k, "label": nodes[k].get("label")} for k in unnamed])
 call("highlight_elements", {"ids": unnamed, "color": "#34D399FF"}, lambda r: f"{len(unnamed)} fixed · green")
