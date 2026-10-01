@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 
 use gpui_mcp::LiveDocumentSource;
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
+use notify::{
+    Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _,
+    event::{AccessKind, AccessMode},
+};
 
 use crate::{
     BindingDocument, BindingDocumentError, HtmlUi, HtmlUiError, LiveHtml, ReloadError, ReloadReport,
@@ -261,7 +264,16 @@ impl ProjectWatcher {
             match self.receiver.try_recv() {
                 // Linux's inotify backend reports opens and non-writing closes,
                 // so reading the bundle to reload it would queue another reload.
-                Ok(Ok(event)) if matches!(event.kind, EventKind::Access(_)) => {}
+                // A close after writing still counts as a change.
+                Ok(Ok(event))
+                    if matches!(
+                        event.kind,
+                        EventKind::Access(
+                            AccessKind::Open(_)
+                                | AccessKind::Read
+                                | AccessKind::Close(AccessMode::Read)
+                        )
+                    ) => {}
                 Ok(Ok(event)) => {
                     files.extend(
                         event
