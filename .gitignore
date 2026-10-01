@@ -9,3 +9,4 @@ target/
 Thumbs.db
 *.log
 *.tmp
+/promo/out
