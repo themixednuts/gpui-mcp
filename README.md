@@ -75,8 +75,9 @@ Most problems come from the items below.
 5. **State disabled and read-only explicitly.** `enabled` comes only from
    `.aria_disabled(true)`. A grey control with no click handler still reports
    `enabled: true`. Mark read-only inputs with `.aria_read_only(true)`.
-6. **Redact secrets.** `.frame_redacted(true)` withholds an element's text and
-   value from the bridge, and from any labels derived from them.
+6. **Redact secrets.** `.frame_redacted(true)` on an element with an id
+   withholds its text and value from the bridge, and from any labels derived
+   from them.
 7. **Check the diagnostics.** `get_ui_tree` returns a `diagnostics` list that
    reports omitted, duplicate and orphaned nodes.
 
