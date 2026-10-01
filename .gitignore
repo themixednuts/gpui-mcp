@@ -10,3 +10,4 @@ Thumbs.db
 *.log
 *.tmp
 /promo/out
+__pycache__/
