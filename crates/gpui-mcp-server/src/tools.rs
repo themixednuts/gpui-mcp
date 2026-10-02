@@ -7,22 +7,24 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use gpui_mcp_protocol::{
-    BridgeResult, Capability, ContextResourceDescriptor, FrameReport, FrameStats, Highlight,
-    InputCommand, LiveDocumentSource, MouseButton, NodeAction, NodeState, Operation, Point,
-    PointerCommand, PointerScrollDelta, Rect, Role, Screenshot, ScreenshotTarget, UiNode, UiTree,
-    ValueInfo,
+    BridgeResult, Capability, ContextResourceDescriptor, FrameReport, FrameStats, InputCommand,
+    LiveDocumentSource, MouseButton, NodeAction, NodeState, Operation, Point, PointerCommand,
+    PointerScrollDelta, Rect, Role, Screenshot, ScreenshotTarget, UiNode, UiTree, ValueInfo,
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use rmcp::{
     Json, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CacheScope, CallToolResult, ContentBlock, ErrorData, Implementation,
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
+        ContentBlock, CreateTaskResult, ErrorData, GetTaskParams, GetTaskResult, Implementation,
         ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams, ProtocolVersion,
         ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-        ResourceContents, ServerCapabilities, ServerInfo,
+        ResourceContents, ServerCapabilities, ServerInfo, SubscribeRequestParams,
+        SubscriptionFilter, UnsubscribeRequestParams, UpdateTaskParams,
     },
-    service::RequestContext,
+    service::{RequestContext, SubscriptionContext},
+    task_manager::{TaskExit, TaskManager, TaskOptions},
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
@@ -36,13 +38,27 @@ use tokio_util::sync::CancellationToken;
 use crate::client::{AppInfo, BridgeClient, BridgeRegistry};
 use crate::recording::{ArtifactStore, RecordingArtifact};
 
+mod annotations;
 mod application_commands;
 mod connection;
 mod diagnostics;
 mod input;
 mod live_document;
+mod messages;
 mod tree;
 mod visual;
+
+use messages::{MESSAGES_URI, watch_app_messages};
+
+/// Tools that can block for seconds. For a client that declares the MCP tasks
+/// extension they run as tasks, so the client is not held on one call; other
+/// clients get the same result synchronously.
+const TASK_TOOLS: [&str; 4] = [
+    "wait_for_messages",
+    "wait_for_element",
+    "wait_for_state",
+    "record_performance",
+];
 
 const MAX_TREE_SNAPSHOTS: usize = 32;
 const MAX_IMAGE_SNAPSHOTS: usize = 8;
@@ -65,6 +81,10 @@ pub(crate) struct GpuiMcp {
     pointer: Arc<Mutex<Point>>,
     artifacts: ArtifactStore,
     target_transition: Arc<tokio::sync::Mutex<()>>,
+    /// Legacy `resources/subscribe` watchers by URI.
+    resource_watchers: Arc<Mutex<BTreeMap<String, CancellationToken>>>,
+    /// Tool calls running as SEP-2663 tasks for clients that declare tasks.
+    tasks: TaskManager,
 }
 
 struct RecordingTask {
@@ -299,6 +319,9 @@ struct HighlightArgs {
     /// Eight-digit `#RRGGBBAA` outline color.
     #[serde(default = "default_highlight_color")]
     color: String,
+    /// Remove the outlines automatically this many milliseconds after they are
+    /// first drawn, from 1 through 3600000.
+    ttl_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -400,16 +423,20 @@ impl GpuiMcp {
             pointer: Arc::new(Mutex::new(Point::default())),
             artifacts,
             target_transition: Arc::new(tokio::sync::Mutex::new(())),
+            resource_watchers: Arc::new(Mutex::new(BTreeMap::new())),
+            tasks: TaskManager::new(),
         }
     }
 
     fn production_router() -> ToolRouter<Self> {
         let mut router = Self::core_router();
+        router.merge(annotations::router());
         router.merge(connection::router());
         router.merge(application_commands::router());
         router.merge(diagnostics::router());
         router.merge(input::router());
         router.merge(live_document::router());
+        router.merge(messages::router());
         router.merge(tree::router());
         router.merge(visual::router());
         router
@@ -826,11 +853,13 @@ impl ServerHandler for GpuiMcp {
         let capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_resources()
+            .enable_resources_subscribe()
+            .enable_tasks()
             .build();
         ServerInfo::new(capabilities)
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "Discover, inspect, and automate explicitly instrumented GPUI windows. Call list_apps first when more than one app may be running, then select_app with the desired target_id; a single live app is selected automatically. Selection persists for this MCP transport. Prefer semantic element tools over coordinates. Pointer actions use GPUI's native event pipeline; keyboard input uses GPUI directly. Screenshots and snapshots remain in memory, and all coordinates are logical pixels relative to the selected window. Video recording continuously captures raw native-window frames and encodes them directly into H.264/MP4 while recording; keep one MCP transport open for start_video_recording and stop_video_recording. Targets cannot be switched during recording. The optional pointer overlay reflects the same GPUI pointer state used for hover and clicks without reading or moving the global OS cursor. Artifact names are portable filenames inside the configured artifact directory; overwrite is opt-in."
+                "Discover, inspect, and automate explicitly instrumented GPUI windows. Call list_apps first when more than one app may be running, then select_app with the desired target_id; a single live app is selected automatically. Selection persists for this MCP transport. Prefer semantic element tools over coordinates. Pointer actions use GPUI's native event pipeline; keyboard input uses GPUI directly. Screenshots and snapshots remain in memory, and all coordinates are logical pixels relative to the selected window. Video recording continuously captures raw native-window frames and encodes them directly into H.264/MP4 while recording; keep one MCP transport open for start_video_recording and stop_video_recording. Targets cannot be switched during recording. The optional pointer overlay reflects the same GPUI pointer state used for hover and clicks without reading or moving the global OS cursor. Artifact names are portable filenames inside the configured artifact directory; overwrite is opt-in. Annotate elements with annotate_elements (labels that follow the element; give them a ttl_ms or remove them when done). Apps with a chat box post messages for you: read them with read_messages or wait_for_messages, or subscribe to gpui://messages, and answer with send_message."
                     .to_owned(),
             )
     }
@@ -840,7 +869,7 @@ impl ServerHandler for GpuiMcp {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        let mut resources = vec![apps_resource()];
+        let mut resources = vec![apps_resource(), messages_resource()];
         if let Ok(client) = self.registry.client().await
             && client
                 .descriptor()
@@ -893,6 +922,17 @@ impl ServerHandler for GpuiMcp {
             .uncacheable(&context)
             .into());
         }
+        if request.uri == MESSAGES_URI {
+            let text = self
+                .messages_resource_text()
+                .await
+                .map_err(|message| ErrorData::internal_error(message, None))?;
+            return Ok(ReadResourceResult::new(vec![
+                ResourceContents::text(text, request.uri).with_mime_type("application/json"),
+            ])
+            .uncacheable(&context)
+            .into());
+        }
         let result = self
             .call(Operation::ReadContextResource {
                 uri: request.uri.clone(),
@@ -912,6 +952,175 @@ impl ServerHandler for GpuiMcp {
         .uncacheable(&context)
         .into())
     }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let as_task = TASK_TOOLS.contains(&request.name.as_ref())
+            && context
+                .client_capabilities()
+                .is_some_and(|capabilities| capabilities.supports_tasks());
+        if !as_task {
+            let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+            return self.tool_router.call(call).await;
+        }
+        let server = self.clone();
+        let options = TaskOptions::new()
+            .with_poll_interval_ms(500)
+            .with_status_message(format!("running {}", request.name));
+        let task = self.tasks.spawn(options, move |task| {
+            Box::pin(async move {
+                let call =
+                    rmcp::handler::server::tool::ToolCallContext::new(&server, request, context);
+                tokio::select! {
+                    () = task.cancelled() => Err(TaskExit::Cancelled),
+                    response = server.tool_router.call(call) => match response {
+                        Ok(CallToolResponse::Complete(result)) => Ok(result),
+                        Ok(_) => Err(TaskExit::Error(ErrorData::internal_error(
+                            "the tool did not complete",
+                            None,
+                        ))),
+                        Err(error) => Err(TaskExit::Error(error)),
+                    },
+                }
+            })
+        });
+        Ok(CallToolResponse::Task(CreateTaskResult::new(task)))
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, ErrorData> {
+        Ok(GetTaskResult::new(self.tasks.get_task(&request.task_id)?))
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.tasks
+            .update_task(&request.task_id, request.input_responses)
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.tasks.cancel_task(&request.task_id)
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        let mut accepted = SubscriptionFilter::new();
+        accepted.resource_subscriptions = requested.resource_subscriptions.as_ref().map(|uris| {
+            uris.iter()
+                .filter(|uri| *uri == MESSAGES_URI)
+                .cloned()
+                .collect()
+        });
+        Some(accepted)
+    }
+
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+        let wants_messages = context
+            .accepted()
+            .resource_subscriptions
+            .as_ref()
+            .is_some_and(|uris| uris.iter().any(|uri| uri == MESSAGES_URI));
+        if !wants_messages {
+            context.cancelled().await;
+            return Ok(());
+        }
+        let cancellation = CancellationToken::new();
+        let sink = context.sink().clone();
+        let watch = watch_app_messages(self.registry.clone(), cancellation.clone(), || {
+            let sink = sink.clone();
+            async move { sink.notify_resource_updated(MESSAGES_URI).await.is_ok() }
+        });
+        tokio::select! {
+            () = context.cancelled() => cancellation.cancel(),
+            () = watch => {}
+        }
+        Ok(())
+    }
+
+    #[allow(deprecated)]
+    async fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        if request.uri != MESSAGES_URI {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "{} does not support subscriptions; only {MESSAGES_URI} does",
+                    request.uri
+                ),
+                None,
+            ));
+        }
+        let cancellation = CancellationToken::new();
+        let previous = self
+            .resource_watchers
+            .lock()
+            .map_err(|_| ErrorData::internal_error("subscription state is poisoned", None))?
+            .insert(request.uri.clone(), cancellation.clone());
+        if let Some(previous) = previous {
+            previous.cancel();
+        }
+        let peer = context.peer;
+        let uri = request.uri;
+        tokio::spawn(watch_app_messages(
+            self.registry.clone(),
+            cancellation,
+            move || {
+                let peer = peer.clone();
+                let uri = uri.clone();
+                async move {
+                    peer.notify_resource_updated(
+                        rmcp::model::ResourceUpdatedNotificationParam::new(uri),
+                    )
+                    .await
+                    .is_ok()
+                }
+            },
+        ));
+        Ok(())
+    }
+
+    #[allow(deprecated)]
+    async fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        if let Some(watcher) = self
+            .resource_watchers
+            .lock()
+            .map_err(|_| ErrorData::internal_error("subscription state is poisoned", None))?
+            .remove(&request.uri)
+        {
+            watcher.cancel();
+        }
+        Ok(())
+    }
+}
+
+fn messages_resource() -> Resource {
+    Resource::new(MESSAGES_URI, "gpui-messages")
+        .with_title("Messages from the application")
+        .with_description(
+            "The newest messages exchanged with the selected application, such as its chat box. Subscribe to be notified when the application posts one; reply with send_message",
+        )
+        .with_mime_type("application/json")
 }
 
 fn apps_resource() -> Resource {
@@ -1634,6 +1843,12 @@ mod tests {
                 "screenshot_element",
                 "highlight_elements",
                 "clear_highlights",
+                "annotate_elements",
+                "remove_annotations",
+                "list_annotations",
+                "read_messages",
+                "wait_for_messages",
+                "send_message",
                 "capture_screenshot_snapshot",
                 "compare_screenshots",
                 "diff_screenshots",

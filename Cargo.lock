@@ -2763,6 +2763,7 @@ dependencies = [
  "gpui",
  "gpui-mcp",
  "gpui-mcp-capture",
+ "gpui-pre",
  "gpui_platform",
  "htmlswap",
  "image",

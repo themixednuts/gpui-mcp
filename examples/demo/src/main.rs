@@ -2,10 +2,10 @@
 
 use gpui::{
     App, Bounds, Context, Div, Entity, FocusHandle, IntoElement, Render, Role, Stateful,
-    StatefulInteractiveElement as _, StyleRefinement, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, rgb, size,
+    StatefulInteractiveElement as _, StyleRefinement, WeakEntity, Window, WindowBounds,
+    WindowOptions, div, prelude::*, px, rgb, size,
 };
-use gpui_mcp::{Automation, BridgeConfig, BridgeHandle};
+use gpui_mcp::{AnnotationSource, Automation, BridgeConfig, BridgeHandle, NewMessage};
 
 const TITLE: &str = "GPUI MCP Demo";
 
@@ -27,8 +27,12 @@ struct Demo {
     search: FocusHandle,
     filter: FocusHandle,
     probes: [Entity<ProbeRegion>; 2],
+    /// The agent's latest message, shown the way a chat box would.
+    reply: Option<String>,
+    /// How many annotations exist and who changed them last, mirrored from the bridge.
+    annotations: (usize, Option<AnnotationSource>),
     automation: Automation,
-    _bridge: BridgeHandle,
+    bridge: BridgeHandle,
 }
 
 /// One region drawn as its own cached view, the way a workbench draws each of
@@ -110,6 +114,63 @@ impl Demo {
         self.count = 0;
         self.automation.log("info", "counter reset");
         cx.notify();
+    }
+
+    /// Post a chat message for the connected agent, as an in-app chat box would.
+    fn ask_agent(&mut self, cx: &mut Context<Self>) {
+        let message = NewMessage::text(format!("Hello from the demo; the count is {}", self.count));
+        if let Err(error) = self.bridge.post_message(message) {
+            self.automation.log("warn", &error.message);
+        }
+        cx.notify();
+    }
+
+    /// A chat box in miniature: a send button, the agent's latest reply, and a
+    /// mirror of the annotations the agent has placed.
+    fn chat_row(&self, cx: &mut Context<Self>) -> Div {
+        let (count, changed_by) = self.annotations;
+        let reply = self
+            .reply
+            .clone()
+            .unwrap_or_else(|| "No reply yet".to_owned());
+        let annotations = format!(
+            "Annotations: {count}{}",
+            match changed_by {
+                Some(AnnotationSource::Agent) => " (agent)",
+                Some(AnnotationSource::App) => " (app)",
+                Some(AnnotationSource::Bridge) => " (expired)",
+                None => "",
+            }
+        );
+        div()
+            .flex()
+            .gap_3()
+            .items_center()
+            .child(
+                div()
+                    .id("chat-send")
+                    .px_4()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(0x39_42_53))
+                    .cursor_pointer()
+                    .child("Ask agent")
+                    .on_click(cx.listener(|this, _, _, cx| this.ask_agent(cx))),
+            )
+            .child(
+                div()
+                    .id("chat-reply")
+                    .child(reply.clone())
+                    .role(Role::Status)
+                    .aria_label(reply),
+            )
+            .child(
+                div()
+                    .id("annotation-count")
+                    .child(annotations.clone())
+                    .role(Role::Status)
+                    .aria_label(annotations),
+            )
     }
 
     fn toggle_lock(&mut self, cx: &mut Context<Self>) {
@@ -241,6 +302,7 @@ impl Render for Demo {
                     ),
             )
             .child(self.lock_row(cx))
+            .child(self.chat_row(cx))
             .child(
                 div()
                     .flex()
@@ -295,25 +357,52 @@ fn main() {
                     }
                 };
                 let automation = bridge.automation();
-                cx.new(|cx| Demo {
-                    count: 0,
-                    locked: true,
-                    search: cx.focus_handle(),
-                    filter: cx.focus_handle(),
-                    probes: [
-                        cx.new(|_| ProbeRegion {
-                            id: "probe-left",
-                            target: "probe-left-target",
-                            label: "Left probe",
-                        }),
-                        cx.new(|_| ProbeRegion {
-                            id: "probe-right",
-                            target: "probe-right-target",
-                            label: "Right probe",
-                        }),
-                    ],
-                    automation,
-                    _bridge: bridge,
+                cx.new(|cx| {
+                    let demo: WeakEntity<Demo> = cx.entity().downgrade();
+                    let registered = bridge
+                        .on_message({
+                            let demo = demo.clone();
+                            move |message, _, cx| {
+                                let _ = demo.update(cx, |demo, cx| {
+                                    demo.reply = Some(message.text.clone());
+                                    cx.notify();
+                                });
+                            }
+                        })
+                        .and_then(|()| {
+                            bridge.on_annotations(move |event, _, cx| {
+                                let _ = demo.update(cx, |demo, cx| {
+                                    demo.annotations =
+                                        (event.annotations.len(), Some(event.changed_by));
+                                    cx.notify();
+                                });
+                            })
+                        });
+                    if let Err(error) = registered {
+                        eprintln!("could not register bridge callbacks: {error}");
+                    }
+                    Demo {
+                        count: 0,
+                        locked: true,
+                        search: cx.focus_handle(),
+                        filter: cx.focus_handle(),
+                        probes: [
+                            cx.new(|_| ProbeRegion {
+                                id: "probe-left",
+                                target: "probe-left-target",
+                                label: "Left probe",
+                            }),
+                            cx.new(|_| ProbeRegion {
+                                id: "probe-right",
+                                target: "probe-right-target",
+                                label: "Right probe",
+                            }),
+                        ],
+                        reply: None,
+                        annotations: (0, None),
+                        automation,
+                        bridge,
+                    }
                 })
             },
         );

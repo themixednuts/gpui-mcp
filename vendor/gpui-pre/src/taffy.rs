@@ -1,6 +1,7 @@
 use crate::{
-    AbsoluteLength, App, Bounds, DefiniteLength, Edges, GridTemplate, Length, Pixels, Point, Size,
-    Style, Window, size,
+    AbsoluteLength, App, Bounds, DefiniteLength, Edges, GridAutoFlow, GridRepetition,
+    GridTemplate, GridTrack, GridTrackBreadth, GridTrackSize, Length, Pixels, Point, Size, Style,
+    Window, size,
     util::{
         ceil_to_device_pixel, round_half_toward_zero, round_stroke_to_device_pixel,
         round_to_device_pixel,
@@ -503,8 +504,32 @@ impl ToTaffy<taffy::style::Style> for Style {
             flex_basis: self.flex_basis.to_taffy(rem_size, scale_factor),
             flex_grow: self.flex_grow,
             flex_shrink: self.flex_shrink,
-            grid_template_rows: to_grid_repeat(&self.grid_rows),
-            grid_template_columns: to_grid_repeat(&self.grid_cols),
+            grid_template_rows: match &self.grid_template_rows {
+                Some(tracks) => grid_track_list(tracks, rem_size, scale_factor),
+                None => to_grid_repeat(&self.grid_rows),
+            },
+            grid_template_columns: match &self.grid_template_columns {
+                Some(tracks) => grid_track_list(tracks, rem_size, scale_factor),
+                None => to_grid_repeat(&self.grid_cols),
+            },
+            grid_auto_rows: self
+                .grid_auto_rows
+                .iter()
+                .flatten()
+                .map(|track| grid_track_size(track, rem_size, scale_factor))
+                .collect(),
+            grid_auto_columns: self
+                .grid_auto_columns
+                .iter()
+                .flatten()
+                .map(|track| grid_track_size(track, rem_size, scale_factor))
+                .collect(),
+            grid_auto_flow: match self.grid_auto_flow.unwrap_or_default() {
+                GridAutoFlow::Row => taffy::style::GridAutoFlow::Row,
+                GridAutoFlow::Column => taffy::style::GridAutoFlow::Column,
+                GridAutoFlow::RowDense => taffy::style::GridAutoFlow::RowDense,
+                GridAutoFlow::ColumnDense => taffy::style::GridAutoFlow::ColumnDense,
+            },
             grid_row: self
                 .grid_location
                 .as_ref()
@@ -545,6 +570,87 @@ impl ToTaffy<taffy::style::Dimension> for Length {
             Length::Definite(length) => length.to_taffy(rem_size, scale_factor),
             Length::Auto => taffy::prelude::Dimension::auto(),
         }
+    }
+}
+
+fn grid_track_list<T: taffy::style::CheapCloneStr>(
+    tracks: &[GridTrack],
+    rem_size: Pixels,
+    scale_factor: f32,
+) -> Vec<taffy::GridTemplateComponent<T>> {
+    tracks
+        .iter()
+        .map(|track| match track {
+            GridTrack::Single(size) => taffy::GridTemplateComponent::Single(grid_track_size(
+                size,
+                rem_size,
+                scale_factor,
+            )),
+            GridTrack::Repeat(count, sizes) => {
+                taffy::GridTemplateComponent::Repeat(taffy::style::GridTemplateRepetition {
+                    count: match count {
+                        GridRepetition::Count(count) => {
+                            taffy::style::RepetitionCount::Count(*count)
+                        }
+                        GridRepetition::AutoFill => taffy::style::RepetitionCount::AutoFill,
+                        GridRepetition::AutoFit => taffy::style::RepetitionCount::AutoFit,
+                    },
+                    tracks: sizes
+                        .iter()
+                        .map(|size| grid_track_size(size, rem_size, scale_factor))
+                        .collect(),
+                    line_names: Vec::new(),
+                })
+            }
+        })
+        .collect()
+}
+
+fn grid_track_size(
+    size: &GridTrackSize,
+    rem_size: Pixels,
+    scale_factor: f32,
+) -> taffy::style::TrackSizingFunction {
+    use taffy::style::{MaxTrackSizingFunction as Max, MinTrackSizingFunction as Min};
+
+    let min = |breadth: &GridTrackBreadth| match breadth {
+        GridTrackBreadth::Length(DefiniteLength::Absolute(length)) => {
+            Min::length(length.to_taffy(rem_size, scale_factor))
+        }
+        GridTrackBreadth::Length(DefiniteLength::Fraction(fraction)) => Min::percent(*fraction),
+        // A flexible minimum is invalid CSS; `minmax(1fr, …)` behaves as `auto`.
+        GridTrackBreadth::Fraction(_) | GridTrackBreadth::Auto => Min::auto(),
+        GridTrackBreadth::MinContent => Min::min_content(),
+        GridTrackBreadth::MaxContent => Min::max_content(),
+    };
+    let max = |breadth: &GridTrackBreadth| match breadth {
+        GridTrackBreadth::Length(DefiniteLength::Absolute(length)) => {
+            Max::length(length.to_taffy(rem_size, scale_factor))
+        }
+        GridTrackBreadth::Length(DefiniteLength::Fraction(fraction)) => Max::percent(*fraction),
+        GridTrackBreadth::Fraction(fraction) => Max::fr(*fraction),
+        GridTrackBreadth::Auto => Max::auto(),
+        GridTrackBreadth::MinContent => Max::min_content(),
+        GridTrackBreadth::MaxContent => Max::max_content(),
+    };
+    match size {
+        GridTrackSize::Breadth(breadth) => taffy::geometry::MinMax {
+            min: min(breadth),
+            max: max(breadth),
+        },
+        GridTrackSize::MinMax(low, high) => taffy::geometry::MinMax {
+            min: min(low),
+            max: max(high),
+        },
+        GridTrackSize::FitContent(limit) => taffy::geometry::MinMax {
+            min: Min::auto(),
+            max: match limit {
+                DefiniteLength::Absolute(length) => {
+                    Max::fit_content_px(length.to_taffy(rem_size, scale_factor))
+                }
+                DefiniteLength::Fraction(fraction) => Max::fit_content_percent(*fraction),
+            },
+        },
     }
 }
 

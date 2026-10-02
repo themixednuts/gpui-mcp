@@ -1,0 +1,368 @@
+diff --git a/src/style.rs b/src/style.rs
+index 63fb973..4458785 100644
+--- a/src/style.rs
++++ b/src/style.rs
+@@ -170,6 +170,127 @@ pub struct GridTemplate {
+     pub min_size: GridTemplateMinSize,
+ }
+ 
++/// One breadth of a grid track: a length, a flexible fraction, or a keyword.
++#[derive(Copy, Clone, PartialEq, Debug, JsonSchema, Serialize, Deserialize)]
++pub enum GridTrackBreadth {
++    /// A length (`px`, `rem`) or a fraction of the grid container (`%`).
++    Length(DefiniteLength),
++    /// A share of the free space, as CSS `fr`. Valid only as a track's maximum;
++    /// as a minimum it behaves as `auto`, as CSS requires.
++    Fraction(f32),
++    /// `auto`.
++    Auto,
++    /// `min-content`.
++    MinContent,
++    /// `max-content`.
++    MaxContent,
++}
++
++/// The size of one grid track, as one value of `grid-template-columns`.
++#[derive(Copy, Clone, PartialEq, Debug, JsonSchema, Serialize, Deserialize)]
++pub enum GridTrackSize {
++    /// A single breadth, such as `120px`, `25%`, `1fr`, `auto` or `min-content`.
++    Breadth(GridTrackBreadth),
++    /// `minmax(min, max)`.
++    MinMax(GridTrackBreadth, GridTrackBreadth),
++    /// `fit-content(limit)`.
++    FitContent(DefiniteLength),
++}
++
++impl GridTrackSize {
++    /// A fixed length or percentage, such as `px(120.)` or `relative(0.25)`.
++    pub fn length(length: impl Into<DefiniteLength>) -> Self {
++        Self::Breadth(GridTrackBreadth::Length(length.into()))
++    }
++
++    /// A share of the free space, as CSS `fr`.
++    pub fn fr(fraction: f32) -> Self {
++        Self::Breadth(GridTrackBreadth::Fraction(fraction))
++    }
++
++    /// `auto`.
++    pub fn auto() -> Self {
++        Self::Breadth(GridTrackBreadth::Auto)
++    }
++
++    /// `min-content`.
++    pub fn min_content() -> Self {
++        Self::Breadth(GridTrackBreadth::MinContent)
++    }
++
++    /// `max-content`.
++    pub fn max_content() -> Self {
++        Self::Breadth(GridTrackBreadth::MaxContent)
++    }
++
++    /// `minmax(min, max)`.
++    pub fn minmax(min: GridTrackBreadth, max: GridTrackBreadth) -> Self {
++        Self::MinMax(min, max)
++    }
++
++    /// `fit-content(limit)`.
++    pub fn fit_content(limit: impl Into<DefiniteLength>) -> Self {
++        Self::FitContent(limit.into())
++    }
++}
++
++/// How many times a `repeat()` repeats its tracks.
++#[derive(Copy, Clone, PartialEq, Eq, Debug, JsonSchema, Serialize, Deserialize)]
++pub enum GridRepetition {
++    /// `repeat(n, …)`.
++    Count(u16),
++    /// `repeat(auto-fill, …)`: as many as fit, keeping empty tracks.
++    AutoFill,
++    /// `repeat(auto-fit, …)`: as many as fit, collapsing empty tracks.
++    AutoFit,
++}
++
++/// One entry of a `grid-template-columns` or `grid-template-rows` track list.
++#[derive(Clone, PartialEq, Debug, JsonSchema, Serialize, Deserialize)]
++pub enum GridTrack {
++    /// One track.
++    Single(GridTrackSize),
++    /// `repeat(count, tracks…)`.
++    Repeat(GridRepetition, Vec<GridTrackSize>),
++}
++
++impl GridTrack {
++    /// `repeat(count, tracks…)`.
++    pub fn repeat(count: u16, tracks: impl IntoIterator<Item = GridTrackSize>) -> Self {
++        Self::Repeat(GridRepetition::Count(count), tracks.into_iter().collect())
++    }
++
++    /// `repeat(auto-fill, tracks…)`.
++    pub fn auto_fill(tracks: impl IntoIterator<Item = GridTrackSize>) -> Self {
++        Self::Repeat(GridRepetition::AutoFill, tracks.into_iter().collect())
++    }
++
++    /// `repeat(auto-fit, tracks…)`.
++    pub fn auto_fit(tracks: impl IntoIterator<Item = GridTrackSize>) -> Self {
++        Self::Repeat(GridRepetition::AutoFit, tracks.into_iter().collect())
++    }
++}
++
++impl From<GridTrackSize> for GridTrack {
++    fn from(size: GridTrackSize) -> Self {
++        Self::Single(size)
++    }
++}
++
++/// How grid items without an explicit position are placed, as CSS `grid-auto-flow`.
++#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, JsonSchema, Serialize, Deserialize)]
++pub enum GridAutoFlow {
++    /// Fill each row in turn.
++    #[default]
++    Row,
++    /// Fill each column in turn.
++    Column,
++    /// `row dense`: fill rows, back-filling earlier holes.
++    RowDense,
++    /// `column dense`: fill columns, back-filling earlier holes.
++    ColumnDense,
++}
++
+ /// The CSS styling that can be applied to an element via the `Styled` trait
+ #[derive(Clone, Refineable, Debug)]
+ #[refineable(Debug, PartialEq, Serialize, Deserialize)]
+@@ -314,6 +435,21 @@ pub struct Style {
+     /// The grid location of this element
+     pub grid_location: Option<GridLocation>,
+ 
++    /// Explicit column tracks, as CSS `grid-template-columns`. Takes precedence over `grid_cols`.
++    pub grid_template_columns: Option<Vec<GridTrack>>,
++
++    /// Explicit row tracks, as CSS `grid-template-rows`. Takes precedence over `grid_rows`.
++    pub grid_template_rows: Option<Vec<GridTrack>>,
++
++    /// Sizes of implicitly created columns, as CSS `grid-auto-columns`.
++    pub grid_auto_columns: Option<Vec<GridTrackSize>>,
++
++    /// Sizes of implicitly created rows, as CSS `grid-auto-rows`.
++    pub grid_auto_rows: Option<Vec<GridTrackSize>>,
++
++    /// How auto-placed items flow, as CSS `grid-auto-flow`.
++    pub grid_auto_flow: Option<GridAutoFlow>,
++
+     /// Whether to draw a red debugging outline around this element
+     #[cfg(debug_assertions)]
+     pub debug: bool,
+@@ -902,6 +1038,12 @@ impl Default for Style {
+             grid_rows: None,
+             grid_cols: None,
+             grid_location: None,
++            grid_template_columns: None,
++            grid_template_rows: None,
++            grid_auto_columns: None,
++            grid_auto_rows: None,
++            grid_auto_flow: None,
++
+ 
+             #[cfg(debug_assertions)]
+             debug: false,
+diff --git a/src/styled.rs b/src/styled.rs
+index 6983339..56bf198 100644
+--- a/src/styled.rs
++++ b/src/styled.rs
+@@ -1,7 +1,7 @@
+ use crate::{
+     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
+     DefiniteLength, Display, Fill, Filter, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
+-    FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, JustifyContent, Length, Pixels,
++    FontWeight, GridAutoFlow, GridPlacement, GridTemplate, GridTemplateMinSize, GridTrack, GridTrackSize, JustifyContent, Length, Pixels,
+     SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
+     TextStyleRefinement, TextTransform, UnderlineStyle, WhiteSpace, px, relative, rems,
+ };
+@@ -815,6 +815,50 @@ pub trait Styled: Sized {
+         self
+     }
+ 
++    /// Sets explicit column tracks, as CSS `grid-template-columns`, for example
++    /// `[GridTrackSize::length(px(200.)).into(), GridTrack::repeat(2, [GridTrackSize::fr(1.)])]`.
++    /// Takes precedence over [`Self::grid_cols`].
++    fn grid_template_columns(mut self, tracks: impl IntoIterator<Item = GridTrack>) -> Self {
++        self.style().grid_template_columns = Some(tracks.into_iter().collect());
++        self
++    }
++
++    /// Sets explicit row tracks, as CSS `grid-template-rows`. Takes precedence over [`Self::grid_rows`].
++    fn grid_template_rows(mut self, tracks: impl IntoIterator<Item = GridTrack>) -> Self {
++        self.style().grid_template_rows = Some(tracks.into_iter().collect());
++        self
++    }
++
++    /// Sets the size of implicitly created columns, as CSS `grid-auto-columns`.
++    fn grid_auto_columns(mut self, tracks: impl IntoIterator<Item = GridTrackSize>) -> Self {
++        self.style().grid_auto_columns = Some(tracks.into_iter().collect());
++        self
++    }
++
++    /// Sets the size of implicitly created rows, as CSS `grid-auto-rows`.
++    fn grid_auto_rows(mut self, tracks: impl IntoIterator<Item = GridTrackSize>) -> Self {
++        self.style().grid_auto_rows = Some(tracks.into_iter().collect());
++        self
++    }
++
++    /// Sets how auto-placed items flow, as CSS `grid-auto-flow`.
++    fn grid_auto_flow(mut self, flow: GridAutoFlow) -> Self {
++        self.style().grid_auto_flow = Some(flow);
++        self
++    }
++
++    /// Places this item between column lines, as CSS `grid-column: start / end`.
++    fn grid_column(mut self, start: GridPlacement, end: GridPlacement) -> Self {
++        self.style().grid_location_mut().column = start..end;
++        self
++    }
++
++    /// Places this item between row lines, as CSS `grid-row: start / end`.
++    fn grid_row(mut self, start: GridPlacement, end: GridPlacement) -> Self {
++        self.style().grid_location_mut().row = start..end;
++        self
++    }
++
+     /// Sets the grid columns of this element.
+     fn grid_cols(mut self, cols: u16) -> Self {
+         self.style().grid_cols = Some(GridTemplate {
+diff --git a/src/taffy.rs b/src/taffy.rs
+index 13d3bc4..efb7f25 100644
+--- a/src/taffy.rs
++++ b/src/taffy.rs
+@@ -1,6 +1,7 @@
+ use crate::{
+-    AbsoluteLength, App, Bounds, DefiniteLength, Edges, GridTemplate, Length, Pixels, Point, Size,
+-    Style, Window, size,
++    AbsoluteLength, App, Bounds, DefiniteLength, Edges, GridAutoFlow, GridRepetition,
++    GridTemplate, GridTrack, GridTrackBreadth, GridTrackSize, Length, Pixels, Point, Size, Style,
++    Window, size,
+     util::{
+         ceil_to_device_pixel, round_half_toward_zero, round_stroke_to_device_pixel,
+         round_to_device_pixel,
+@@ -508,8 +509,32 @@ impl ToTaffy<taffy::style::Style> for Style {
+             flex_basis: self.flex_basis.to_taffy(rem_size, scale_factor),
+             flex_grow: self.flex_grow,
+             flex_shrink: self.flex_shrink,
+-            grid_template_rows: to_grid_repeat(&self.grid_rows),
+-            grid_template_columns: to_grid_repeat(&self.grid_cols),
++            grid_template_rows: match &self.grid_template_rows {
++                Some(tracks) => grid_track_list(tracks, rem_size, scale_factor),
++                None => to_grid_repeat(&self.grid_rows),
++            },
++            grid_template_columns: match &self.grid_template_columns {
++                Some(tracks) => grid_track_list(tracks, rem_size, scale_factor),
++                None => to_grid_repeat(&self.grid_cols),
++            },
++            grid_auto_rows: self
++                .grid_auto_rows
++                .iter()
++                .flatten()
++                .map(|track| grid_track_size(track, rem_size, scale_factor))
++                .collect(),
++            grid_auto_columns: self
++                .grid_auto_columns
++                .iter()
++                .flatten()
++                .map(|track| grid_track_size(track, rem_size, scale_factor))
++                .collect(),
++            grid_auto_flow: match self.grid_auto_flow.unwrap_or_default() {
++                GridAutoFlow::Row => taffy::style::GridAutoFlow::Row,
++                GridAutoFlow::Column => taffy::style::GridAutoFlow::Column,
++                GridAutoFlow::RowDense => taffy::style::GridAutoFlow::RowDense,
++                GridAutoFlow::ColumnDense => taffy::style::GridAutoFlow::ColumnDense,
++            },
+             grid_row: self
+                 .grid_location
+                 .as_ref()
+@@ -553,6 +578,87 @@ impl ToTaffy<taffy::style::Dimension> for Length {
+     }
+ }
+ 
++fn grid_track_list<T: taffy::style::CheapCloneStr>(
++    tracks: &[GridTrack],
++    rem_size: Pixels,
++    scale_factor: f32,
++) -> Vec<taffy::GridTemplateComponent<T>> {
++    tracks
++        .iter()
++        .map(|track| match track {
++            GridTrack::Single(size) => taffy::GridTemplateComponent::Single(grid_track_size(
++                size,
++                rem_size,
++                scale_factor,
++            )),
++            GridTrack::Repeat(count, sizes) => {
++                taffy::GridTemplateComponent::Repeat(taffy::style::GridTemplateRepetition {
++                    count: match count {
++                        GridRepetition::Count(count) => {
++                            taffy::style::RepetitionCount::Count(*count)
++                        }
++                        GridRepetition::AutoFill => taffy::style::RepetitionCount::AutoFill,
++                        GridRepetition::AutoFit => taffy::style::RepetitionCount::AutoFit,
++                    },
++                    tracks: sizes
++                        .iter()
++                        .map(|size| grid_track_size(size, rem_size, scale_factor))
++                        .collect(),
++                    line_names: Vec::new(),
++                })
++            }
++        })
++        .collect()
++}
++
++fn grid_track_size(
++    size: &GridTrackSize,
++    rem_size: Pixels,
++    scale_factor: f32,
++) -> taffy::style::TrackSizingFunction {
++    use taffy::style::{MaxTrackSizingFunction as Max, MinTrackSizingFunction as Min};
++
++    let min = |breadth: &GridTrackBreadth| match breadth {
++        GridTrackBreadth::Length(DefiniteLength::Absolute(length)) => {
++            Min::length(length.to_taffy(rem_size, scale_factor))
++        }
++        GridTrackBreadth::Length(DefiniteLength::Fraction(fraction)) => Min::percent(*fraction),
++        // A flexible minimum is invalid CSS; `minmax(1fr, …)` behaves as `auto`.
++        GridTrackBreadth::Fraction(_) | GridTrackBreadth::Auto => Min::auto(),
++        GridTrackBreadth::MinContent => Min::min_content(),
++        GridTrackBreadth::MaxContent => Min::max_content(),
++    };
++    let max = |breadth: &GridTrackBreadth| match breadth {
++        GridTrackBreadth::Length(DefiniteLength::Absolute(length)) => {
++            Max::length(length.to_taffy(rem_size, scale_factor))
++        }
++        GridTrackBreadth::Length(DefiniteLength::Fraction(fraction)) => Max::percent(*fraction),
++        GridTrackBreadth::Fraction(fraction) => Max::fr(*fraction),
++        GridTrackBreadth::Auto => Max::auto(),
++        GridTrackBreadth::MinContent => Max::min_content(),
++        GridTrackBreadth::MaxContent => Max::max_content(),
++    };
++    match size {
++        GridTrackSize::Breadth(breadth) => taffy::geometry::MinMax {
++            min: min(breadth),
++            max: max(breadth),
++        },
++        GridTrackSize::MinMax(low, high) => taffy::geometry::MinMax {
++            min: min(low),
++            max: max(high),
++        },
++        GridTrackSize::FitContent(limit) => taffy::geometry::MinMax {
++            min: Min::auto(),
++            max: match limit {
++                DefiniteLength::Absolute(length) => {
++                    Max::fit_content_px(length.to_taffy(rem_size, scale_factor))
++                }
++                DefiniteLength::Fraction(fraction) => Max::fit_content_percent(*fraction),
++            },
++        },
++    }
++}
++
+ impl ToTaffy<taffy::style::LengthPercentage> for DefiniteLength {
+     fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> taffy::style::LengthPercentage {
+         match self {

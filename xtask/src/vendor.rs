@@ -12,7 +12,7 @@ use sha2::{Digest as _, Sha256};
 use crate::patch::{self, Files};
 
 /// The patches in each version's series, applied in this order.
-const SERIES: [Patch; 2] = [Patch::Automation, Patch::FontFallback];
+const SERIES: [Patch; 3] = [Patch::Automation, Patch::FontFallback, Patch::Grid];
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum Crate {
@@ -47,6 +47,9 @@ pub(crate) enum Patch {
     Automation,
     /// An unrelated font fix that consumers may skip.
     FontFallback,
+    /// CSS grid track lists, which gpui-mcp-html renders `grid-template-*` with.
+    /// Consumers that don't use gpui-mcp-html may skip it.
+    Grid,
 }
 
 impl Patch {
@@ -54,6 +57,7 @@ impl Patch {
         match self {
             Self::Automation => "automation",
             Self::FontFallback => "font-fallback",
+            Self::Grid => "grid",
         }
     }
 }
@@ -69,7 +73,7 @@ pub(crate) struct VendorArgs {
     /// Write the patched crate here instead of vendor/<crate>.
     #[arg(long)]
     output: Option<PathBuf>,
-    /// Leave out an optional patch. Only font-fallback is optional.
+    /// Leave out an optional patch: font-fallback or grid.
     #[arg(long, value_enum)]
     without: Vec<Patch>,
     /// Verify vendor/<crate> instead of writing anything.

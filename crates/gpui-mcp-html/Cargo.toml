@@ -9,13 +9,19 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["runtime", "json", "ron"]
-runtime = ["dep:gpui", "dep:gpui-mcp", "dep:htmlswap"]
+default = ["zed", "json", "ron"]
+# The live renderer. It needs a GPUI backend: `zed` (the default) or `gpui-pre`
+# (GPUI Kit). Select exactly one, as for gpui-mcp itself.
+runtime = ["dep:gpui-mcp", "dep:htmlswap"]
+zed = ["runtime", "dep:gpui", "gpui-mcp/zed"]
+gpui-pre = ["runtime", "dep:gpui_pre", "gpui-mcp/gpui-pre"]
+# GPUI test contexts for this crate's tests and for apps testing rendered HTML.
+test-support = ["gpui?/test-support", "gpui_pre?/test-support", "gpui-mcp/test-support"]
 dev-watch = ["runtime", "dep:notify", "ron"]
 json = ["dep:serde_json"]
 ron = ["dep:ron"]
 visual-parity = [
-    "runtime",
+    "zed",
     "dep:anyhow",
     "dep:clap",
     "dep:gpui-mcp-capture",
@@ -28,8 +34,9 @@ visual-parity = [
 anyhow = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 gpui = { workspace = true, optional = true }
+gpui_pre = { workspace = true, optional = true }
 gpui_platform = { workspace = true, optional = true }
-gpui-mcp = { path = "../gpui-mcp", default-features = false, features = ["zed"], optional = true }
+gpui-mcp = { path = "../gpui-mcp", default-features = false, optional = true }
 gpui-mcp-capture = { path = "../gpui-mcp-capture", optional = true }
 htmlswap = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
@@ -45,8 +52,8 @@ path = "src/bin/visual.rs"
 required-features = ["visual-parity"]
 
 [dev-dependencies]
-gpui = { workspace = true, features = ["test-support"] }
-gpui-mcp = { path = "../gpui-mcp", default-features = false, features = ["zed", "test-support"] }
+# Backend-neutral, so the tests run on whichever backend the features select.
+gpui-mcp = { path = "../gpui-mcp", default-features = false, features = ["test-support"] }
 tempfile = "3.23.0"
 
 [lints]

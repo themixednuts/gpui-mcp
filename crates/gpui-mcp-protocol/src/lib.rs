@@ -10,11 +10,24 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use directories::BaseDirs;
+
+mod annotation;
+mod message;
+
+pub use annotation::{
+    Annotation, AnnotationSource, AnnotationSpec, AnnotationStyle, AnnotationTarget,
+    DEFAULT_ANNOTATION_COLOR, MAX_ANNOTATION_ID_BYTES, MAX_ANNOTATION_LABEL_BYTES,
+    MAX_ANNOTATION_TTL_MS, MAX_ANNOTATIONS, is_valid_annotation_name, parse_rgba,
+};
+pub use message::{
+    MAX_MESSAGE_DATA_BYTES, MAX_MESSAGE_KIND_BYTES, MAX_MESSAGE_PAGE, MAX_MESSAGE_TEXT_BYTES,
+    MAX_RETAINED_MESSAGES, MAX_UNREAD_MESSAGES, Message, MessagePage, MessageSender, NewMessage,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Current wire protocol version.
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 14;
 /// Maximum accepted request frame, including its four-byte length prefix.
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// Maximum accepted response frame. Screenshots are base64 encoded inside it.
@@ -637,6 +650,10 @@ pub enum ScreenshotTarget {
 }
 
 /// Highlight description rendered by the GPUI integration.
+///
+/// The bridge shows each highlight as an [`Annotation`] on a fixed rectangle in
+/// the `highlights` group. Prefer [`Operation::UpsertAnnotations`], whose node
+/// targets follow the element as the layout changes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Highlight {
     /// Logical-pixel rectangle.
@@ -927,6 +944,10 @@ pub enum Capability {
     ContextResources,
     /// Bounded application-owned structured commands.
     ApplicationCommands,
+    /// Annotations that track semantic nodes.
+    Annotations,
+    /// An application that reads messages the agent sends it.
+    Messages,
 }
 
 /// Discoverable application command exposed as a generic MCP mutation tool.
@@ -1187,6 +1208,45 @@ pub enum Operation {
     },
     /// Clear visual highlights.
     ClearHighlights,
+    /// Add or replace annotations by id, atomically.
+    UpsertAnnotations {
+        /// Annotations to add or replace.
+        annotations: Vec<AnnotationSpec>,
+        /// Remove every annotation in this group first, in the same step.
+        replace_group: Option<String>,
+    },
+    /// Remove annotations by id. Unknown ids are ignored.
+    RemoveAnnotations {
+        /// Identifiers to remove.
+        ids: Vec<String>,
+    },
+    /// Remove every annotation, or every annotation in one group.
+    ClearAnnotations {
+        /// Group to clear; all annotations when absent.
+        group: Option<String>,
+    },
+    /// Return the current annotations with their most recently drawn bounds.
+    ListAnnotations,
+    /// Append a message from the agent to the application.
+    SendMessage {
+        /// The message.
+        message: NewMessage,
+    },
+    /// Read messages after an id, optionally waiting for one to arrive.
+    ReadMessages {
+        /// Return messages with a greater id.
+        after: u64,
+        /// Only messages from this side.
+        from: Option<MessageSender>,
+        /// Maximum messages, from 1 through 128.
+        limit: u16,
+        /// Wait up to this many milliseconds for a matching message when none is
+        /// available yet; zero returns at once. A wait that times out returns an
+        /// empty page rather than an error.
+        wait_ms: u64,
+        /// Count the app's messages in this page as read by the agent.
+        mark_read: bool,
+    },
     /// Return current frame timing statistics.
     GetFrameStats,
     /// Return the current window-relative logical pointer position from GPUI's input pipeline.
@@ -1268,6 +1328,12 @@ pub enum BridgeResult {
     ApplicationCommands(Vec<ApplicationCommandDescriptor>),
     /// Structured application command outcome.
     ApplicationCommand(ApplicationCommandResult),
+    /// Current or changed annotations.
+    Annotations(Vec<Annotation>),
+    /// One accepted message.
+    Message(Message),
+    /// A page of messages.
+    Messages(MessagePage),
 }
 
 /// Stable error code safe to expose to MCP clients.

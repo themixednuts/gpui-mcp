@@ -1,17 +1,22 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::AccessibilityFrame;
 use gpui_mcp_protocol::{
-    BridgeError, Distribution, ErrorCode, FrameReport, FrameSample, FrameStats, FrameSummary,
-    Highlight, LogEntry, MAX_FRAME_SAMPLES, MAX_FRAME_VIEWS, MAX_ID_BYTES, MAX_LABEL_BYTES,
-    MAX_METADATA_FIELDS, MAX_METADATA_KEY_BYTES, MAX_METADATA_VALUE_BYTES, MAX_TEXT_BYTES,
-    MAX_TREE_NODES, Rect, SemanticDiagnostic, SemanticDiagnosticCode, UiNode, UiTree, ViewActivity,
+    Annotation, AnnotationSource, AnnotationSpec, BridgeError, Distribution, ErrorCode,
+    FrameReport, FrameSample, FrameStats, FrameSummary, Highlight, LogEntry, MAX_FRAME_SAMPLES,
+    MAX_FRAME_VIEWS, MAX_ID_BYTES, MAX_LABEL_BYTES, MAX_METADATA_FIELDS, MAX_METADATA_KEY_BYTES,
+    MAX_METADATA_VALUE_BYTES, MAX_TEXT_BYTES, MAX_TREE_NODES, Message, MessagePage, MessageSender,
+    NewMessage, Rect, SemanticDiagnostic, SemanticDiagnosticCode, UiNode, UiTree, ViewActivity,
     ViewDraw, ViewOutcome, ViewRenderCause, WindowGeometry,
 };
 use tokio::sync::watch;
 use tokio::time::timeout;
+
+use crate::annotations::{AnnotationStore, HIGHLIGHT_GROUP, PaintItem};
+use crate::messages::MessageLog;
 
 const MAX_TIMING_SAMPLES: usize = 240;
 const MAX_DIAGNOSTICS: usize = 128;
@@ -128,7 +133,19 @@ pub(crate) struct SharedState {
     converting: Mutex<()>,
     /// Counts accessibility frames handed over, to wake tree waiters.
     semantic_frames: watch::Sender<u64>,
-    highlights: RwLock<Vec<Highlight>>,
+    annotations: Mutex<AnnotationStore>,
+    /// Number of annotations, read on every frame without taking the lock.
+    annotation_count: AtomicUsize,
+    annotation_changes: watch::Sender<AnnotationChange>,
+    /// The latest accessibility frame, kept only while annotations need it.
+    overlay_frame: Mutex<Option<Arc<AccessibilityFrame>>>,
+    paint_annotations: AtomicBool,
+    /// Deadline of the scheduled expiry frame, if one is scheduled.
+    expiry_timer: Mutex<Option<Instant>>,
+    messages: Mutex<MessageLog>,
+    /// Id of the newest message, to wake readers.
+    message_events: watch::Sender<u64>,
+    accepts_agent_messages: AtomicBool,
     timings: Mutex<TimingState>,
     logs: Mutex<VecDeque<LogEntry>>,
     completed_frame: watch::Sender<FrameStats>,
@@ -155,7 +172,15 @@ impl SharedState {
             intake: Mutex::new(SemanticIntake::default()),
             converting: Mutex::new(()),
             semantic_frames,
-            highlights: RwLock::new(Vec::new()),
+            annotations: Mutex::new(AnnotationStore::default()),
+            annotation_count: AtomicUsize::new(0),
+            annotation_changes: watch::channel(AnnotationChange::default()).0,
+            overlay_frame: Mutex::new(None),
+            paint_annotations: AtomicBool::new(true),
+            expiry_timer: Mutex::new(None),
+            messages: Mutex::new(MessageLog::default()),
+            message_events: watch::channel(0).0,
+            accepts_agent_messages: AtomicBool::new(false),
             timings: Mutex::new(TimingState::default()),
             logs: Mutex::new(VecDeque::with_capacity(512)),
             completed_frame,
@@ -491,18 +516,259 @@ impl SharedState {
             .map_err(|_| BridgeError::new(ErrorCode::Timeout, "frame wait timed out"))?
     }
 
+    /// Show legacy highlights as fixed-rectangle annotations in their own group.
     pub(crate) fn set_highlights(&self, highlights: Vec<Highlight>) {
-        *self
-            .highlights
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = highlights;
+        let specs = highlights
+            .into_iter()
+            .enumerate()
+            .map(|(index, highlight)| {
+                let mut spec = AnnotationSpec::rect(highlight.rect)
+                    .with_id(format!("highlight-{index}"))
+                    .with_color(highlight.color)
+                    .with_group(HIGHLIGHT_GROUP);
+                spec.label = highlight.label;
+                spec
+            })
+            .collect();
+        if let Err(error) =
+            self.upsert_annotations(specs, Some(HIGHLIGHT_GROUP), AnnotationSource::Agent)
+        {
+            tracing::warn!(message = %error.message, "could not show highlights");
+        }
     }
 
-    pub(crate) fn highlights(&self) -> Vec<Highlight> {
-        self.highlights
-            .read()
+    fn with_annotations<R>(
+        &self,
+        source: AnnotationSource,
+        change: impl FnOnce(&mut AnnotationStore) -> R,
+        changed: impl FnOnce(&R) -> bool,
+    ) -> R {
+        let mut store = self
+            .annotations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = change(&mut store);
+        if changed(&result) {
+            self.annotation_count.store(store.len(), Ordering::Release);
+            drop(store);
+            self.annotation_changes.send_modify(|current| {
+                current.revision += 1;
+                current.source = source;
+            });
+        }
+        result
+    }
+
+    pub(crate) fn upsert_annotations(
+        &self,
+        specs: Vec<AnnotationSpec>,
+        replace_group: Option<&str>,
+        source: AnnotationSource,
+    ) -> Result<Vec<Annotation>, BridgeError> {
+        self.with_annotations(
+            source,
+            |store| store.upsert(specs, replace_group, source, unix_ms()),
+            Result::is_ok,
+        )
+    }
+
+    pub(crate) fn remove_annotations(
+        &self,
+        ids: &[impl AsRef<str>],
+        source: AnnotationSource,
+    ) -> usize {
+        self.with_annotations(source, |store| store.remove(ids), |removed| *removed > 0)
+    }
+
+    pub(crate) fn clear_annotations(&self, group: Option<&str>, source: AnnotationSource) -> usize {
+        self.with_annotations(source, |store| store.clear(group), |removed| *removed > 0)
+    }
+
+    pub(crate) fn annotations(&self) -> Vec<Annotation> {
+        self.annotations
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .list()
+    }
+
+    pub(crate) fn subscribe_annotations(&self) -> watch::Receiver<AnnotationChange> {
+        self.annotation_changes.subscribe()
+    }
+
+    /// Wake annotation listeners without changing anything.
+    pub(crate) fn notify_annotation_listeners(&self) {
+        self.annotation_changes.send_modify(|_| {});
+    }
+
+    pub(crate) fn annotation_revision(&self) -> u64 {
+        self.annotation_changes.borrow().revision
+    }
+
+    pub(crate) fn set_paint_annotations(&self, paint: bool) {
+        self.paint_annotations.store(paint, Ordering::Release);
+    }
+
+    pub(crate) fn paints_annotations(&self) -> bool {
+        self.paint_annotations.load(Ordering::Acquire)
+    }
+
+    /// Whether the overlay pass needs this frame's accessibility tree.
+    pub(crate) fn has_annotations(&self) -> bool {
+        self.annotation_count.load(Ordering::Acquire) > 0
+    }
+
+    /// Keep the frame for resolving annotation targets, or release a kept one.
+    pub(crate) fn keep_overlay_frame(&self, frame: Option<&Arc<AccessibilityFrame>>) {
+        let replaced = std::mem::replace(
+            &mut *self
+                .overlay_frame
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            frame.cloned(),
+        );
+        drop(replaced);
+    }
+
+    /// Drop expired annotations, then return what to draw this frame, the
+    /// frame to resolve node targets against, and the next expiry.
+    pub(crate) fn annotation_paint(
+        &self,
+        now: Instant,
+    ) -> (
+        Vec<PaintItem>,
+        Option<Arc<AccessibilityFrame>>,
+        Option<Instant>,
+    ) {
+        let (items, next_expiry, _) = self.with_annotations(
+            AnnotationSource::Bridge,
+            |store| {
+                let pruned = store.prune_expired(now);
+                (store.paint_items(), store.next_expiry(), pruned)
+            },
+            |(_, _, pruned)| *pruned,
+        );
+        let frame = self
+            .overlay_frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (items, frame, next_expiry)
+    }
+
+    pub(crate) fn record_resolved(&self, resolved: &BTreeMap<String, Option<Rect>>) {
+        self.annotations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_resolved(resolved);
+    }
+
+    /// Claim the expiry frame for `deadline`, unless an earlier one is scheduled.
+    pub(crate) fn claim_expiry_timer(&self, deadline: Instant) -> bool {
+        let mut scheduled = self
+            .expiry_timer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if scheduled.is_some_and(|current| current <= deadline) {
+            return false;
+        }
+        *scheduled = Some(deadline);
+        true
+    }
+
+    pub(crate) fn expiry_timer_fired(&self, deadline: Instant) {
+        let mut scheduled = self
+            .expiry_timer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *scheduled == Some(deadline) {
+            *scheduled = None;
+        }
+    }
+
+    pub(crate) fn post_message(
+        &self,
+        from: MessageSender,
+        message: NewMessage,
+    ) -> Result<Message, BridgeError> {
+        let posted = self
+            .messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .post(from, message, unix_ms())?;
+        self.message_events.send_replace(posted.id);
+        Ok(posted)
+    }
+
+    pub(crate) fn read_messages(
+        &self,
+        after: u64,
+        from: Option<MessageSender>,
+        limit: usize,
+        reader: Option<MessageSender>,
+    ) -> MessagePage {
+        let page = self
+            .messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .read(after, from, limit, reader);
+        if reader.is_some() {
+            // Readers can free room for a blocked writer; wake waiters to recount.
+            self.message_events.send_modify(|_| {});
+        }
+        page
+    }
+
+    pub(crate) fn mark_messages_read(&self, reader: MessageSender, id: u64) {
+        self.messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mark_read(reader, id);
+    }
+
+    pub(crate) fn set_accepts_agent_messages(&self, accepts: bool) {
+        self.accepts_agent_messages
+            .store(accepts, Ordering::Release);
+    }
+
+    pub(crate) fn accepts_agent_messages(&self) -> bool {
+        self.accepts_agent_messages.load(Ordering::Acquire)
+    }
+
+    /// Wake message readers without posting anything.
+    pub(crate) fn wake_message_readers(&self) {
+        self.message_events.send_modify(|_| {});
+    }
+
+    pub(crate) fn subscribe_messages(&self) -> watch::Receiver<u64> {
+        self.message_events.subscribe()
+    }
+
+    /// Read messages after `after`, waiting up to `wait` for a matching one.
+    /// A wait that times out returns an empty page.
+    pub(crate) async fn wait_for_messages(
+        &self,
+        after: u64,
+        from: Option<MessageSender>,
+        limit: usize,
+        wait: Duration,
+        reader: Option<MessageSender>,
+    ) -> MessagePage {
+        let mut receiver = self.message_events.subscribe();
+        let arrived = async {
+            loop {
+                receiver.borrow_and_update();
+                let available = self
+                    .messages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .has_after(after, from);
+                if available || receiver.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+        let _ = timeout(wait, arrived).await;
+        self.read_messages(after, from, limit, reader)
     }
 
     pub(crate) fn frame_stats(&self) -> FrameStats {
@@ -510,12 +776,7 @@ impl SharedState {
     }
 
     pub(crate) fn add_log(&self, level: &str, message: &str) {
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX);
+        let timestamp_ms = unix_ms();
         let mut sanitized = message.replace(['\r', '\n'], " ");
         sanitized.truncate(sanitized.floor_char_boundary(4096));
         let mut logs = self
@@ -1025,6 +1286,33 @@ fn level_rank(level: &str) -> u8 {
         "error" => 4,
         _ => 2,
     }
+}
+
+/// The latest change to the annotation set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AnnotationChange {
+    /// Increases with every change.
+    pub(crate) revision: u64,
+    /// Who made the latest change.
+    pub(crate) source: AnnotationSource,
+}
+
+impl Default for AnnotationChange {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            source: AnnotationSource::Bridge,
+        }
+    }
+}
+
+pub(crate) fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 pub(crate) fn rect_from_gpui(bounds: gpui::Bounds<gpui::Pixels>) -> Rect {

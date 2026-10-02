@@ -100,12 +100,93 @@ For HTML-authored interfaces that agents can also edit live, see the
 | Discover | `list_apps`, `select_app`, `get_ui_tree`, `find_elements`, `get_element` |
 | Act | `click_element`, `type_text`, `set_text`, `set_value`, `keyboard`, `hover_element`, `drag_element`, `scroll`, `pointer_*` |
 | Verify | `wait_for_element`, `wait_for_state`, `get_element_state`, `save_ui_snapshot`, `diff_current_ui` |
-| Pixels | `screenshot`, `screenshot_element`, `compare_screenshots`, `highlight_elements`, `start_video_recording` |
+| Pixels | `screenshot`, `screenshot_element`, `compare_screenshots`, `start_video_recording` |
+| Annotate | `annotate_elements`, `remove_annotations`, `list_annotations`, `highlight_elements`, `clear_highlights` |
+| Talk to the app | `read_messages`, `wait_for_messages`, `send_message`, the `gpui://messages` resource |
 | Performance | `mark_frames`, `get_frame_report`, `record_performance` |
 | Live edit | `get_live_document`, `preview_live_document` |
 
 Prefer the element tools over coordinates. All coordinates are logical pixels
 relative to the window.
+
+Clients that support the MCP tasks extension (SEP-2663) get the tools that can
+block for seconds (`wait_for_messages`, `wait_for_element`, `wait_for_state`,
+`record_performance`) as tasks they poll with `tasks/get`, so a long wait does
+not hold the client. Other clients get the same result from an ordinary call.
+
+## Annotations
+
+An annotation marks a semantic element, or a fixed rectangle, with an outline
+or fill and an optional label drawn as a tag. Node annotations are resolved
+again on every frame, so they follow the element through layout changes,
+scrolling and zoom, and hide while it is absent, hidden, or scrolled out of
+its scroll container. Each has an id (reuse it to update the annotation), an
+optional group, and an optional lifetime that starts at the first frame that
+draws it. Agents use `annotate_elements`; `highlight_elements` is a thin
+wrapper that outlines elements in the `highlights` group.
+
+The application shares the same set. It can add its own annotations, observe
+the agent's, and draw them itself:
+
+```rust,ignore
+use gpui_mcp::{AnnotationSpec, AnnotationStyle};
+
+let automation = bridge.automation();
+automation.annotate(
+    AnnotationSpec::node("save")
+        .with_label("Unsaved changes")
+        .with_style(AnnotationStyle::OutlineFill)
+        .with_color("#FFB020FF")
+        .with_ttl_ms(5_000),
+    window,
+)?;
+
+// Called after every change by the agent, the app, or expiry.
+bridge.on_annotations(|event, _window, cx| {
+    // event.annotations: the full set; event.changed_by: Agent, App or Bridge
+})?;
+
+// Draw them yourself instead; bounds are still resolved every frame.
+automation.paint_annotations(false, window);
+let drawn = automation.annotations(); // each with `resolved` bounds
+```
+
+## Talking to the agent from your app
+
+There is no model in the bridge. An in-app chat box talks to the person's own
+MCP agent (Claude Code, Codex, or any other client) through a bounded message
+log: messages have monotonic ids and timestamps, either side reads by id, and
+each side may have at most 64 messages the other has not read.
+
+```rust,ignore
+use gpui_mcp::NewMessage;
+
+// Receive the agent's messages on the GPUI thread, once each, in order.
+// Registering this also tells the agent that the app reads messages.
+bridge.on_message(|message, _window, cx| {
+    // show message.text; message.reply_to names the app message it answers
+})?;
+
+// Post what the person typed.
+bridge.post_message(NewMessage::text("Make the toolbar denser"))?;
+```
+
+The agent reads the app's messages with `read_messages` (pass the returned
+`latest_id` as `since` next time) and replies with `send_message`, naming the
+message it answers in `reply_to`. To wait for the person's next message:
+
+- any client can call `wait_for_messages` in a loop; each call blocks for up
+  to 30 seconds and returns an empty page with `timed_out: true` when nothing
+  arrived;
+- clients that support MCP tasks run that wait as a task instead of a
+  blocking call;
+- clients that subscribe to resources can subscribe to `gpui://messages`
+  (with `resources/subscribe` or `subscriptions/listen`) and receive
+  `notifications/resources/updated` whenever the app posts a message.
+
+For a chat loop, tell the agent something like: "Call `wait_for_messages` with
+the latest id you have seen, act on each message from the app, and answer it
+with `send_message`, then wait again."
 
 ## GPUI Kit, `gpui-pre` and `gpui-ce`
 
@@ -179,11 +260,17 @@ patches of your own, keep your own patched copy instead:
    ```
 
 The patches are in [`vendor/patches/`](vendor/patches), one folder per crate
-and version. Each version has two:
+and version. Each version has three:
 
 - `automation.patch` has everything the bridge needs.
 - `font-fallback.patch` is an unrelated font fix. Add `--without font-fallback`
   to skip it.
+- `grid.patch` exposes CSS grid track lists (`grid_template_columns`,
+  `grid_template_rows`, `grid_auto_rows`, `grid_auto_flow`, `grid_column`,
+  `grid_row`, with `px`, `%`, `fr`, `auto`, `min-content`, `max-content`,
+  `minmax()`, `fit-content()` and `repeat(n | auto-fill | auto-fit, …)`).
+  The bridge doesn't need it, but `gpui-mcp-html` does. Add
+  `--without grid` to skip it.
 
 CI builds and tests the bridge against every supported version, so these
 patches are kept working.
@@ -197,7 +284,10 @@ patches are kept working.
   Custom-drawn components only show what they annotate.
 - In Kit 0.7.0, disabled controls report `enabled: true` and read-only inputs
   don't report `read_only`. Kit doesn't publish these states yet.
-- `gpui-mcp-html` only supports the Zed backend for now.
+- `gpui-mcp-html` works with GPUI Kit too: add it with
+  `default-features = false, features = ["gpui-pre", "json", "ron"]`. Its
+  `grid-template-*` support needs the `grid.patch` described below, which the
+  `[patch]` recipe already includes.
 
 ## Measuring frame cost
 
@@ -228,7 +318,7 @@ fixed interval. In process, use `Automation::mark_frames` and
 `Automation::frame_report`.
 
 `bridge_ms` is the work the bridge adds to a draw: finishing the accessibility
-tree, building the observed frame, and painting highlights. The semantic tree
+tree, building the observed frame, and painting annotations. The semantic tree
 is converted off the UI thread when a client reads it.
 
 ## Platform notes

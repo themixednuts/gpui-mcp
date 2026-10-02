@@ -94,9 +94,11 @@ impl BridgeClient {
     pub(crate) async fn call(&self, operation: Operation) -> Result<BridgeResult, String> {
         let response_timeout = match &operation {
             Operation::WaitForTree { timeout_ms, .. }
-            | Operation::WaitForFrame { timeout_ms, .. } => {
-                Duration::from_millis(*timeout_ms).saturating_add(IO_TIMEOUT)
-            }
+            | Operation::WaitForFrame { timeout_ms, .. }
+            | Operation::ReadMessages {
+                wait_ms: timeout_ms,
+                ..
+            } => Duration::from_millis(*timeout_ms).saturating_add(IO_TIMEOUT),
             _ => IO_TIMEOUT,
         };
         let request_id =

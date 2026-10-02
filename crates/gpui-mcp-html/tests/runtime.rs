@@ -1,5 +1,8 @@
 //! End-to-end pure HTML rendering through a real GPUI test window and MCP semantics.
 
+#[cfg(feature = "gpui-pre")]
+extern crate gpui_pre as gpui;
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -1011,4 +1014,161 @@ fn embedded_component_height_tracks_its_flex_host(cx: &mut TestAppContext) {
             Some(expected_canvas_height)
         );
     }
+}
+
+fn assert_close(actual: f32, expected: f32, what: &str) {
+    assert!(
+        (actual - expected).abs() < 0.5,
+        "{what}: expected {expected}, got {actual}"
+    );
+}
+
+#[gpui::test]
+fn css_grid_track_lists_lay_out_like_css(cx: &mut TestAppContext) {
+    cx.update(gpui_mcp_html::init);
+    let html = r#"<main id="page">
+  <section id="layout">
+    <div id="sidebar"></div><div id="content"></div><div id="aside"></div>
+    <div id="footer"></div>
+  </section>
+  <section id="cards">
+    <div id="card-0" class="card"></div><div id="card-1" class="card"></div>
+    <div id="card-2" class="card"></div><div id="card-3" class="card"></div>
+    <div id="card-4" class="card"></div>
+  </section>
+</main>"#;
+    let css = "body { width: 600px; height: 400px; }
+#page { display: flex; flex-direction: column; }
+#layout {
+  display: grid;
+  width: 400px;
+  grid-template-columns: 100px 1fr 2fr;
+  grid-template-rows: 30px;
+  grid-auto-rows: 15px;
+}
+#footer { grid-column: 2 / span 2; }
+#cards { display: grid; width: 200px; grid-template-columns: repeat(auto-fill, 50px); row-gap: 5px; }
+.card { height: 10px; }";
+    let Some(ui) = expect_ok(
+        HtmlUi::compile_with_stylesheet(html, BindingDocument::new(), "grid.css", css),
+        "grid fixture should compile",
+    ) else {
+        return;
+    };
+    let automation = Automation::for_test();
+    let Some(live) = expect_ok(
+        LiveHtml::new(ui, automation.clone(), HookRegistry::new()),
+        "grid fixture should connect",
+    ) else {
+        return;
+    };
+    assert!(live.diagnostics().is_empty(), "{:?}", live.diagnostics());
+    let (_view, visual) = cx.add_window_view(|_, _| RuntimeView { live });
+    visual.run_until_parked();
+
+    let tree = automation.snapshot();
+    let bounds = |id: &str| tree.nodes[id].bounds.unwrap_or_default();
+    let origin = bounds("layout");
+    let column = |id: &str| (bounds(id).x - origin.x, bounds(id).width);
+    assert_eq!(column("sidebar"), (0.0, 100.0));
+    assert_eq!(column("content"), (100.0, 100.0));
+    assert_eq!(column("aside"), (200.0, 200.0));
+    assert_close(bounds("sidebar").height, 30.0, "explicit row height");
+    // The spanning footer lands in an implicit row sized by grid-auto-rows.
+    assert_eq!(column("footer"), (100.0, 300.0));
+    assert_close(bounds("footer").height, 15.0, "implicit row height");
+    assert_close(bounds("footer").y - origin.y, 30.0, "implicit row offset");
+
+    // repeat(auto-fill, 50px) in 200px makes four columns, so the fifth card wraps.
+    let first = bounds("card-0");
+    assert_close(
+        bounds("card-3").x - first.x,
+        150.0,
+        "fourth auto-fill column",
+    );
+    assert_close(bounds("card-4").x, first.x, "wrapped card column");
+    assert_close(
+        bounds("card-4").y - first.y,
+        15.0,
+        "one 10px row plus a 5px row gap",
+    );
+}
+
+#[gpui::test]
+fn rendered_elements_map_back_to_their_markup(cx: &mut TestAppContext) {
+    cx.update(gpui_mcp_html::init);
+    let html = "<main id=\"app\">\n  <p>Intro</p>\n  <button id=\"go\">Go</button>\n</main>";
+    let Some(ui) = expect_ok(
+        HtmlUi::compile(html, BindingDocument::new()),
+        "source map fixture should compile",
+    ) else {
+        return;
+    };
+    let automation = Automation::for_test();
+    let Some(live) = expect_ok(
+        LiveHtml::new(ui, automation.clone(), HookRegistry::new()),
+        "source map fixture should connect",
+    ) else {
+        return;
+    };
+    let Some(namespace) = expect_ok(SemanticNamespace::new("editor"), "valid namespace") else {
+        return;
+    };
+    let live = live.embedded(namespace);
+    let map = live.source_map();
+    let (_view, visual) = cx.add_window_view(|_, _| RuntimeView { live });
+    visual.run_until_parked();
+    let tree = automation.snapshot();
+
+    let markup = |node: &gpui_mcp_html::SourceNode| {
+        node.span
+            .clone()
+            .map(|span| &html[span])
+            .unwrap_or_default()
+    };
+    let by_tag = |tag: &str| map.nodes().iter().find(|node| node.tag == tag);
+
+    // The paragraph has no authored id, yet maps to its markup through a generated one.
+    let paragraph = by_tag("p");
+    assert_eq!(paragraph.map(markup), Some("<p>Intro</p>"));
+    assert_eq!(paragraph.and_then(|p| p.authored_id.clone()), None);
+    assert_eq!(
+        paragraph.map(|p| (p.line, p.column)),
+        Some((Some(2), Some(3)))
+    );
+    assert!(paragraph.is_some_and(|p| p.element_id.as_str().starts_with("html-node-")));
+
+    let button = by_tag("button");
+    assert_eq!(button.map(|b| b.semantic_id.as_str()), Some("editor--go"));
+    assert_eq!(
+        button.and_then(|b| map.get(&b.semantic_id)).map(markup),
+        Some("<button id=\"go\">Go</button>")
+    );
+    assert_eq!(
+        button.and_then(|b| b.parent.as_deref()),
+        by_tag("main").map(|main| main.semantic_id.as_str())
+    );
+
+    // Every mapped element is in the live tree under its semantic id, with its span.
+    for node in map.nodes() {
+        let rendered = tree.nodes.get(&node.semantic_id);
+        assert!(rendered.is_some(), "{} was not rendered", node.semantic_id);
+        let span = node
+            .span
+            .clone()
+            .map(|span| format!("{}..{}", span.start, span.end));
+        assert_eq!(
+            rendered.and_then(|rendered| rendered.metadata.get("source_span").cloned()),
+            span,
+            "{}",
+            node.semantic_id
+        );
+    }
+
+    // An offset inside the button's text resolves to the button, not <main>.
+    let offset = html.find("Go<").unwrap_or_default();
+    assert_eq!(
+        map.at_offset(offset).map(|node| node.tag.as_str()),
+        Some("button")
+    );
 }

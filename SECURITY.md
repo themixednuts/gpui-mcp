@@ -25,6 +25,8 @@ The bridge defends against unauthorized local IPC clients, cross-user endpoint a
 
 Video recording is state owned by one MCP server process. `start_video_recording` and `stop_video_recording` must run over the same initialized MCP transport. Continuous mode captures settled GPUI frames at a bounded rate; `capture_video_frame` is an optional checkpoint. Session IDs bind in-flight captures and encoding to the recording that created them; duplicate starts, concurrent captures, and calls made while encoding are rejected. Repeated capture failures stop the continuous worker instead of retrying unboundedly. Failed or cancelled capture requests release only their own session reservation. Failed encoding restores captured frames so the same session can be retried. The output is a real H.264/MP4 file; optional cursor overlays use GPUI's window-relative pointer state.
 
+Messages and annotations carry text between the application and the agent. Treat each direction as untrusted input: a message the application posts (often typed by a person) reaches the agent's context and can attempt to redirect it, and an agent's message or annotation label is shown to the person by the application. Both are bounded (16 KiB of text and 16 KiB of data per message, 64 unread messages per direction, 128 annotations, 128-byte labels without control characters), and the bridge never executes either.
+
 The following are outside its boundary:
 
 - a process already running with the same user's privileges and able to read that user's private runtime/local-data files;

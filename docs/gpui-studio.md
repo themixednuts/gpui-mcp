@@ -52,7 +52,11 @@ chat surface.
 
 Primary modes are Design, Source, Split, Test, and Compare. An AI command bar
 opens on demand and shows proposed operations/diffs before apply; it does not
-replace the outline or inspector. Selecting an element synchronizes canvas,
+replace the outline or inspector. Studio has no built-in model: the command
+bar talks to the person's own MCP agent through the bridge's message log
+(`BridgeHandle::post_message` / `on_message`, and the agent's `read_messages`,
+`wait_for_messages` and `send_message`), and the agent points at canvas
+elements with annotations that Studio can mirror through `on_annotations`. Selecting an element synchronizes canvas,
 HTML, applicable CSS rules, semantic node, bindings, and diagnostics.
 
 High-value manual features include:

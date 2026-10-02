@@ -41,13 +41,23 @@ source files use LF line endings, and the published `Cargo.lock` is removed.
 | `gpui-pre` | 0.3.5, 0.3.6, 0.3.7 | 0.3.7 |
 | `gpui-ce` | 0.2.2 | 0.2.2 |
 
-Each version has its own folder in `patches/<crate>/<version>/` with two
+Each version has its own folder in `patches/<crate>/<version>/` with three
 patches, applied in this order:
 
 1. `automation.patch`: everything the bridge needs.
 2. `font-fallback.patch`: keeps the requested weight and style when a font
    falls back to another family. The bridge doesn't need it, so it can be
    skipped.
+3. `grid.patch`: CSS grid track lists. Upstream GPUI only offers
+   `grid_cols(n)` / `grid_rows(n)`, which always mean
+   `repeat(n, minmax(0, 1fr))`, although taffy implements full CSS grid. This
+   adds `GridTrack`, `GridTrackSize`, `GridTrackBreadth`, `GridRepetition` and
+   `GridAutoFlow`, and the `Styled` builders `grid_template_columns`,
+   `grid_template_rows`, `grid_auto_columns`, `grid_auto_rows`,
+   `grid_auto_flow`, `grid_column` and `grid_row`. `gpui-mcp-html` needs it to
+   render `grid-template-*`; the bridge doesn't, so it can be skipped. The Zed
+   tree in `gpui/` carries the same change (see
+   [`gpui/PATCHES.md`](gpui/PATCHES.md)).
 
 The patches differ slightly between versions because the GPUI code they
 change differs:
@@ -80,6 +90,7 @@ cargo xtask vendor --crate gpui-ce
 # Write a patched copy of any supported version somewhere else
 cargo xtask vendor --crate gpui-pre --version 0.3.5 --output <dir>
 cargo xtask vendor --crate gpui-pre --version 0.3.5 --output <dir> --without font-fallback
+cargo xtask vendor --crate gpui-pre --version 0.3.5 --output <dir> --without font-fallback --without grid
 ```
 
 The script verifies the download's checksum and changes nothing if a patch
@@ -91,8 +102,11 @@ workspace `Cargo.toml` doesn't match its `.json` file.
 - Both vendored copies match the published crate plus their patches.
 - The bridge builds, passes its tests and passes Clippy on every OS against
   both vendored copies.
-- On Linux it does the same against patched `gpui-pre` 0.3.5 and 0.3.6, and
-  against `gpui-pre` 0.3.7 and `gpui-ce` 0.2.2 without the font patch.
+- On Linux it does the same against patched `gpui-pre` 0.3.5 and 0.3.6,
+  against `gpui-pre` 0.3.7 and `gpui-ce` 0.2.2 without the font patch, and
+  against `gpui-pre` 0.3.7 without the grid patch.
+- `gpui-mcp-html` builds, passes its tests and passes Clippy against the
+  vendored `gpui-pre` as well as the Zed tree.
 - The Kit demo builds and passes its tests.
 - The bridge builds and passes its tests on Rust 1.95, the oldest version it
   supports.

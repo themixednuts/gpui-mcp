@@ -92,6 +92,12 @@ jobs:
       - name: Test bridge with gpui-pre
         run: cargo test -p gpui-mcp --no-default-features --features gpui-pre,test-support --locked
 
+      - name: Test HTML runtime with gpui-pre
+        run: cargo test -p gpui-mcp-html --no-default-features --features gpui-pre,json,ron,dev-watch --locked
+
+      - name: Clippy HTML runtime with gpui-pre
+        run: cargo clippy -p gpui-mcp-html --all-targets --no-default-features --features gpui-pre,json,ron,dev-watch --locked -- -D warnings
+
       - name: Check GPUI Kit example formatting
         run: cargo fmt --manifest-path examples/gpui-kit/Cargo.toml -- --check
 
@@ -167,6 +173,9 @@ jobs:
           - crate: gpui-pre
             version: 0.3.7
             without: font-fallback
+          - crate: gpui-pre
+            version: 0.3.7
+            without: grid
           - crate: gpui-ce
             version: 0.2.2
             without: font-fallback

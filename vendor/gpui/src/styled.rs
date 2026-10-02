@@ -1,7 +1,8 @@
 use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
-    FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
+    FontWeight, GridAutoFlow, GridPlacement, GridTemplate, GridTemplateMinSize, GridTrack,
+    GridTrackSize, Hsla, JustifyContent, Length,
     SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
     TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
 };
@@ -745,6 +746,50 @@ pub trait Styled: Sized {
     /// Sets the opacity of this element and its children.
     fn opacity(mut self, opacity: f32) -> Self {
         self.style().opacity = Some(opacity);
+        self
+    }
+
+    /// Sets explicit column tracks, as CSS `grid-template-columns`, for example
+    /// `[GridTrackSize::length(px(200.)).into(), GridTrack::repeat(2, [GridTrackSize::fr(1.)])]`.
+    /// Takes precedence over [`Self::grid_cols`].
+    fn grid_template_columns(mut self, tracks: impl IntoIterator<Item = GridTrack>) -> Self {
+        self.style().grid_template_columns = Some(tracks.into_iter().collect());
+        self
+    }
+
+    /// Sets explicit row tracks, as CSS `grid-template-rows`. Takes precedence over [`Self::grid_rows`].
+    fn grid_template_rows(mut self, tracks: impl IntoIterator<Item = GridTrack>) -> Self {
+        self.style().grid_template_rows = Some(tracks.into_iter().collect());
+        self
+    }
+
+    /// Sets the size of implicitly created columns, as CSS `grid-auto-columns`.
+    fn grid_auto_columns(mut self, tracks: impl IntoIterator<Item = GridTrackSize>) -> Self {
+        self.style().grid_auto_columns = Some(tracks.into_iter().collect());
+        self
+    }
+
+    /// Sets the size of implicitly created rows, as CSS `grid-auto-rows`.
+    fn grid_auto_rows(mut self, tracks: impl IntoIterator<Item = GridTrackSize>) -> Self {
+        self.style().grid_auto_rows = Some(tracks.into_iter().collect());
+        self
+    }
+
+    /// Sets how auto-placed items flow, as CSS `grid-auto-flow`.
+    fn grid_auto_flow(mut self, flow: GridAutoFlow) -> Self {
+        self.style().grid_auto_flow = Some(flow);
+        self
+    }
+
+    /// Places this item between column lines, as CSS `grid-column: start / end`.
+    fn grid_column(mut self, start: GridPlacement, end: GridPlacement) -> Self {
+        self.style().grid_location_mut().column = start..end;
+        self
+    }
+
+    /// Places this item between row lines, as CSS `grid-row: start / end`.
+    fn grid_row(mut self, start: GridPlacement, end: GridPlacement) -> Self {
+        self.style().grid_location_mut().row = start..end;
         self
     }
 

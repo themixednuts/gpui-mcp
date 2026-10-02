@@ -22,6 +22,10 @@ This shape supports both ways of adopting the system:
    `gpui-mcp-html` project-generation API. It produces the bundle and a working
    GPUI/MCP host without overwriting an existing path.
 
+The renderer runs on Zed's GPUI (the default `zed` feature) and on the
+`gpui-pre` release GPUI Kit uses (`default-features = false, features =
+["gpui-pre", "json", "ron"]`). Generated projects use the Zed backend.
+
 ## Why HTML, RON, and JSON each have a separate job
 
 HTML is the visual document language. It already has useful structure, form
@@ -50,15 +54,36 @@ stylesheets must be supplied explicitly by the host. The compiler rejects:
 Validation is fail closed: an error prevents construction of `HtmlUi`; the
 compiler does not return a partially trusted render plan for execution.
 
-The initial live CSS subset covers flex layout, fixed-count equal-track grid,
-spacing, pixel dimensions, background/text/border colors, font family,
-size/weight/line height, and border radius. Single `:hover`, `:focus`, and
+The live CSS subset covers flex layout, CSS grid (track lists with lengths,
+percentages, `fr`, `auto`, `min-content`, `max-content`, `minmax()`,
+`fit-content()` and `repeat(n | auto-fill | auto-fit, …)` for
+`grid-template-columns` and `grid-template-rows`; `grid-auto-columns`,
+`grid-auto-rows` and `grid-auto-flow`; line and span placement with
+`grid-column`, `grid-row` and their `-start`/`-end` longhands; `row-gap` and
+`column-gap`), spacing, pixel dimensions, background/text/border colors, font
+family, size/weight/line height, and border radius. Single `:hover`, `:focus`, and
 `:active` variants map to GPUI's native interactive refinements. Standard
 `<details>` elements retain open/closed disclosure state and publish it through
-the semantic tree. Unsupported properties, lengths, unequal grid tracks,
+the semantic tree. Unsupported properties, lengths, named grid lines and areas,
 combined conditions, dynamic rules, and pseudo-elements remain in the document
 and produce `RenderDiagnostic` entries rather than disappearing silently. A
 builder should show these diagnostics next to the source.
+
+## Mapping the canvas back to source
+
+An editor needs to go from a rendered element to its markup and back, and most
+elements have no authored `id`. `LiveHtml::source_map()` maps every rendered
+element of the active revision to its semantic id (the id in the MCP tree,
+including any embedding namespace), its document id (authored, or a generated
+`html-node-…` id derived from its position), tag, position path, parent, and
+the byte range, line and column of its markup in the HTML source.
+`SourceMap::get(semantic_id)` resolves a selection on the canvas, and
+`SourceMap::at_offset(byte)` resolves an editor caret to the innermost element.
+
+Each rendered node also carries `source_span` metadata (`start..end`) in the
+semantic tree, so an MCP agent can map `get_ui_tree` nodes back to source
+without the Rust API. Generated ids change when an element moves; spans are
+per revision. Give an element an `id` when its identity must survive edits.
 
 ## Binding document
 

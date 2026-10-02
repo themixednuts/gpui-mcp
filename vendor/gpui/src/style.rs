@@ -174,6 +174,127 @@ pub struct GridTemplate {
     pub min_size: GridTemplateMinSize,
 }
 
+/// One breadth of a grid track: a length, a flexible fraction, or a keyword.
+#[derive(Copy, Clone, PartialEq, Debug, JsonSchema, Serialize, Deserialize)]
+pub enum GridTrackBreadth {
+    /// A length (`px`, `rem`) or a fraction of the grid container (`%`).
+    Length(DefiniteLength),
+    /// A share of the free space, as CSS `fr`. Valid only as a track's maximum;
+    /// as a minimum it behaves as `auto`, as CSS requires.
+    Fraction(f32),
+    /// `auto`.
+    Auto,
+    /// `min-content`.
+    MinContent,
+    /// `max-content`.
+    MaxContent,
+}
+
+/// The size of one grid track, as one value of `grid-template-columns`.
+#[derive(Copy, Clone, PartialEq, Debug, JsonSchema, Serialize, Deserialize)]
+pub enum GridTrackSize {
+    /// A single breadth, such as `120px`, `25%`, `1fr`, `auto` or `min-content`.
+    Breadth(GridTrackBreadth),
+    /// `minmax(min, max)`.
+    MinMax(GridTrackBreadth, GridTrackBreadth),
+    /// `fit-content(limit)`.
+    FitContent(DefiniteLength),
+}
+
+impl GridTrackSize {
+    /// A fixed length or percentage, such as `px(120.)` or `relative(0.25)`.
+    pub fn length(length: impl Into<DefiniteLength>) -> Self {
+        Self::Breadth(GridTrackBreadth::Length(length.into()))
+    }
+
+    /// A share of the free space, as CSS `fr`.
+    pub fn fr(fraction: f32) -> Self {
+        Self::Breadth(GridTrackBreadth::Fraction(fraction))
+    }
+
+    /// `auto`.
+    pub fn auto() -> Self {
+        Self::Breadth(GridTrackBreadth::Auto)
+    }
+
+    /// `min-content`.
+    pub fn min_content() -> Self {
+        Self::Breadth(GridTrackBreadth::MinContent)
+    }
+
+    /// `max-content`.
+    pub fn max_content() -> Self {
+        Self::Breadth(GridTrackBreadth::MaxContent)
+    }
+
+    /// `minmax(min, max)`.
+    pub fn minmax(min: GridTrackBreadth, max: GridTrackBreadth) -> Self {
+        Self::MinMax(min, max)
+    }
+
+    /// `fit-content(limit)`.
+    pub fn fit_content(limit: impl Into<DefiniteLength>) -> Self {
+        Self::FitContent(limit.into())
+    }
+}
+
+/// How many times a `repeat()` repeats its tracks.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, JsonSchema, Serialize, Deserialize)]
+pub enum GridRepetition {
+    /// `repeat(n, …)`.
+    Count(u16),
+    /// `repeat(auto-fill, …)`: as many as fit, keeping empty tracks.
+    AutoFill,
+    /// `repeat(auto-fit, …)`: as many as fit, collapsing empty tracks.
+    AutoFit,
+}
+
+/// One entry of a `grid-template-columns` or `grid-template-rows` track list.
+#[derive(Clone, PartialEq, Debug, JsonSchema, Serialize, Deserialize)]
+pub enum GridTrack {
+    /// One track.
+    Single(GridTrackSize),
+    /// `repeat(count, tracks…)`.
+    Repeat(GridRepetition, Vec<GridTrackSize>),
+}
+
+impl GridTrack {
+    /// `repeat(count, tracks…)`.
+    pub fn repeat(count: u16, tracks: impl IntoIterator<Item = GridTrackSize>) -> Self {
+        Self::Repeat(GridRepetition::Count(count), tracks.into_iter().collect())
+    }
+
+    /// `repeat(auto-fill, tracks…)`.
+    pub fn auto_fill(tracks: impl IntoIterator<Item = GridTrackSize>) -> Self {
+        Self::Repeat(GridRepetition::AutoFill, tracks.into_iter().collect())
+    }
+
+    /// `repeat(auto-fit, tracks…)`.
+    pub fn auto_fit(tracks: impl IntoIterator<Item = GridTrackSize>) -> Self {
+        Self::Repeat(GridRepetition::AutoFit, tracks.into_iter().collect())
+    }
+}
+
+impl From<GridTrackSize> for GridTrack {
+    fn from(size: GridTrackSize) -> Self {
+        Self::Single(size)
+    }
+}
+
+/// How grid items without an explicit position are placed, as CSS `grid-auto-flow`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, JsonSchema, Serialize, Deserialize)]
+pub enum GridAutoFlow {
+    /// Fill each row in turn.
+    #[default]
+    Row,
+    /// Fill each column in turn.
+    Column,
+    /// `row dense`: fill rows, back-filling earlier holes.
+    RowDense,
+    /// `column dense`: fill columns, back-filling earlier holes.
+    ColumnDense,
+}
+
 /// The CSS styling that can be applied to an element via the `Styled` trait
 #[derive(Clone, Refineable, Debug)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -311,6 +432,21 @@ pub struct Style {
 
     /// The grid location of this element
     pub grid_location: Option<GridLocation>,
+
+    /// Explicit column tracks, as CSS `grid-template-columns`. Takes precedence over `grid_cols`.
+    pub grid_template_columns: Option<Vec<GridTrack>>,
+
+    /// Explicit row tracks, as CSS `grid-template-rows`. Takes precedence over `grid_rows`.
+    pub grid_template_rows: Option<Vec<GridTrack>>,
+
+    /// Sizes of implicitly created columns, as CSS `grid-auto-columns`.
+    pub grid_auto_columns: Option<Vec<GridTrackSize>>,
+
+    /// Sizes of implicitly created rows, as CSS `grid-auto-rows`.
+    pub grid_auto_rows: Option<Vec<GridTrackSize>>,
+
+    /// How auto-placed items flow, as CSS `grid-auto-flow`.
+    pub grid_auto_flow: Option<GridAutoFlow>,
 
     /// Whether to draw a red debugging outline around this element
     #[cfg(debug_assertions)]
@@ -812,6 +948,11 @@ impl Default for Style {
             grid_rows: None,
             grid_cols: None,
             grid_location: None,
+            grid_template_columns: None,
+            grid_template_rows: None,
+            grid_auto_columns: None,
+            grid_auto_rows: None,
+            grid_auto_flow: None,
 
             #[cfg(debug_assertions)]
             debug: false,

@@ -23,7 +23,9 @@ extern crate gpui_ce as gpui;
 #[cfg(feature = "gpui-pre")]
 extern crate gpui_pre as gpui;
 
+mod annotations;
 mod input;
+mod messages;
 mod native_window;
 mod observer;
 mod registry;
@@ -32,6 +34,11 @@ mod service;
 use std::sync::Arc;
 
 pub use gpui_mcp_protocol::MouseButton;
+pub use gpui_mcp_protocol::{
+    Annotation, AnnotationSource, AnnotationSpec, AnnotationStyle, AnnotationTarget,
+    DEFAULT_ANNOTATION_COLOR, MAX_ANNOTATIONS, MAX_MESSAGE_PAGE, MAX_MESSAGE_TEXT_BYTES,
+    MAX_RETAINED_MESSAGES, MAX_UNREAD_MESSAGES, Message, MessagePage, MessageSender, NewMessage,
+};
 pub use gpui_mcp_protocol::{
     AppId, ApplicationCommandDescriptor, ApplicationCommandResult, BridgeError, ContextResource,
     ContextResourceDescriptor, Distribution, ErrorCode, FrameReport, FrameSample, FrameStats,
@@ -42,9 +49,9 @@ pub use gpui_mcp_protocol::{
     UiTree, ValueInfo, ViewActivity, ViewDraw, ViewOutcome, ViewRenderCause,
 };
 pub use service::{
-    ApplicationCommandRequest, ApplicationCommandResponse, BridgeConfig, BridgeConfigError,
-    BridgeHandle, ContextResourceRequest, ContextResourceResponse, HostError, LiveDocumentRequest,
-    LiveDocumentResponse, StartError,
+    AnnotationEvent, ApplicationCommandRequest, ApplicationCommandResponse, BridgeConfig,
+    BridgeConfigError, BridgeHandle, ContextResourceRequest, ContextResourceResponse, HostError,
+    LiveDocumentRequest, LiveDocumentResponse, StartError,
 };
 
 use observer::BridgeObserver;
@@ -158,6 +165,120 @@ impl Automation {
     /// Do not pass secrets. Newlines are replaced and messages are capped at 4 KiB.
     pub fn log(&self, level: &str, message: &str) {
         self.state.add_log(level, message);
+    }
+
+    /// Add or replace one annotation by id, as the application.
+    ///
+    /// A node target is resolved again on every frame, so the annotation
+    /// follows the element through layout changes, scrolling and zoom, and is
+    /// hidden while the element is absent. The window is asked for a frame so
+    /// the change shows without other invalidation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::InvalidRequest`] for a spec outside the bounds, or
+    /// [`ErrorCode::Busy`] when 128 annotations already exist.
+    ///
+    /// [`ErrorCode::InvalidRequest`]: gpui_mcp_protocol::ErrorCode::InvalidRequest
+    /// [`ErrorCode::Busy`]: gpui_mcp_protocol::ErrorCode::Busy
+    pub fn annotate(
+        &self,
+        spec: AnnotationSpec,
+        window: &mut gpui::Window,
+    ) -> Result<Annotation, BridgeError> {
+        let mut applied = self.set_annotations(vec![spec], None, window)?;
+        applied.pop().ok_or_else(|| {
+            BridgeError::new(
+                gpui_mcp_protocol::ErrorCode::Internal,
+                "annotation was not applied",
+            )
+        })
+    }
+
+    /// Add or replace several annotations at once, first removing every
+    /// annotation in `replace_group` when it is given. Either every spec
+    /// applies or none does.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::annotate`].
+    pub fn set_annotations(
+        &self,
+        specs: Vec<AnnotationSpec>,
+        replace_group: Option<&str>,
+        window: &mut gpui::Window,
+    ) -> Result<Vec<Annotation>, BridgeError> {
+        let applied = self
+            .state
+            .upsert_annotations(specs, replace_group, AnnotationSource::App)?;
+        window.request_frame();
+        Ok(applied)
+    }
+
+    /// Remove annotations by id, and return how many were removed.
+    pub fn remove_annotations(&self, ids: &[impl AsRef<str>], window: &mut gpui::Window) -> usize {
+        let removed = self.state.remove_annotations(ids, AnnotationSource::App);
+        window.request_frame();
+        removed
+    }
+
+    /// Remove every annotation, or every one in `group`, and return how many were removed.
+    pub fn clear_annotations(&self, group: Option<&str>, window: &mut gpui::Window) -> usize {
+        let removed = self.state.clear_annotations(group, AnnotationSource::App);
+        window.request_frame();
+        removed
+    }
+
+    /// Every current annotation in draw order, each with the bounds it was
+    /// drawn at in the most recent frame.
+    #[must_use]
+    pub fn annotations(&self) -> Vec<Annotation> {
+        self.state.annotations()
+    }
+
+    /// A number that increases whenever annotations are added, changed or removed.
+    #[must_use]
+    pub fn annotation_revision(&self) -> u64 {
+        self.state.annotation_revision()
+    }
+
+    /// Choose whether the bridge draws annotations. They are still resolved
+    /// every frame, so an application that draws them itself can read their
+    /// bounds from [`Self::annotations`].
+    pub fn paint_annotations(&self, paint: bool, window: &mut gpui::Window) {
+        self.state.set_paint_annotations(paint);
+        window.request_frame();
+    }
+
+    /// Post a message for the connected agent.
+    ///
+    /// The agent reads it with the `read_messages` or `wait_for_messages` tool,
+    /// or through the `gpui://messages` resource. There is no model in the
+    /// bridge: the message waits in a bounded log until the agent reads it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::InvalidRequest`] for a message outside the bounds,
+    /// or [`ErrorCode::Busy`] while the agent has 64 of the app's messages unread.
+    ///
+    /// [`ErrorCode::InvalidRequest`]: gpui_mcp_protocol::ErrorCode::InvalidRequest
+    /// [`ErrorCode::Busy`]: gpui_mcp_protocol::ErrorCode::Busy
+    pub fn post_message(&self, message: NewMessage) -> Result<Message, BridgeError> {
+        self.state.post_message(MessageSender::App, message)
+    }
+
+    /// Read retained messages after id `after`, oldest first, optionally only
+    /// from one side. Messages from the agent in the page count as read by the
+    /// application.
+    #[must_use]
+    pub fn read_messages(
+        &self,
+        after: u64,
+        from: Option<MessageSender>,
+        limit: usize,
+    ) -> MessagePage {
+        self.state
+            .read_messages(after, from, limit, Some(MessageSender::App))
     }
 
     /// Most recent log entries in chronological order, filtered to `min_level`

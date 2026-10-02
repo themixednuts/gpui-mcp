@@ -1,14 +1,13 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
     AlignItems, AlignSelf, AnyElement, App, AppContext as _, BoxShadow, Context, DefiniteLength,
-    Div, Entity, FocusHandle, FontFallbacks, FontWeight, FrameAction, GridPlacement,
-    InteractiveElement as _, IntoElement, Length, Overflow, ParentElement as _, Render,
-    Role as AccessibleRole, ScrollHandle, SharedString, Stateful, StatefulInteractiveElement as _,
-    Styled, Toggled, Window, div, point, px, relative, rgba,
+    Div, Entity, FocusHandle, FontFallbacks, FontWeight, FrameAction, InteractiveElement as _,
+    IntoElement, Length, Overflow, ParentElement as _, Render, Role as AccessibleRole,
+    ScrollHandle, SharedString, Stateful, StatefulInteractiveElement as _, Styled, Toggled, Window,
+    div, point, px, relative, rgba,
 };
 use gpui_mcp::{Automation, MAX_LABEL_BYTES, MAX_TEXT_BYTES};
 use htmlswap::{
@@ -18,6 +17,7 @@ use htmlswap::{
 
 use crate::components::{ComponentNode, ComponentRegistry};
 use crate::document::{attribute, is_text_editable};
+use crate::grid::GridProperty;
 use crate::input::{RuntimeTextInput, RuntimeTextInputOptions};
 use crate::{
     Binding, BindingMode, ElementId, HandlerId, HookEvent, HookOutcome, HookRegistry,
@@ -402,6 +402,18 @@ impl LiveHtml {
             .unwrap_or_else(|| MediaViewport::from_window(window))
     }
 
+    /// Map every rendered element of the active document to its HTML source:
+    /// semantic id, document id (authored or generated), tag, position path,
+    /// and the byte range, line and column of its markup.
+    ///
+    /// Each rendered node also carries its byte range as `source_span`
+    /// (`start..end`) metadata in the semantic tree, so an MCP client can map
+    /// `get_ui_tree` nodes back to source without this API.
+    #[must_use]
+    pub fn source_map(&self) -> crate::SourceMap {
+        crate::SourceMap::build(self.ui.plan(), self.ui.source(), |id| self.scoped_id(id))
+    }
+
     /// Unsupported CSS/features retained for visual-builder diagnostics.
     #[must_use]
     pub fn diagnostics(&self) -> &[RenderDiagnostic] {
@@ -561,6 +573,9 @@ impl LiveHtml {
         }
         if let Some(authored_id) = attribute(element, "id") {
             host = host.frame_metadata("authored_id", authored_id);
+        }
+        if let Some(span) = element.span {
+            host = host.frame_metadata("source_span", format!("{}..{}", span.start, span.end));
         }
         if let Some(component_id) = attribute(element, "component") {
             host = host.frame_metadata("component_id", component_id);
@@ -912,7 +927,7 @@ fn index_bindings<'a>(
         .collect()
 }
 
-fn generated_id(path: &[usize]) -> String {
+pub(crate) fn generated_id(path: &[usize]) -> String {
     let suffix = path
         .iter()
         .map(usize::to_string)
@@ -1485,6 +1500,9 @@ fn apply_style<T: Styled>(
     }
     let raw_value = declaration.value.as_str().trim();
     let value = raw_value.to_ascii_lowercase();
+    if let Some(grid) = GridProperty::of(&declaration.property) {
+        return grid.apply(host, &value);
+    }
     if layout_property(&declaration.property) {
         return apply_layout_style(host, &declaration.property, &value);
     }
@@ -1569,8 +1587,6 @@ fn layout_property(property: &StyleProperty) -> bool {
             | StyleProperty::AlignItems
             | StyleProperty::AlignSelf
             | StyleProperty::JustifyContent
-            | StyleProperty::GridTemplateColumns
-            | StyleProperty::GridColumn
             | StyleProperty::Position
             | StyleProperty::Top
             | StyleProperty::Right
@@ -1621,7 +1637,7 @@ fn apply_layout_style<T: Styled>(host: T, property: &StyleProperty, value: &str)
     match property {
         StyleProperty::Display => match value {
             "flex" | "inline-flex" => host.flex(),
-            "grid" => host.grid(),
+            "grid" | "inline-grid" => host.grid(),
             "block" | "inline" | "inline-block" => host.block(),
             "none" => host.hidden(),
             _ => host,
@@ -1654,12 +1670,6 @@ fn apply_layout_style<T: Styled>(host: T, property: &StyleProperty, value: &str)
             "space-around" => host.justify_around(),
             _ => host,
         },
-        StyleProperty::GridTemplateColumns => {
-            with_value!(grid_column_count(value), |value| host.grid_cols(value))
-        }
-        StyleProperty::GridColumn => {
-            with_value!(grid_column(value), |value| apply_grid_column(host, value))
-        }
         StyleProperty::Position => match value {
             "relative" => host.relative(),
             "absolute" => host.absolute(),
@@ -1717,56 +1727,6 @@ fn apply_layout_style<T: Styled>(host: T, property: &StyleProperty, value: &str)
         }),
         _ => host,
     }
-}
-
-fn grid_column_count(value: &str) -> Option<u16> {
-    let tracks = if let Some(inner) = value
-        .strip_prefix("repeat(")
-        .and_then(|value| value.strip_suffix(')'))
-    {
-        let (count, track) = inner.split_once(',')?;
-        if track.trim() != "1fr" {
-            return None;
-        }
-        return count.trim().parse().ok().filter(|count| *count > 0);
-    } else {
-        value.split_whitespace().collect::<Vec<_>>()
-    };
-    let count = u16::try_from(tracks.len()).ok()?;
-    (count > 0 && tracks.iter().all(|track| *track == "1fr")).then_some(count)
-}
-
-fn grid_column(value: &str) -> Option<Range<GridPlacement>> {
-    let (start, end) = value
-        .split_once('/')
-        .map_or((value.trim(), "auto"), |(start, end)| {
-            (start.trim(), end.trim())
-        });
-    Some(grid_placement(start)?..grid_placement(end)?)
-}
-
-fn grid_placement(value: &str) -> Option<GridPlacement> {
-    if value == "auto" {
-        return Some(GridPlacement::Auto);
-    }
-    if let Some(span) = value.strip_prefix("span ") {
-        return span
-            .trim()
-            .parse::<u16>()
-            .ok()
-            .filter(|span| *span > 0)
-            .map(GridPlacement::Span);
-    }
-    value
-        .parse::<i16>()
-        .ok()
-        .filter(|line| *line != 0)
-        .map(GridPlacement::Line)
-}
-
-fn apply_grid_column<T: Styled>(mut host: T, value: Range<GridPlacement>) -> T {
-    host.style().grid_location_mut().column = value;
-    host
 }
 
 fn apply_align_self<T: Styled>(mut host: T, value: &str) -> T {
@@ -2750,22 +2710,13 @@ fn collect_declaration_diagnostics(
                 message: "live renderer supports none, hidden, solid, and dashed borders"
                     .to_owned(),
             });
-        } else if declaration.property == StyleProperty::GridTemplateColumns
-            && grid_column_count(&normalized).is_none()
+        } else if let Some(grid) = GridProperty::of(&declaration.property)
+            && !grid.accepts(&normalized)
         {
             diagnostics.push(RenderDiagnostic {
                 node_id: node_id.to_owned(),
                 feature: declaration.property.to_string(),
-                message: "live renderer supports fixed counts of equal 1fr grid columns".to_owned(),
-            });
-        } else if declaration.property == StyleProperty::GridColumn
-            && grid_column(&normalized).is_none()
-        {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer accepts auto, grid line numbers, and span counts"
-                    .to_owned(),
+                message: grid.accepted().to_owned(),
             });
         } else if declaration.property == StyleProperty::Position
             && !matches!(normalized.as_str(), "relative" | "absolute")
@@ -2941,71 +2892,70 @@ fn collect_declaration_diagnostics(
 }
 
 fn supported_property(property: &StyleProperty) -> bool {
-    matches!(
-        property,
-        StyleProperty::Display
-            | StyleProperty::FlexDirection
-            | StyleProperty::FlexWrap
-            | StyleProperty::Flex
-            | StyleProperty::FlexBasis
-            | StyleProperty::FlexGrow
-            | StyleProperty::FlexShrink
-            | StyleProperty::AlignItems
-            | StyleProperty::AlignSelf
-            | StyleProperty::JustifyContent
-            | StyleProperty::GridTemplateColumns
-            | StyleProperty::GridColumn
-            | StyleProperty::Position
-            | StyleProperty::Top
-            | StyleProperty::Right
-            | StyleProperty::Bottom
-            | StyleProperty::Left
-            | StyleProperty::Inset
-            | StyleProperty::Gap
-            | StyleProperty::Padding
-            | StyleProperty::PaddingTop
-            | StyleProperty::PaddingRight
-            | StyleProperty::PaddingBottom
-            | StyleProperty::PaddingLeft
-            | StyleProperty::Margin
-            | StyleProperty::MarginTop
-            | StyleProperty::MarginRight
-            | StyleProperty::MarginBottom
-            | StyleProperty::MarginLeft
-            | StyleProperty::Width
-            | StyleProperty::Height
-            | StyleProperty::MinWidth
-            | StyleProperty::MinHeight
-            | StyleProperty::MaxWidth
-            | StyleProperty::MaxHeight
-            | StyleProperty::Overflow
-            | StyleProperty::OverflowX
-            | StyleProperty::OverflowY
-            | StyleProperty::Background
-            | StyleProperty::BackgroundColor
-            | StyleProperty::BoxSizing
-            | StyleProperty::Color
-            | StyleProperty::FontFamily
-            | StyleProperty::FontSize
-            | StyleProperty::FontWeight
-            | StyleProperty::LineHeight
-            | StyleProperty::WhiteSpace
-            | StyleProperty::TextAlign
-            | StyleProperty::TextOverflow
-            | StyleProperty::Cursor
-            | StyleProperty::Opacity
-            | StyleProperty::BoxShadow
-            | StyleProperty::BorderWidth
-            | StyleProperty::BorderStyle
-            | StyleProperty::BorderColor
-            | StyleProperty::Border
-            | StyleProperty::BorderTop
-            | StyleProperty::BorderRight
-            | StyleProperty::BorderBottom
-            | StyleProperty::BorderLeft
-            | StyleProperty::BorderRadius
-            | StyleProperty::Outline
-    )
+    GridProperty::of(property).is_some()
+        || matches!(
+            property,
+            StyleProperty::Display
+                | StyleProperty::FlexDirection
+                | StyleProperty::FlexWrap
+                | StyleProperty::Flex
+                | StyleProperty::FlexBasis
+                | StyleProperty::FlexGrow
+                | StyleProperty::FlexShrink
+                | StyleProperty::AlignItems
+                | StyleProperty::AlignSelf
+                | StyleProperty::JustifyContent
+                | StyleProperty::Position
+                | StyleProperty::Top
+                | StyleProperty::Right
+                | StyleProperty::Bottom
+                | StyleProperty::Left
+                | StyleProperty::Inset
+                | StyleProperty::Gap
+                | StyleProperty::Padding
+                | StyleProperty::PaddingTop
+                | StyleProperty::PaddingRight
+                | StyleProperty::PaddingBottom
+                | StyleProperty::PaddingLeft
+                | StyleProperty::Margin
+                | StyleProperty::MarginTop
+                | StyleProperty::MarginRight
+                | StyleProperty::MarginBottom
+                | StyleProperty::MarginLeft
+                | StyleProperty::Width
+                | StyleProperty::Height
+                | StyleProperty::MinWidth
+                | StyleProperty::MinHeight
+                | StyleProperty::MaxWidth
+                | StyleProperty::MaxHeight
+                | StyleProperty::Overflow
+                | StyleProperty::OverflowX
+                | StyleProperty::OverflowY
+                | StyleProperty::Background
+                | StyleProperty::BackgroundColor
+                | StyleProperty::BoxSizing
+                | StyleProperty::Color
+                | StyleProperty::FontFamily
+                | StyleProperty::FontSize
+                | StyleProperty::FontWeight
+                | StyleProperty::LineHeight
+                | StyleProperty::WhiteSpace
+                | StyleProperty::TextAlign
+                | StyleProperty::TextOverflow
+                | StyleProperty::Cursor
+                | StyleProperty::Opacity
+                | StyleProperty::BoxShadow
+                | StyleProperty::BorderWidth
+                | StyleProperty::BorderStyle
+                | StyleProperty::BorderColor
+                | StyleProperty::Border
+                | StyleProperty::BorderTop
+                | StyleProperty::BorderRight
+                | StyleProperty::BorderBottom
+                | StyleProperty::BorderLeft
+                | StyleProperty::BorderRadius
+                | StyleProperty::Outline
+        )
 }
 
 fn responsive_length_property(property: &StyleProperty) -> bool {
@@ -3064,7 +3014,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::rc::Rc;
 
-    use gpui::{GridPlacement, Role as AccessibleRole, px};
+    use gpui::{Role as AccessibleRole, px};
     use gpui_mcp::Automation;
     use htmlswap::{RenderNode, StyleDeclaration, StyleProperty};
 
@@ -3076,9 +3026,8 @@ mod tests {
     use super::{
         BorderStyle, MediaViewport, ReloadError, SemanticNamespace, accessible_label, aria_role,
         border_value, box_shadows, box_values, collect_declaration_diagnostics, color,
-        cursor_supported, definite_length, effective_border_style, flex_value, font_family,
-        grid_column, grid_column_count, length, line_height, media_query_matches, opacity,
-        overflow, update_hovered_element,
+        cursor_supported, definite_length, effective_border_style, flex_value, font_family, length,
+        line_height, media_query_matches, opacity, overflow, update_hovered_element,
     };
 
     #[test]
@@ -3214,30 +3163,36 @@ mod tests {
     }
 
     #[test]
-    fn grid_columns_require_equal_fractional_tracks() {
-        assert_eq!(grid_column_count("repeat(3, 1fr)"), Some(3));
-        assert_eq!(grid_column_count("1fr 1fr"), Some(2));
-        assert_eq!(grid_column_count("repeat(2, 120px)"), None);
-        assert_eq!(grid_column_count("1fr 2fr"), None);
-        assert_eq!(grid_column_count("repeat(0, 1fr)"), None);
-    }
+    fn grid_css_is_supported_and_invalid_values_are_diagnosed() {
+        let unknown = |name: &str| StyleProperty::Unknown(name.into());
+        let supported = [
+            (
+                StyleProperty::GridTemplateColumns,
+                "240px repeat(2, minmax(0, 1fr))",
+            ),
+            (unknown("grid-template-rows"), "auto 1fr fit-content(120px)"),
+            (unknown("grid-auto-rows"), "minmax(32px, auto)"),
+            (unknown("grid-auto-flow"), "row dense"),
+            (unknown("grid-row"), "2 / span 2"),
+            (unknown("grid-column-start"), "-1"),
+            (unknown("row-gap"), "8px"),
+            (unknown("column-gap"), "12px"),
+        ]
+        .into_iter()
+        .map(|(property, value)| StyleDeclaration::new(property, value, false, None))
+        .collect::<Vec<_>>();
+        let mut diagnostics = Vec::new();
+        collect_declaration_diagnostics("grid", &supported, &mut diagnostics);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
 
-    #[test]
-    fn grid_column_accepts_line_and_span_placement() {
-        assert_eq!(
-            grid_column("1 / span 2"),
-            Some(GridPlacement::Line(1)..GridPlacement::Span(2))
-        );
-        assert_eq!(
-            grid_column("1 / -1"),
-            Some(GridPlacement::Line(1)..GridPlacement::Line(-1))
-        );
-        assert_eq!(
-            grid_column("auto"),
-            Some(GridPlacement::Auto..GridPlacement::Auto)
-        );
-        assert_eq!(grid_column("0 / span 2"), None);
-        assert_eq!(grid_column("1 / span 0"), None);
+        let rejected = [
+            StyleDeclaration::new(StyleProperty::GridTemplateColumns, "[a] 1fr", false, None),
+            StyleDeclaration::new(StyleProperty::GridColumn, "0 / span 2", false, None),
+            StyleDeclaration::new(unknown("grid-auto-flow"), "diagonal", false, None),
+        ];
+        collect_declaration_diagnostics("grid", &rejected, &mut diagnostics);
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:#?}");
+        assert!(diagnostics[0].message.contains("track lists"));
     }
 
     #[test]

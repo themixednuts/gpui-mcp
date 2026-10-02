@@ -3,10 +3,10 @@
 This directory tracks Zed GPUI at commit
 `16c9aa7ea6d897a8044d9501cde1b295256722f2` (`gpui` 0.2.2).
 
-gpui-mcp carries nine focused changes that are not available from upstream
+gpui-mcp carries ten focused changes that are not available from upstream
 GPUI yet. The first six were last checked against `zed-industries/zed` `main`
-on 2026-09-22, at the commit named above; the last three were written against
-the same commit on 2026-09-23:
+on 2026-09-22, at the commit named above; the next three were written against
+the same commit on 2026-09-23, and the last on 2026-10-02:
 
 - read-only observation of each completed rendered AccessKit tree, with stable
   GPUI element paths, frame-unique node identities, bounds, text provenance,
@@ -61,7 +61,7 @@ the same commit on 2026-09-23:
   nodes by position rather than by searching for their path;
 - `Window::request_frame`, which schedules a frame without the view-cache
   invalidation of `Window::refresh`, and `Window::frame_pending`, which reports
-  whether the window is invalidated; and
+  whether the window is invalidated;
 - view-scoped redraws for an element's own interaction state. Pressing,
   releasing, and the active state of an element with click or drag handlers,
   and showing its tooltip, notify the view that painted the element. Upstream
@@ -75,7 +75,20 @@ the same commit on 2026-09-23:
   hover status, and switching between keyboard and pointer input still refresh
   the window: a drag is drawn at window level, any view may read
   `Window::is_window_hovered`, and input modality changes hover and
-  focus-visible styling everywhere.
+  focus-visible styling everywhere; and
+- CSS grid track lists. Upstream exposes only `grid_cols(n)` / `grid_rows(n)`,
+  which always mean `repeat(n, minmax(0, 1fr))`, although taffy implements
+  full CSS grid. `GridTrack`, `GridTrackSize`, `GridTrackBreadth`,
+  `GridRepetition` and `GridAutoFlow`, with the `Styled` builders
+  `grid_template_columns`, `grid_template_rows`, `grid_auto_columns`,
+  `grid_auto_rows`, `grid_auto_flow`, `grid_column` and `grid_row`, express
+  lengths, percentages, `fr`, `auto`, `min-content`, `max-content`,
+  `minmax()`, `fit-content()` and `repeat(n | auto-fill | auto-fit, …)`, and
+  are converted to taffy's own track sizing functions. An explicit template
+  takes precedence over `grid_cols` / `grid_rows`, which are unchanged.
+  Automation does not depend on it, so the `gpui-pre` and `gpui-ce` series
+  keep it in a separate `grid.patch` that consumers may skip;
+  `gpui-mcp-html` uses it to render `grid-template-*`.
 
 Two earlier additions are no longer needed and are not carried:
 

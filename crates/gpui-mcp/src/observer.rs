@@ -1,19 +1,27 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Weak},
+    time::Instant,
 };
 
 use gpui::{
-    AccessibilityFrame, App, BorderStyle, DrawnFrame, FrameAction, FrameNode, FrameObserver,
-    ViewDrawOutcome, Window,
+    AccessibilityFrame, App, BorderStyle, Bounds, DrawnFrame, FrameAction, FrameNode,
+    FrameObserver, Hsla, Pixels, SharedString, TextAlign, ViewDrawOutcome, Window,
     accesskit::{self, Action, Role as AccessibleRole, Toggled},
-    outline, point, px, rgba, size,
+    fill, point, px, quad, rgba, size, transparent_black,
 };
 use gpui_mcp_protocol::{
-    NodeAction, NodeState, Role, TextInfo, UiNode, ValueInfo, ViewRenderCause,
+    AnnotationStyle, AnnotationTarget, NodeAction, NodeState, Rect, Role, TextInfo, UiNode,
+    ValueInfo, ViewRenderCause,
 };
 
+use crate::annotations::PaintItem;
 use crate::registry::{SharedState, ViewRecord, rect_from_gpui};
+
+const LABEL_FONT_SIZE: f32 = 11.0;
+const LABEL_HEIGHT: f32 = 16.0;
+const LABEL_PADDING: f32 = 4.0;
+const OUTLINE_WIDTH: f32 = 2.0;
 
 pub(crate) struct BridgeObserver {
     state: Weak<SharedState>,
@@ -41,6 +49,7 @@ impl FrameObserver for BridgeObserver {
     fn accessibility_frame(&self, frame: &Arc<AccessibilityFrame>) {
         if let Some(state) = self.state.upgrade() {
             state.observe_semantics(frame);
+            state.keep_overlay_frame(state.has_annotations().then_some(frame));
         }
     }
 
@@ -50,24 +59,36 @@ impl FrameObserver for BridgeObserver {
         }
     }
 
-    fn paint_overlay(&self, window: &mut Window, _cx: &mut App) {
+    fn paint_overlay(&self, window: &mut Window, cx: &mut App) {
         let Some(state) = self.state.upgrade() else {
             return;
         };
-        for highlight in state.highlights() {
-            let Some(color) = parse_color(&highlight.color) else {
-                continue;
-            };
-            let rect = highlight.rect;
-            window.paint_quad(outline(
-                gpui::Bounds::new(
-                    point(px(rect.x), px(rect.y)),
-                    size(px(rect.width), px(rect.height)),
-                ),
-                rgba(color),
-                BorderStyle::Solid,
-            ));
+        if !state.has_annotations() {
+            return;
         }
+        let (items, frame, next_expiry) = state.annotation_paint(cx.background_executor().now());
+        if let Some(deadline) = next_expiry {
+            self.schedule_expiry(&state, deadline, window, cx);
+        }
+        if items.is_empty() {
+            return;
+        }
+        let viewport = window.viewport_size();
+        let viewport = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: f32::from(viewport.width),
+            height: f32::from(viewport.height),
+        };
+        let resolved = resolve_targets(&items, frame.as_deref(), viewport);
+        if state.paints_annotations() {
+            for item in &items {
+                if let Some(Some(rect)) = resolved.get(&item.id) {
+                    paint_annotation(item, *rect, viewport, window, cx);
+                }
+            }
+        }
+        state.record_resolved(&resolved);
     }
 
     fn frame_finished(&self) {
@@ -91,6 +112,234 @@ impl FrameObserver for BridgeObserver {
                 }),
             );
         }
+    }
+}
+
+impl BridgeObserver {
+    /// Draw a frame when the next annotation expires, so it disappears on time
+    /// even when nothing else redraws the window.
+    fn schedule_expiry(
+        &self,
+        state: &SharedState,
+        deadline: Instant,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if !state.claim_expiry_timer(deadline) {
+            return;
+        }
+        let weak = self.state.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let executor = cx.background_executor().clone();
+                let delay = deadline.saturating_duration_since(executor.now());
+                executor.timer(delay).await;
+                if let Some(state) = weak.upgrade() {
+                    state.expiry_timer_fired(deadline);
+                }
+                let _ = cx.update(|window, _| window.request_frame());
+            })
+            .detach();
+    }
+}
+
+/// Resolve every annotation to the part of its target visible this frame.
+///
+/// Node targets are looked up in the frame's semantic nodes, so they follow
+/// layout, scrolling and zoom. A node that is missing, hidden, or scrolled
+/// entirely out of its scroll containers resolves to `None`.
+pub(crate) fn resolve_targets(
+    items: &[PaintItem],
+    frame: Option<&AccessibilityFrame>,
+    viewport: Rect,
+) -> BTreeMap<String, Option<Rect>> {
+    let index: Option<HashMap<&str, &FrameNode>> = frame
+        .filter(|_| {
+            items
+                .iter()
+                .any(|item| matches!(item.target, AnnotationTarget::Node { .. }))
+        })
+        .map(|frame| frame.nodes().map(|(_, node)| (node.id(), node)).collect());
+    items
+        .iter()
+        .map(|item| {
+            let rect = match &item.target {
+                AnnotationTarget::Rect { rect } => Some(*rect),
+                AnnotationTarget::Node { node_id } => frame
+                    .zip(index.as_ref())
+                    .and_then(|(frame, index)| visible_node_rect(frame, index, node_id)),
+            };
+            (
+                item.id.clone(),
+                rect.and_then(|rect| intersect(rect, viewport)),
+            )
+        })
+        .collect()
+}
+
+fn visible_node_rect(
+    frame: &AccessibilityFrame,
+    index: &HashMap<&str, &FrameNode>,
+    node_id: &str,
+) -> Option<Rect> {
+    let hidden = |node: &FrameNode| {
+        frame
+            .accessibility_node(node)
+            .is_some_and(accesskit::Node::is_hidden)
+    };
+    let node = *index.get(node_id)?;
+    if hidden(node) {
+        return None;
+    }
+    let mut rect = rect_from_gpui(node.bounds());
+    let mut current = node;
+    // Parent links come from one finished frame, but stop on a cycle anyway.
+    for _ in 0..index.len() {
+        let Some(parent) = current.parent().and_then(|id| index.get(id).copied()) else {
+            break;
+        };
+        if hidden(parent) {
+            return None;
+        }
+        if parent.actions().contains(&FrameAction::Scroll) {
+            rect = intersect(rect, rect_from_gpui(parent.bounds()))?;
+        }
+        current = parent;
+    }
+    Some(rect)
+}
+
+/// The overlap of two rectangles, or `None` when they do not overlap.
+pub(crate) fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = (a.x + a.width).min(b.x + b.width);
+    let bottom = (a.y + a.height).min(b.y + b.height);
+    (right > left && bottom > top).then_some(Rect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
+fn bounds(rect: Rect) -> Bounds<Pixels> {
+    Bounds::new(
+        point(px(rect.x), px(rect.y)),
+        size(px(rect.width), px(rect.height)),
+    )
+}
+
+fn paint_annotation(
+    item: &PaintItem,
+    rect: Rect,
+    viewport: Rect,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let color = hsla(item.color);
+    let outline = |window: &mut Window| {
+        window.paint_quad(quad(
+            bounds(rect),
+            px(0.0),
+            transparent_black(),
+            px(OUTLINE_WIDTH),
+            color,
+            BorderStyle::Solid,
+        ));
+    };
+    match item.style {
+        AnnotationStyle::Outline => outline(window),
+        AnnotationStyle::Fill => window.paint_quad(fill(bounds(rect), color)),
+        AnnotationStyle::OutlineFill => {
+            window.paint_quad(fill(bounds(rect), hsla(quarter_alpha(item.color))));
+            outline(window);
+        }
+    }
+    if let Some(label) = item.label.as_deref().filter(|label| !label.is_empty()) {
+        paint_label(label, item.color, rect, viewport, window, cx);
+    }
+}
+
+/// Draw `label` as a solid chip above the annotation's top-left corner, or just
+/// inside it when there is no room above, in black or white for contrast.
+fn paint_label(
+    label: &str,
+    color: u32,
+    rect: Rect,
+    viewport: Rect,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let chip_color = hsla(color | 0xff);
+    let text_color = hsla(contrasting_text(color));
+    let mut run = window.text_style().to_run(label.len());
+    run.color = text_color;
+    run.background_color = None;
+    run.underline = None;
+    run.strikethrough = None;
+    let line = window.text_system().shape_line(
+        SharedString::from(label.to_owned()),
+        px(LABEL_FONT_SIZE),
+        &[run],
+        None,
+    );
+    let width = f32::from(line.width) + LABEL_PADDING * 2.0;
+    let x = rect.x.min(viewport.width - width).max(0.0);
+    let y = if rect.y >= LABEL_HEIGHT {
+        rect.y - LABEL_HEIGHT
+    } else {
+        rect.y
+    };
+    let chip = Rect {
+        x,
+        y,
+        width,
+        height: LABEL_HEIGHT,
+    };
+    window.paint_quad(quad(
+        bounds(chip),
+        px(3.0),
+        chip_color,
+        px(0.0),
+        transparent_black(),
+        BorderStyle::Solid,
+    ));
+    let _ = line.paint(
+        point(px(x + LABEL_PADDING), px(y)),
+        px(LABEL_HEIGHT),
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    );
+}
+
+#[cfg(feature = "gpui-ce")]
+fn hsla(color: u32) -> Hsla {
+    gpui::rgb_to_hsla(rgba(color))
+}
+
+#[cfg(not(feature = "gpui-ce"))]
+fn hsla(color: u32) -> Hsla {
+    Hsla::from(rgba(color))
+}
+
+/// `color` with a quarter of its alpha.
+pub(crate) const fn quarter_alpha(color: u32) -> u32 {
+    (color & 0xffff_ff00) | ((color & 0xff) / 4)
+}
+
+/// Black or white, whichever reads better on the opaque form of `color`.
+pub(crate) const fn contrasting_text(color: u32) -> u32 {
+    let red = (color >> 24) & 0xff;
+    let green = (color >> 16) & 0xff;
+    let blue = (color >> 8) & 0xff;
+    // ITU-R BT.601 luma, scaled by 1000.
+    if red * 299 + green * 587 + blue * 114 > 150_000 {
+        0x0000_00ff
+    } else {
+        0xffff_ffff
     }
 }
 
@@ -384,13 +633,6 @@ const fn role(role: AccessibleRole) -> Role {
         | AccessibleRole::TabPanel => Role::Group,
         _ => Role::Generic,
     }
-}
-
-fn parse_color(color: &str) -> Option<u32> {
-    let value = color.strip_prefix('#')?;
-    (value.len() == 8)
-        .then(|| u32::from_str_radix(value, 16).ok())
-        .flatten()
 }
 
 #[cfg(all(test, feature = "test-support"))]
@@ -1249,6 +1491,235 @@ mod tests {
                 .any(|id| id.ends_with(".q.y") && id != "q.y"),
             "the nested pair must be pushed past the id it would otherwise spell, got {:?}",
             tree.nodes.keys().collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod overlay_math_tests {
+    use gpui_mcp_protocol::Rect;
+
+    use super::{contrasting_text, intersect, quarter_alpha};
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> Rect {
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn rectangles_clip_to_their_overlap() {
+        assert_eq!(
+            intersect(rect(0., 0., 10., 10.), rect(5., 5., 10., 10.)),
+            Some(rect(5., 5., 5., 5.))
+        );
+        assert_eq!(intersect(rect(0., 0., 5., 5.), rect(5., 0., 5., 5.)), None);
+    }
+
+    #[test]
+    fn labels_contrast_with_their_chip() {
+        assert_eq!(contrasting_text(0xffff_00ff), 0x0000_00ff);
+        assert_eq!(contrasting_text(0x0000_80ff), 0xffff_ffff);
+        assert_eq!(quarter_alpha(0x1122_33ff), 0x1122_333f);
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod annotation_tests {
+    use std::time::Duration;
+
+    use gpui::{
+        Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+        StatefulInteractiveElement as _, Styled as _, TestAppContext, Window, div, px,
+    };
+    use gpui_mcp_protocol::{AnnotationSource, AnnotationSpec, Rect};
+
+    use crate::Automation;
+
+    struct Moving {
+        offset: f32,
+        show_target: bool,
+        scrolled_away: bool,
+    }
+
+    impl Render for Moving {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let list = div()
+                .id("list")
+                .absolute()
+                .top(px(200.))
+                .left(px(0.))
+                .w(px(100.))
+                .h(px(50.))
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .id("inside")
+                        .mt(px(if self.scrolled_away { 500. } else { 10. }))
+                        .w(px(40.))
+                        .h(px(20.)),
+                );
+            let mut root = div().id("root").size_full().child(list);
+            if self.show_target {
+                root = root.child(
+                    div()
+                        .id("target")
+                        .absolute()
+                        .top(px(self.offset))
+                        .left(px(30.))
+                        .w(px(50.))
+                        .h(px(20.)),
+                );
+            }
+            root
+        }
+    }
+
+    fn resolved(automation: &Automation, id: &str) -> Option<Rect> {
+        automation
+            .annotations()
+            .into_iter()
+            .find(|annotation| annotation.id == id)
+            .and_then(|annotation| annotation.resolved)
+    }
+
+    #[gpui::test]
+    fn node_annotations_follow_their_element(cx: &mut TestAppContext) {
+        let automation = Automation::isolated();
+        let for_window = automation.clone();
+        let (view, visual) = cx.add_window_view(move |window, _| {
+            for_window.attach(window);
+            Moving {
+                offset: 40.,
+                show_target: true,
+                scrolled_away: false,
+            }
+        });
+        visual.run_until_parked();
+
+        let applied = visual
+            .update(|window, _| {
+                automation.set_annotations(
+                    vec![
+                        AnnotationSpec::node("target")
+                            .with_id("t")
+                            .with_label("Save button"),
+                        AnnotationSpec::node("inside").with_id("in-scroll"),
+                        AnnotationSpec::node("missing").with_id("m"),
+                    ],
+                    None,
+                    window,
+                )
+            })
+            .map_err(|error| error.message);
+        assert_eq!(
+            applied.map(|applied| applied[0].source),
+            Ok(AnnotationSource::App)
+        );
+        visual.run_until_parked();
+
+        let first = resolved(&automation, "t");
+        assert!(first.is_some(), "the target is drawn");
+        assert_eq!(automation.snapshot().nodes["target"].bounds, first);
+        assert!(resolved(&automation, "in-scroll").is_some());
+        assert_eq!(resolved(&automation, "m"), None);
+
+        view.update(visual, |view, cx| {
+            view.offset = 90.;
+            view.scrolled_away = true;
+            cx.notify();
+        });
+        visual.run_until_parked();
+        let moved = resolved(&automation, "t");
+        assert!(
+            first
+                .zip(moved)
+                .is_some_and(|(first, moved)| (moved.y - first.y - 50.).abs() < 0.5),
+            "{first:?} -> {moved:?}"
+        );
+        assert_eq!(
+            resolved(&automation, "in-scroll"),
+            None,
+            "a node scrolled out of its container is not drawn"
+        );
+
+        view.update(visual, |view, cx| {
+            view.show_target = false;
+            cx.notify();
+        });
+        visual.run_until_parked();
+        assert_eq!(resolved(&automation, "t"), None);
+        assert_eq!(
+            automation.annotations().len(),
+            3,
+            "absence hides, not removes"
+        );
+    }
+
+    #[gpui::test]
+    fn annotations_expire_without_other_redraws(cx: &mut TestAppContext) {
+        let executor = cx.executor();
+        let automation = Automation::isolated();
+        let for_window = automation.clone();
+        let (_view, visual) = cx.add_window_view(move |window, _| {
+            for_window.attach(window);
+            Moving {
+                offset: 0.,
+                show_target: true,
+                scrolled_away: false,
+            }
+        });
+        visual.run_until_parked();
+        let annotated = visual.update(|window, _| {
+            automation.annotate(AnnotationSpec::node("target").with_ttl_ms(500), window)
+        });
+        assert!(annotated.is_ok());
+        visual.run_until_parked();
+        let revision = automation.annotation_revision();
+        assert_eq!(automation.annotations().len(), 1);
+
+        executor.advance_clock(Duration::from_millis(400));
+        visual.run_until_parked();
+        assert_eq!(automation.annotations().len(), 1);
+
+        executor.advance_clock(Duration::from_millis(200));
+        visual.run_until_parked();
+        assert!(automation.annotations().is_empty());
+        assert!(automation.annotation_revision() > revision);
+    }
+
+    #[gpui::test]
+    fn the_app_can_stop_the_bridge_drawing(cx: &mut TestAppContext) {
+        let automation = Automation::isolated();
+        let for_window = automation.clone();
+        let (_view, visual) = cx.add_window_view(move |window, _| {
+            for_window.attach(window);
+            Moving {
+                offset: 0.,
+                show_target: true,
+                scrolled_away: false,
+            }
+        });
+        visual.run_until_parked();
+        visual.update(|window, _| {
+            automation.paint_annotations(false, window);
+            assert!(
+                automation
+                    .annotate(AnnotationSpec::node("target").with_id("t"), window)
+                    .is_ok()
+            );
+        });
+        visual.run_until_parked();
+        assert!(
+            resolved(&automation, "t").is_some(),
+            "bounds still resolve for an app that draws annotations itself"
+        );
+        assert_eq!(
+            visual.update(|window, _| automation.clear_annotations(None, window)),
+            1
         );
     }
 }
