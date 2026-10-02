@@ -3567,7 +3567,7 @@ dependencies = [
 [[package]]
 name = "htmlswap"
 version = "0.1.0"
-source = "git+https://github.com/themixednuts/htmlswap?rev=7b6bd0f0c73cef241819c707615684fd2c066341#7b6bd0f0c73cef241819c707615684fd2c066341"
+source = "git+https://github.com/themixednuts/htmlswap?rev=9bce314d0409ffc08240d6acd990a7d21c9b2bf8#9bce314d0409ffc08240d6acd990a7d21c9b2bf8"
 dependencies = [
  "arcstr",
  "clap",

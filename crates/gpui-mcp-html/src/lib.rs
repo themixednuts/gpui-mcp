@@ -26,6 +26,8 @@ mod grid;
 mod hooks;
 #[cfg(feature = "runtime")]
 mod input;
+#[cfg(feature = "runtime")]
+mod motion;
 #[cfg(feature = "dev-watch")]
 mod project;
 #[cfg(feature = "runtime")]
@@ -36,6 +38,8 @@ mod scaffold;
 mod session;
 #[cfg(feature = "runtime")]
 mod source_map;
+#[cfg(feature = "runtime")]
+mod view_transition;
 
 pub use binding::{
     BINDING_DOCUMENT_VERSION, Binding, BindingDocument, BindingDocumentError, BindingMode,

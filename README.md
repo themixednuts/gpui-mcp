@@ -91,7 +91,9 @@ div()
 
 For HTML-authored interfaces that agents can also edit live, see the
 [visual builder guide](docs/visual-builder.md) and the
-[showcase](examples/runtime-showcase).
+[showcase](examples/runtime-showcase). The HTML renderer animates with
+standard CSS: `transition`, `@keyframes`, `@starting-style` and view
+transitions (see [Motion](docs/visual-builder.md#motion)).
 
 ## What agents can do
 

@@ -1172,3 +1172,325 @@ fn rendered_elements_map_back_to_their_markup(cx: &mut TestAppContext) {
         Some("button")
     );
 }
+
+/// Draw the frame GPUI's animation loop would draw next, `advance` later.
+fn next_frame(visual: &mut gpui::VisualTestContext, advance: std::time::Duration) {
+    visual.executor().advance_clock(advance);
+    visual.update(|window, cx| {
+        window.simulate_next_frame(cx);
+    });
+    visual.run_until_parked();
+}
+
+fn mount<'a>(
+    html: &str,
+    css: &str,
+    cx: &'a mut TestAppContext,
+) -> Option<(Automation, &'a mut gpui::VisualTestContext)> {
+    cx.update(gpui_mcp_html::init);
+    let ui = expect_ok(
+        HtmlUi::compile_with_stylesheet(html, BindingDocument::new(), "motion.css", css),
+        "motion fixture should compile",
+    )?;
+    let automation = Automation::for_test();
+    let live = expect_ok(
+        LiveHtml::new(ui, automation.clone(), HookRegistry::new()),
+        "motion fixture should connect",
+    )?;
+    let (_view, visual) = cx.add_window_view(|_, _| RuntimeView { live });
+    visual.run_until_parked();
+    Some((automation, visual))
+}
+
+fn bounds_of(automation: &Automation, id: &str) -> gpui_mcp::Rect {
+    automation.snapshot().nodes[id].bounds.unwrap_or_default()
+}
+
+#[gpui::test]
+fn css_transitions_interpolate_interaction_changes(cx: &mut TestAppContext) {
+    let css = "body { width: 600px; height: 400px; }
+.box { width: 100px; height: 20px; transition: width 1s linear, translate 1s linear; }
+.box:hover { width: 200px; translate: 100px 0; }";
+    let Some((automation, visual)) = mount(
+        r#"<main id="page"><div id="box" class="box">Box</div></main>"#,
+        css,
+        cx,
+    ) else {
+        return;
+    };
+    let start = bounds_of(&automation, "box");
+    assert_close(start.width, 100.0, "starting width");
+
+    let ms = std::time::Duration::from_millis;
+    visual.simulate_mouse_move(
+        point(px(start.x + 10.0), px(start.y + 10.0)),
+        None,
+        Modifiers::default(),
+    );
+    visual.run_until_parked();
+    next_frame(visual, ms(500));
+    let half = bounds_of(&automation, "box");
+    assert_close(half.width, 150.0, "width half-way through the transition");
+    assert_close(
+        half.x - start.x,
+        50.0,
+        "translate half-way, without moving layout",
+    );
+
+    // Leaving half-way reverses from the value on screen.
+    visual.simulate_mouse_move(point(px(590.0), px(390.0)), None, Modifiers::default());
+    visual.run_until_parked();
+    next_frame(visual, ms(250));
+    assert_close(
+        bounds_of(&automation, "box").width,
+        137.5,
+        "a reversed transition starts from where it was",
+    );
+    next_frame(visual, ms(2000));
+    let settled = bounds_of(&automation, "box");
+    assert_close(settled.width, 100.0, "settled width");
+    assert_close(settled.x, start.x, "settled position");
+}
+
+#[gpui::test]
+fn starting_style_and_keyframes_animate_on_first_render(cx: &mut TestAppContext) {
+    let css = "body { width: 600px; height: 400px; }
+#page { display: flex; flex-direction: column; }
+.grow { width: 100px; height: 10px; transition: width 1s linear; }
+@starting-style { .grow { width: 0px; } }
+@keyframes stretch { from { width: 0px; } to { width: 200px; } }
+.pulse { width: 100px; height: 10px; animation: stretch 1s linear; }";
+    let Some((automation, visual)) = mount(
+        r#"<main id="page"><div id="grow" class="grow"></div><div id="pulse" class="pulse"></div></main>"#,
+        css,
+        cx,
+    ) else {
+        return;
+    };
+    assert_close(
+        bounds_of(&automation, "grow").width,
+        0.0,
+        "entry starts from @starting-style",
+    );
+    assert_close(
+        bounds_of(&automation, "pulse").width,
+        0.0,
+        "animation starts at its first keyframe",
+    );
+
+    let ms = std::time::Duration::from_millis;
+    next_frame(visual, ms(250));
+    assert_close(
+        bounds_of(&automation, "grow").width,
+        25.0,
+        "entry transition",
+    );
+    assert_close(bounds_of(&automation, "pulse").width, 50.0, "keyframes");
+    next_frame(visual, ms(1000));
+    assert_close(
+        bounds_of(&automation, "grow").width,
+        100.0,
+        "entry finished",
+    );
+    assert_close(
+        bounds_of(&automation, "pulse").width,
+        100.0,
+        "without fill-mode the animation releases the element's own value",
+    );
+}
+
+fn compile_motion(html: &str, css: &str) -> Option<HtmlUi> {
+    expect_ok(
+        HtmlUi::compile_with_stylesheet(html, BindingDocument::new(), "motion.css", css),
+        "view-transition fixture should compile",
+    )
+}
+
+fn mount_view<'a>(
+    html: &str,
+    css: &str,
+    cx: &'a mut TestAppContext,
+) -> Option<(
+    Automation,
+    gpui::Entity<RuntimeView>,
+    &'a mut gpui::VisualTestContext,
+)> {
+    cx.update(gpui_mcp_html::init);
+    let ui = compile_motion(html, css)?;
+    let automation = Automation::for_test();
+    let live = expect_ok(
+        LiveHtml::new(ui, automation.clone(), HookRegistry::new()),
+        "view-transition fixture should connect",
+    )?;
+    let (view, visual) = cx.add_window_view(|_, _| RuntimeView { live });
+    visual.run_until_parked();
+    Some((automation, view, visual))
+}
+
+const HERO_HTML: &str = r#"<main id="page"><div id="hero" class="hero">Hero</div></main>"#;
+
+fn hero_css(navigation: bool, margin: f32, group: &str) -> String {
+    let navigation = if navigation {
+        "@view-transition { navigation: auto; }"
+    } else {
+        ""
+    };
+    format!(
+        "{navigation}
+body {{ width: 600px; height: 400px; }}
+.hero {{ view-transition-name: hero; width: 100px; height: 20px; margin-left: {margin}px; }}
+::view-transition-group(hero) {{ {group} }}"
+    )
+}
+
+#[gpui::test]
+fn navigation_view_transitions_move_named_elements(cx: &mut TestAppContext) {
+    let linear = "animation-duration: 1s; animation-timing-function: linear;";
+    let Some((automation, view, visual)) = mount_view(HERO_HTML, &hero_css(true, 0.0, linear), cx)
+    else {
+        return;
+    };
+    let start = bounds_of(&automation, "hero");
+    let Some(next) = compile_motion(HERO_HTML, &hero_css(true, 200.0, linear)) else {
+        return;
+    };
+    view.update(visual, |view, cx| {
+        assert!(view.live.reload(next).is_ok());
+        cx.notify();
+    });
+    visual.run_until_parked();
+    assert_close(
+        bounds_of(&automation, "hero").x,
+        start.x,
+        "the group starts at the old box",
+    );
+    assert!(
+        automation
+            .snapshot()
+            .nodes
+            .contains_key("html-view-transition"),
+        "the old image is drawn while the transition runs"
+    );
+
+    let ms = std::time::Duration::from_millis;
+    next_frame(visual, ms(500));
+    assert_close(
+        bounds_of(&automation, "hero").x - start.x,
+        100.0,
+        "half-way along the group's path",
+    );
+    next_frame(visual, ms(600));
+    next_frame(visual, ms(16));
+    assert_close(
+        bounds_of(&automation, "hero").x - start.x,
+        200.0,
+        "the new box",
+    );
+    assert!(!view.read_with(visual, |view, _| view.live.view_transition_running()));
+    assert!(
+        !automation
+            .snapshot()
+            .nodes
+            .contains_key("html-view-transition"),
+        "the old image is gone once the transition ends"
+    );
+
+    // Both documents must opt in for a swap to transition.
+    let Some(plain) = compile_motion(HERO_HTML, &hero_css(false, 0.0, linear)) else {
+        return;
+    };
+    view.update(visual, |view, cx| {
+        assert!(view.live.reload(plain).is_ok());
+        assert!(!view.live.view_transition_running());
+        cx.notify();
+    });
+    visual.run_until_parked();
+    assert_close(bounds_of(&automation, "hero").x, start.x, "no transition");
+}
+
+#[gpui::test]
+fn same_document_view_transitions_activate_their_types(cx: &mut TestAppContext) {
+    let css = "body { width: 600px; height: 400px; }
+#page { display: flex; flex-direction: column; }
+.hero { view-transition-name: hero; width: 100px; height: 20px; }
+.badge { width: 40px; height: 10px; }
+main:active-view-transition-type(slide) .badge { width: 80px; }
+::view-transition-group(*) { animation: none; }
+::view-transition-old(root) { animation: 400ms linear both fade; }
+@keyframes fade { to { opacity: 0; } }";
+    let html = r#"<main id="page"><div id="hero" class="hero">Hero</div><div id="badge" class="badge"></div></main>"#;
+    let Some((automation, view, visual)) = mount_view(html, css, cx) else {
+        return;
+    };
+    let hero = bounds_of(&automation, "hero");
+    let moved = html.replace(
+        r#"<div id="hero" class="hero">Hero</div><div id="badge" class="badge"></div>"#,
+        r#"<div id="badge" class="badge"></div><div id="hero" class="hero">Hero</div>"#,
+    );
+    let Some(next) = compile_motion(&moved, css) else {
+        return;
+    };
+    view.update_in(visual, |view, window, cx| {
+        assert!(view.live.start_view_transition(["slide"], window, cx));
+        // A document swap while the transition is pending becomes its new state.
+        assert!(view.live.reload(next).is_ok());
+        cx.notify();
+    });
+    visual.run_until_parked();
+    assert_close(
+        bounds_of(&automation, "badge").width,
+        80.0,
+        ":active-view-transition-type() matches while the transition runs",
+    );
+    assert_close(
+        bounds_of(&automation, "hero").y - hero.y,
+        10.0,
+        "`animation: none` on the group jumps to the new box",
+    );
+
+    let ms = std::time::Duration::from_millis;
+    next_frame(visual, ms(200));
+    assert!(view.read_with(visual, |view, _| view.live.view_transition_running()));
+    next_frame(visual, ms(300));
+    next_frame(visual, ms(16));
+    assert!(!view.read_with(visual, |view, _| view.live.view_transition_running()));
+    assert_close(
+        bounds_of(&automation, "badge").width,
+        40.0,
+        "types stop matching when the transition ends",
+    );
+}
+
+#[gpui::test]
+fn duplicate_and_missing_names_do_not_break_transitions(cx: &mut TestAppContext) {
+    let css = "body { width: 600px; height: 400px; }
+.card { view-transition-name: card; width: 50px; height: 20px; }
+.solo { view-transition-name: solo; width: 50px; height: 20px; }";
+    let Some((automation, view, visual)) = mount_view(
+        r#"<main id="page"><div id="a" class="card"></div><div id="b" class="card"></div><div id="gone" class="solo"></div></main>"#,
+        css,
+        cx,
+    ) else {
+        return;
+    };
+    let Some(next) = compile_motion(
+        r#"<main id="page"><div id="a" class="card"></div><div id="fresh" class="hero"></div></main>"#,
+        &format!("{css} .hero {{ view-transition-name: fresh; width: 10px; height: 10px; }}"),
+    ) else {
+        return;
+    };
+    view.update_in(visual, |view, window, cx| {
+        assert!(
+            view.live
+                .start_view_transition(Vec::<&str>::new(), window, cx)
+        );
+        assert!(view.live.reload(next).is_ok());
+        cx.notify();
+    });
+    visual.run_until_parked();
+    assert!(automation.snapshot().nodes.contains_key("fresh"));
+    next_frame(visual, std::time::Duration::from_millis(400));
+    next_frame(visual, std::time::Duration::from_millis(16));
+    assert!(!view.read_with(visual, |view, _| view.live.view_transition_running()));
+    assert_close(bounds_of(&automation, "a").width, 50.0, "settled");
+}

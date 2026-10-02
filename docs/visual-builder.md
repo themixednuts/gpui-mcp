@@ -154,6 +154,68 @@ application owns privileged behavior and native component implementation.
 Unknown custom elements still render their children, so source remains
 inspectable while a component is being implemented.
 
+## Motion
+
+Motion is written in standard CSS and runs on GPUI's animation frames, on
+both backends. Elements that declare no motion do no per-frame motion work,
+and rules are parsed once per element and interaction state.
+
+**Transitions.** `transition` (and its longhands) animates `color`,
+`background-color`, `border-color`, `opacity`, `width`, `height` and
+`translate` (or `transform: translate(…)`) whenever their computed value
+changes: on `:hover`, `:focus`, `:active`, media changes, or a bound
+`width`/`height`. A transition interrupted part-way reverses from the value on
+screen, as in browsers. `@starting-style` gives entry transitions on an
+element's first render. Easing supports the keywords, `cubic-bezier()` and
+`steps()`. `translate` moves an element in prepaint, so layout is unchanged
+while hit testing and semantic bounds follow it.
+
+**Animations.** `animation` (and its longhands) plays `@keyframes` over the
+same properties, with delays, iteration counts, `infinite`, direction and
+fill mode. Keyframe selectors may set `animation-timing-function`.
+
+**Reduced motion.** `@media (prefers-reduced-motion: reduce)` follows GPUI's
+reduce-motion setting.
+
+**View transitions.** Elements with a `view-transition-name` animate between
+two states: a group moves each one from its old box to its new box, while the
+old and new images cross-fade, and everything else (`root`) cross-fades as
+well. `view-transition-name: none` opts out, and `auto`/`match-element` name
+an element by its id. A transition starts in one of two ways:
+
+```rust,ignore
+// Same document: capture, then change state; the next frame animates.
+live.start_view_transition(["slide"], window, cx);
+app_state.update(cx, |state, _| state.page = Page::Detail);
+
+// Navigation: both documents declare `@view-transition { navigation: auto; }`.
+live.reload(next_document)?;
+```
+
+Calling `reload` while a same-document transition is pending makes the new
+document its incoming state. While the transition runs, its types match
+`:active-view-transition-type()` in any selector, for example
+`main:active-view-transition-type(slide) .title`; `@view-transition { types: … }` adds types to navigations.
+`skip_view_transition` ends one at once, and `view_transition_running` reports
+whether one is pending or running.
+
+The pseudo-elements take author rules as in browsers:
+`::view-transition-group(name)`, `::view-transition-old(name)` and
+`::view-transition-new(name)`, with `*`,
+`root` and `.class` (from `view-transition-class`) selectors. Group timing
+defaults to `250ms ease`; `animation: none` on a group makes it jump. Old and
+new images play `@keyframes` such as fades and slides (`opacity` and
+`translate`), inheriting the group's timing unless they set their own.
+
+GPUI keeps no pixels between frames, so the old state is drawn by rendering the
+previous document again, inertly: same styles and bound values, but no ids,
+handlers or focus, and hidden from semantic snapshots. The new state is the
+live document, which stays interactive throughout. A group moves its element
+rather than scaling it; an old image is stretched to the group's box, and the
+new element keeps its own size. A name used by more than one element is not
+transitioned, while the rest of the transition proceeds. Custom components
+draw only their children in old images.
+
 ## Builder operations
 
 A visual editor should modify the source bundle through structured operations,

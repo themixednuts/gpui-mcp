@@ -39,7 +39,7 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "16c9aa7ea6d897a80
 gpui_pre = { package = "gpui-pre", version = ">=0.3.5, <=0.3.7" }
 gpui_ce = { package = "gpui-ce", version = "=0.2.2" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "16c9aa7ea6d897a8044d9501cde1b295256722f2", features = ["font-kit", "wayland", "x11"] }
-htmlswap = { git = "https://github.com/themixednuts/htmlswap", rev = "7b6bd0f0c73cef241819c707615684fd2c066341" }
+htmlswap = { git = "https://github.com/themixednuts/htmlswap", rev = "9bce314d0409ffc08240d6acd990a7d21c9b2bf8" }
 image = { version = "0.25.10", default-features = false, features = ["png", "gif"] }
 interprocess = { version = "2.4.2", features = ["tokio"] }
 notify = "8.2.0"
