@@ -92,11 +92,11 @@ jobs:
       - name: Test bridge with gpui-pre
         run: cargo test -p gpui-mcp --no-default-features --features gpui-pre,test-support --locked
 
-      - name: Test HTML runtime with gpui-pre
-        run: cargo test -p gpui-mcp-html --no-default-features --features gpui-pre,json,ron,dev-watch --locked
+      - name: Test HTML runtime and view transitions with gpui-pre
+        run: cargo test -p gpui-mcp-html -p gpui-view-transitions --no-default-features --features gpui-mcp-html/gpui-pre,gpui-mcp-html/json,gpui-mcp-html/ron,gpui-mcp-html/dev-watch --locked
 
-      - name: Clippy HTML runtime with gpui-pre
-        run: cargo clippy -p gpui-mcp-html --all-targets --no-default-features --features gpui-pre,json,ron,dev-watch --locked -- -D warnings
+      - name: Clippy HTML runtime and view transitions with gpui-pre
+        run: cargo clippy -p gpui-mcp-html -p gpui-view-transitions --all-targets --no-default-features --features gpui-mcp-html/gpui-pre,gpui-mcp-html/json,gpui-mcp-html/ron,gpui-mcp-html/dev-watch --locked -- -D warnings
 
       - name: Check GPUI Kit example formatting
         run: cargo fmt --manifest-path examples/gpui-kit/Cargo.toml -- --check
@@ -211,6 +211,21 @@ jobs:
           --output "$RUNNER_TEMP/$CRATE"
           ${WITHOUT:+--without "$WITHOUT"}
 
+      # The committed lockfile resolves the newest releases. For an older
+      # gpui-pre, move GPUI Kit's base layer to the oldest release the
+      # workspace accepts (it accepts every gpui-pre the bridge does), then
+      # select the patched release.
+      - name: Resolve the patched release
+        if: matrix.crate == 'gpui-pre'
+        env:
+          CRATE: ${{ matrix.crate }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          base=$(sed -n 's/^gpui-base = { version = ">=\([0-9.]*\),.*/\1/p' Cargo.toml)
+          patch="patch.crates-io.$CRATE.path='$RUNNER_TEMP/$CRATE'"
+          cargo update -p gpui-base --precise "$base" --config "$patch"
+          cargo update -p "$CRATE" --precise "$VERSION" --config "$patch"
+
       # The committed lockfile names the vendored release, so these steps
       # resolve the patched release instead of using --locked.
       # The bridge's unit tests need the GPUI crate's own test support, which
@@ -239,6 +254,23 @@ jobs:
           cargo clippy -p gpui-mcp --all-targets --no-default-features
           --features "$CRATE,test-support,${CRATE//-/_}/test-support"
           --config "patch.crates-io.$CRATE.path='$RUNNER_TEMP/$CRATE'" -- -D warnings
+
+      # The HTML runtime and view transitions support the same releases, with
+      # GPUI Kit motion. The runtime needs every optional patch (grid layout),
+      # so rows without one skip it.
+      - name: Test HTML runtime and view transitions
+        if: matrix.crate == 'gpui-pre' && !matrix.without
+        run: >-
+          cargo test -p gpui-mcp-html -p gpui-view-transitions --no-default-features
+          --features "gpui-mcp-html/gpui-pre,gpui-mcp-html/json,gpui-mcp-html/ron,gpui-mcp-html/dev-watch"
+          --config "patch.crates-io.gpui-pre.path='$RUNNER_TEMP/gpui-pre'"
+
+      - name: Clippy HTML runtime and view transitions
+        if: matrix.crate == 'gpui-pre' && !matrix.without
+        run: >-
+          cargo clippy -p gpui-mcp-html -p gpui-view-transitions --all-targets --no-default-features
+          --features "gpui-mcp-html/gpui-pre,gpui-mcp-html/json,gpui-mcp-html/ron,gpui-mcp-html/dev-watch"
+          --config "patch.crates-io.gpui-pre.path='$RUNNER_TEMP/gpui-pre'" -- -D warnings
 
   msrv:
     # gpui-mcp and gpui-mcp-protocol declare an older rust-version than the

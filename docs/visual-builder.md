@@ -54,20 +54,37 @@ stylesheets must be supplied explicitly by the host. The compiler rejects:
 Validation is fail closed: an error prevents construction of `HtmlUi`; the
 compiler does not return a partially trusted render plan for execution.
 
-The live CSS subset covers flex layout, CSS grid (track lists with lengths,
-percentages, `fr`, `auto`, `min-content`, `max-content`, `minmax()`,
-`fit-content()` and `repeat(n | auto-fill | auto-fit, …)` for
-`grid-template-columns` and `grid-template-rows`; `grid-auto-columns`,
-`grid-auto-rows` and `grid-auto-flow`; line and span placement with
-`grid-column`, `grid-row` and their `-start`/`-end` longhands; `row-gap` and
-`column-gap`), spacing, pixel dimensions, background/text/border colors, font
-family, size/weight/line height, and border radius. Single `:hover`, `:focus`, and
-`:active` variants map to GPUI's native interactive refinements. Standard
-`<details>` elements retain open/closed disclosure state and publish it through
-the semantic tree. Unsupported properties, lengths, named grid lines and areas,
-combined conditions, dynamic rules, and pseudo-elements remain in the document
-and produce `RenderDiagnostic` entries rather than disappearing silently. A
-builder should show these diagnostics next to the source.
+CSS goes through htmlswap's typed lowering (`htmlswap::computed`), the same
+one its code generators use, so the canvas and exported code cannot disagree
+about a value. The lowering follows the specifications: every length unit
+(viewport and font-relative units; not container units), `calc()` and the
+math functions, CSS Color 4/5 (`oklch()`, `color-mix()`, relative colors,
+system colors), custom properties with `var()` and cycle detection,
+`color-scheme` with `light-dark()`, CSS-wide keywords, and media queries
+(sizes, ranges, `prefers-color-scheme`, `prefers-reduced-motion`, `hover`,
+`pointer`). `LiveHtml::set_color_scheme` overrides the system scheme.
+
+GPUI then draws flex and grid layout (track lists with lengths, percentages,
+`fr`, `auto`, `min-content`, `max-content`, `minmax()`, `fit-content()` and
+`repeat()`; auto tracks and flow; line and span placement; gaps), spacing,
+sizes, insets, colors, solid and dashed borders, radii, box shadows, opacity,
+overflow, cursors, fonts (family fallback, weight, style, size, line height,
+`font-feature-settings`, `font-kerning`), text alignment, wrapping, ellipsis,
+`line-clamp`, `text-transform` and text decoration. GPUI sizes are border-box;
+`content-box` sizes (the CSS default) are converted when the padding and
+borders are absolute, and diagnosed otherwise, so stylesheets normally set
+`box-sizing: border-box`.
+
+State pseudo-classes apply to the element they are written on: in
+`.card:hover .title`, hovering the card restyles its title. `:hover`,
+`:focus`, `:focus-visible`, `:active` and their `:not()` forms are tracked.
+Standard `<details>` elements retain open/closed disclosure state and publish
+it through the semantic tree. What GPUI cannot draw (fixed or sticky
+positioning, intrinsic sizes, mixed-unit `calc()` lengths, other border
+styles, letter spacing, named grid lines and areas, `@supports`, container
+queries, pseudo-elements) stays in the document and produces a
+`RenderDiagnostic` instead of disappearing silently. A builder should show
+these diagnostics next to the source.
 
 ## Mapping the canvas back to source
 
@@ -156,17 +173,22 @@ inspectable while a component is being implemented.
 
 ## Motion
 
-Motion is written in standard CSS and runs on GPUI's animation frames, on
-both backends. Elements that declare no motion do no per-frame motion work,
-and rules are parsed once per element and interaction state.
+Motion is written in standard CSS. Transitions and animations run on GPUI
+Kit's motion runtime (`gpui_base::motion`), the same runtime exported GPUI Kit
+code calls, so the canvas and the exported app move identically. This is
+always on with the `gpui-pre` backend. On the Zed backend, which GPUI Kit
+does not support, animated properties take their end values at once; nothing
+is approximated. Elements that declare no motion do no
+per-frame motion work.
 
-**Transitions.** `transition` (and its longhands) animates `color`,
-`background-color`, `border-color`, `opacity`, `width`, `height` and
-`translate` (or `transform: translate(…)`) whenever their computed value
-changes: on `:hover`, `:focus`, `:active`, media changes, or a bound
-`width`/`height`. A transition interrupted part-way reverses from the value on
-screen, as in browsers. `@starting-style` gives entry transitions on an
-element's first render. Easing supports the keywords, `cubic-bezier()` and
+**Transitions.** `transition` (and its longhands) animates every property in
+htmlswap's animatable table: colors, opacity, sizes, insets, margins,
+padding, gaps, border widths and radii, flex factors, font size, line height
+and `translate` (or `transform: translate(…)`). A transition starts whenever
+a computed value changes: on `:hover`, `:focus`, `:active`, media changes, or
+a bound `width`/`height`. A transition interrupted part-way reverses from the
+value on screen, as in browsers. `@starting-style` gives entry transitions on
+an element's first render. Easing supports the keywords, `cubic-bezier()` and
 `steps()`. `translate` moves an element in prepaint, so layout is unchanged
 while hit testing and semantic bounds follow it.
 
@@ -180,7 +202,9 @@ reduce-motion setting.
 **View transitions.** Elements with a `view-transition-name` animate between
 two states: a group moves each one from its old box to its new box, while the
 old and new images cross-fade, and everything else (`root`) cross-fades as
-well. `view-transition-name: none` opts out, and `auto`/`match-element` name
+well. They run on the `gpui-view-transitions` crate (on `gpui_base::motion`),
+which exported GPUI Kit code uses too; on the Zed backend a transition applies
+its end state at once, and `start_view_transition` returns `false`. `view-transition-name: none` opts out, and `auto`/`match-element` name
 an element by its id. A transition starts in one of two ways:
 
 ```rust,ignore
@@ -210,8 +234,9 @@ new images play `@keyframes` such as fades and slides (`opacity` and
 GPUI keeps no pixels between frames, so the old state is drawn by rendering the
 previous document again, inertly: same styles and bound values, but no ids,
 handlers or focus, and hidden from semantic snapshots. The new state is the
-live document, which stays interactive throughout. A group moves its element
-rather than scaling it; an old image is stretched to the group's box, and the
+live document, which stays interactive throughout. Captured and new boxes
+include an element's `translate`, as browsers capture transformed boxes. A
+group moves its element rather than scaling it; an old image is stretched to the group's box, and the
 new element keeps its own size. A name used by more than one element is not
 transitioned, while the rest of the transition proceeds. Custom components
 draw only their children in old images.

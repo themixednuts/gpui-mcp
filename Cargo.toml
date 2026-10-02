@@ -5,6 +5,7 @@ members = [
     "crates/gpui-mcp",
     "crates/gpui-mcp-html",
     "crates/gpui-mcp-server",
+    "crates/gpui-view-transitions",
     "examples/demo",
     "examples/runtime-showcase",
     "xtask",
@@ -39,7 +40,12 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "16c9aa7ea6d897a80
 gpui_pre = { package = "gpui-pre", version = ">=0.3.5, <=0.3.7" }
 gpui_ce = { package = "gpui-ce", version = "=0.2.2" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "16c9aa7ea6d897a8044d9501cde1b295256722f2", features = ["font-kit", "wayland", "x11"] }
-htmlswap = { git = "https://github.com/themixednuts/htmlswap", rev = "9bce314d0409ffc08240d6acd990a7d21c9b2bf8" }
+# GPUI Kit's foundation crate, for its motion runtime. It pins gpui-pre 0.3.7.
+# GPUI Kit's base layer, for its motion runtime. 0.6.4 accepts gpui-pre ^0.3.5
+# and 0.7.0 pins 0.3.7, so this range has a release for every gpui-pre the
+# bridge accepts; the motion API is the same across it.
+gpui-base = { version = ">=0.6.4, <0.8", default-features = false }
+htmlswap = { git = "https://github.com/themixednuts/htmlswap", rev = "e6079d37972dc1428751246cd0e690e52f0dce0a" }
 image = { version = "0.25.10", default-features = false, features = ["png", "gif"] }
 interprocess = { version = "2.4.2", features = ["tokio"] }
 notify = "8.2.0"

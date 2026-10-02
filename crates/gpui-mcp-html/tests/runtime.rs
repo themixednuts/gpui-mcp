@@ -1206,6 +1206,7 @@ fn bounds_of(automation: &Automation, id: &str) -> gpui_mcp::Rect {
     automation.snapshot().nodes[id].bounds.unwrap_or_default()
 }
 
+#[cfg(feature = "gpui-pre")]
 #[gpui::test]
 fn css_transitions_interpolate_interaction_changes(cx: &mut TestAppContext) {
     let css = "body { width: 600px; height: 400px; }
@@ -1237,13 +1238,14 @@ fn css_transitions_interpolate_interaction_changes(cx: &mut TestAppContext) {
         "translate half-way, without moving layout",
     );
 
-    // Leaving half-way reverses from the value on screen.
+    // Leaving half-way reverses from the value on screen, over half the
+    // duration (the reversing shortening factor, CSS Transitions 1 §3).
     visual.simulate_mouse_move(point(px(590.0), px(390.0)), None, Modifiers::default());
     visual.run_until_parked();
     next_frame(visual, ms(250));
     assert_close(
         bounds_of(&automation, "box").width,
-        137.5,
+        125.0,
         "a reversed transition starts from where it was",
     );
     next_frame(visual, ms(2000));
@@ -1252,6 +1254,7 @@ fn css_transitions_interpolate_interaction_changes(cx: &mut TestAppContext) {
     assert_close(settled.x, start.x, "settled position");
 }
 
+#[cfg(feature = "gpui-pre")]
 #[gpui::test]
 fn starting_style_and_keyframes_animate_on_first_render(cx: &mut TestAppContext) {
     let css = "body { width: 600px; height: 400px; }
@@ -1299,6 +1302,82 @@ fn starting_style_and_keyframes_animate_on_first_render(cx: &mut TestAppContext)
     );
 }
 
+/// Without GPUI Kit's motion runtime, a view transition applies its end
+/// state at once: nothing is captured or drawn over the new state.
+#[cfg(not(feature = "gpui-pre"))]
+#[gpui::test]
+fn without_gpui_kit_view_transitions_apply_end_states(cx: &mut TestAppContext) {
+    let linear = "animation-duration: 1s; animation-timing-function: linear;";
+    let Some((automation, view, visual)) = mount_view(HERO_HTML, &hero_css(true, 0.0, linear), cx)
+    else {
+        return;
+    };
+    let start = bounds_of(&automation, "hero");
+    let Some(next) = compile_motion(HERO_HTML, &hero_css(true, 200.0, linear)) else {
+        return;
+    };
+    view.update_in(visual, |view, window, cx| {
+        assert!(!view.live.start_view_transition(["slide"], window, cx));
+        assert!(view.live.reload(next).is_ok());
+        assert!(!view.live.view_transition_running());
+        cx.notify();
+    });
+    visual.run_until_parked();
+    assert_close(
+        bounds_of(&automation, "hero").x - start.x,
+        200.0,
+        "the new box at once",
+    );
+    assert!(
+        !automation
+            .snapshot()
+            .nodes
+            .contains_key("html-view-transition-old")
+    );
+}
+
+/// Without GPUI Kit's motion runtime, animated properties take their end
+/// values at once rather than approximating the animation.
+#[cfg(not(feature = "gpui-pre"))]
+#[gpui::test]
+fn without_gpui_kit_motion_applies_end_states(cx: &mut TestAppContext) {
+    let css = "body { width: 600px; height: 400px; }
+#page { display: flex; flex-direction: column; }
+.box { margin: 50px; width: 100px; height: 20px; transition: width 1s linear; }
+.box:hover { width: 200px; }
+@starting-style { .box { width: 0px; } }
+@keyframes stretch { from { width: 0px; } to { width: 300px; } }
+.pulse { width: 100px; height: 10px; animation: stretch 1s linear; }";
+    let Some((automation, visual)) = mount(
+        r#"<main id="page"><div id="box" class="box">Box</div><div id="pulse" class="pulse"></div></main>"#,
+        css,
+        cx,
+    ) else {
+        return;
+    };
+    let start = bounds_of(&automation, "box");
+    assert_close(start.width, 100.0, "no entry transition");
+    assert_close(bounds_of(&automation, "pulse").width, 100.0, "no keyframes");
+
+    visual.simulate_mouse_move(
+        point(px(start.x + 10.0), px(start.y + 10.0)),
+        None,
+        Modifiers::default(),
+    );
+    visual.run_until_parked();
+    assert_close(
+        bounds_of(&automation, "box").width,
+        200.0,
+        "hover applies at once",
+    );
+    next_frame(visual, std::time::Duration::from_millis(500));
+    assert_close(
+        bounds_of(&automation, "box").width,
+        200.0,
+        "nothing animates",
+    );
+}
+
 fn compile_motion(html: &str, css: &str) -> Option<HtmlUi> {
     expect_ok(
         HtmlUi::compile_with_stylesheet(html, BindingDocument::new(), "motion.css", css),
@@ -1343,6 +1422,7 @@ body {{ width: 600px; height: 400px; }}
     )
 }
 
+#[cfg(feature = "gpui-pre")]
 #[gpui::test]
 fn navigation_view_transitions_move_named_elements(cx: &mut TestAppContext) {
     let linear = "animation-duration: 1s; animation-timing-function: linear;";
@@ -1368,7 +1448,7 @@ fn navigation_view_transitions_move_named_elements(cx: &mut TestAppContext) {
         automation
             .snapshot()
             .nodes
-            .contains_key("html-view-transition"),
+            .contains_key("html-view-transition-old"),
         "the old image is drawn while the transition runs"
     );
 
@@ -1391,7 +1471,7 @@ fn navigation_view_transitions_move_named_elements(cx: &mut TestAppContext) {
         !automation
             .snapshot()
             .nodes
-            .contains_key("html-view-transition"),
+            .contains_key("html-view-transition-old"),
         "the old image is gone once the transition ends"
     );
 
@@ -1408,6 +1488,7 @@ fn navigation_view_transitions_move_named_elements(cx: &mut TestAppContext) {
     assert_close(bounds_of(&automation, "hero").x, start.x, "no transition");
 }
 
+#[cfg(feature = "gpui-pre")]
 #[gpui::test]
 fn same_document_view_transitions_activate_their_types(cx: &mut TestAppContext) {
     let css = "body { width: 600px; height: 400px; }
@@ -1461,6 +1542,7 @@ main:active-view-transition-type(slide) .badge { width: 80px; }
     );
 }
 
+#[cfg(feature = "gpui-pre")]
 #[gpui::test]
 fn duplicate_and_missing_names_do_not_break_transitions(cx: &mut TestAppContext) {
     let css = "body { width: 600px; height: 400px; }

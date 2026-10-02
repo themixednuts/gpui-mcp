@@ -1,513 +1,304 @@
-//! CSS transitions and `@keyframes` animations for the live renderer.
+//! CSS transitions and `@keyframes` for the live renderer.
 //!
-//! Each element keeps one track per animated property. A track remembers
-//! where the property started, where it is going, and when, on the window
-//! executor's clock. When an element's computed value changes the track
-//! restarts from the value currently on screen, so an interrupted
-//! transition reverses smoothly, as in a browser. Sampling a track
-//! allocates nothing.
-
-use std::collections::HashMap;
-use std::time::Instant;
+//! On the `gpui-pre` backend (GPUI Kit) they run on GPUI Kit's motion runtime
+//! (`gpui_base::motion`), the same runtime generated GPUI Kit code uses, so
+//! the Studio canvas and an exported app animate identically. The values
+//! come from htmlswap's typed lowering: `AnimatableProperty` says what a rule
+//! animates and `AnimatedValue` how values blend. Without the feature (the
+//! Zed GPUI backend), properties take their end values at once.
 
 use gpui::{
-    AnyElement, App, Bounds, DefiniteLength, Element, ElementId as GpuiElementId, GlobalElementId,
-    InspectorElementId, IntoElement, LayoutId, Pixels, Window, point, px,
+    AnyElement, App, Bounds, Element, ElementId as GpuiElementId, GlobalElementId,
+    InspectorElementId, IntoElement, LayoutId, Pixels, Window, point,
 };
-use htmlswap::motion::{Animation, Easing, Transition};
-use htmlswap::{RenderKeyframes, RenderMotionPlan, StyleDeclaration};
+use htmlswap::computed::{ComputedStyle, LengthPercentage, Underlying};
+use htmlswap::{RenderMotionPlan, StyleDeclaration};
 
-use crate::ElementId;
+use crate::cascade::Computed;
 
-/// A property the renderer can interpolate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Animated {
-    BackgroundColor,
-    Color,
-    BorderColor,
-    Opacity,
-    Width,
-    Height,
-    Translate,
+/// What one element animates this frame.
+#[cfg_attr(not(feature = "gpui-pre"), allow(dead_code))]
+pub(crate) struct Inputs<'a> {
+    /// The element's runtime id, which keys its motion state.
+    pub(crate) key: &'a str,
+    pub(crate) computed: &'a Computed,
+    /// The style to animate toward: the computed style with bound values.
+    pub(crate) target: &'a ComputedStyle,
+    /// Whether this is the element's first frame, when `@starting-style`
+    /// applies.
+    pub(crate) entering: bool,
+    pub(crate) plan: &'a RenderMotionPlan,
+    pub(crate) underlying: Underlying,
+    /// Computes a keyframe's declarations in the element's scope.
+    pub(crate) compute_keyframe: &'a dyn Fn(&[StyleDeclaration]) -> ComputedStyle,
 }
 
-impl Animated {
-    pub(crate) const ALL: [Self; 7] = [
-        Self::BackgroundColor,
-        Self::Color,
-        Self::BorderColor,
-        Self::Opacity,
-        Self::Width,
-        Self::Height,
-        Self::Translate,
-    ];
-
-    pub(crate) const fn css_name(self) -> &'static str {
-        match self {
-            Self::BackgroundColor => "background-color",
-            Self::Color => "color",
-            Self::BorderColor => "border-color",
-            Self::Opacity => "opacity",
-            Self::Width => "width",
-            Self::Height => "height",
-            Self::Translate => "translate",
-        }
-    }
-
-    pub(crate) const fn index(self) -> usize {
-        self as usize
-    }
-
-    /// Parse a declaration of this property, including the shorthands and
-    /// equivalent forms that set it.
-    fn parse(self, declaration: &StyleDeclaration) -> Option<MotionValue> {
-        let name = declaration.property.as_str();
-        let value = declaration.value.as_str().trim();
-        let lowered = value.to_ascii_lowercase();
-        match self {
-            Self::BackgroundColor if matches!(name, "background-color" | "background") => {
-                crate::render::color(&lowered).map(MotionValue::color)
-            }
-            Self::Color if name == "color" => {
-                crate::render::color(&lowered).map(MotionValue::color)
-            }
-            Self::BorderColor if name == "border-color" => {
-                crate::render::color(&lowered).map(MotionValue::color)
-            }
-            Self::Opacity if name == "opacity" => {
-                crate::render::opacity(&lowered).map(MotionValue::Number)
-            }
-            Self::Width if name == "width" => length(&lowered),
-            Self::Height if name == "height" => length(&lowered),
-            Self::Translate if name == "translate" => translate(&lowered),
-            Self::Translate if name == "transform" => transform_translate(&lowered),
-            _ => None,
-        }
-    }
-
-    /// The value an element has when nothing sets the property.
-    const fn initial(self) -> Option<MotionValue> {
-        match self {
-            Self::BackgroundColor => Some(MotionValue::Color([0.0; 4])),
-            Self::Opacity => Some(MotionValue::Number(1.0)),
-            Self::Translate => Some(MotionValue::Translate(Offset::ZERO, Offset::ZERO)),
-            // Inherited colors and `auto` sizes are not interpolated.
-            Self::Color | Self::BorderColor | Self::Width | Self::Height => None,
-        }
-    }
-}
-
-/// One component of a translation: `px + fraction × own size`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Offset {
-    pub(crate) px: f32,
-    pub(crate) fraction: f32,
-}
-
-impl Offset {
-    pub(crate) const ZERO: Self = Self {
-        px: 0.0,
-        fraction: 0.0,
-    };
-
-    fn lerp(self, to: Self, t: f32) -> Self {
-        Self {
-            px: lerp(self.px, to.px, t),
-            fraction: lerp(self.fraction, to.fraction, t),
-        }
-    }
-
-    pub(crate) fn resolve(self, size: Pixels) -> Pixels {
-        px(self.px + self.fraction * f32::from(size))
-    }
-}
-
-/// An interpolable computed value.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum MotionValue {
-    /// Premultiplied linear-in-sRGB RGBA in `0..=1`, which is how browsers
-    /// interpolate legacy colors without darkening fades through transparent.
-    Color([f32; 4]),
-    Number(f32),
-    Pixels(f32),
-    /// A percentage of the containing block, as `0..=1`.
-    Fraction(f32),
-    Translate(Offset, Offset),
-}
-
-impl MotionValue {
-    fn color(rgba: u32) -> Self {
-        let [r, g, b, a] = rgba.to_be_bytes().map(|byte| f32::from(byte) / 255.0);
-        Self::Color([r * a, g * a, b * a, a])
-    }
-
-    /// `0xRRGGBBAA` for a color value.
-    pub(crate) fn rgba(self) -> Option<u32> {
-        let Self::Color([r, g, b, a]) = self else {
-            return None;
-        };
-        // Clamped to 0..=255 first, so the cast cannot truncate or wrap.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u32;
-        let unpremultiply = |channel: f32| if a > 0.0 { channel / a } else { 0.0 };
-        Some(
-            byte(unpremultiply(r)) << 24
-                | byte(unpremultiply(g)) << 16
-                | byte(unpremultiply(b)) << 8
-                | byte(a),
-        )
-    }
-
-    pub(crate) fn number(self) -> Option<f32> {
-        match self {
-            Self::Number(value) => Some(value),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn length(self) -> Option<DefiniteLength> {
-        match self {
-            Self::Pixels(value) => Some(px(value).into()),
-            Self::Fraction(value) => Some(DefiniteLength::Fraction(value)),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn translate(self) -> Option<(Offset, Offset)> {
-        match self {
-            Self::Translate(x, y) => Some((x, y)),
-            _ => None,
-        }
-    }
-
-    /// Interpolate, or `None` when the values have no common form (such as
-    /// pixels and percentages, or `auto`), in which case CSS switches at once.
-    fn lerp(self, to: Self, t: f32) -> Option<Self> {
-        Some(match (self, to) {
-            (Self::Color(from), Self::Color(to)) => {
-                Self::Color(std::array::from_fn(|index| lerp(from[index], to[index], t)))
-            }
-            (Self::Number(from), Self::Number(to)) => Self::Number(lerp(from, to, t)),
-            (Self::Pixels(from), Self::Pixels(to)) => Self::Pixels(lerp(from, to, t)),
-            (Self::Fraction(from), Self::Fraction(to)) => Self::Fraction(lerp(from, to, t)),
-            (Self::Translate(from_x, from_y), Self::Translate(to_x, to_y)) => {
-                Self::Translate(from_x.lerp(to_x, t), from_y.lerp(to_y, t))
-            }
-            _ => return None,
-        })
-    }
-}
-
-fn lerp(from: f32, to: f32, t: f32) -> f32 {
-    from + (to - from) * t
-}
-
-fn length(value: &str) -> Option<MotionValue> {
-    if value == "0" {
-        return Some(MotionValue::Pixels(0.0));
-    }
-    if let Some(percent) = value.strip_suffix('%') {
-        return percent
-            .trim()
-            .parse::<f32>()
-            .ok()
-            .map(|p| MotionValue::Fraction(p / 100.0));
-    }
-    if let Some(pixels) = value.strip_suffix("px") {
-        return pixels.trim().parse().ok().map(MotionValue::Pixels);
-    }
-    if let Some(rems) = value.strip_suffix("rem") {
-        return rems
-            .trim()
-            .parse::<f32>()
-            .ok()
-            .map(|r| MotionValue::Pixels(r * 16.0));
-    }
-    None
-}
-
-fn offset(value: &str) -> Option<Offset> {
-    match length(value)? {
-        MotionValue::Pixels(px) => Some(Offset { px, fraction: 0.0 }),
-        MotionValue::Fraction(fraction) => Some(Offset { px: 0.0, fraction }),
-        _ => None,
-    }
-}
-
-/// `translate: x [y [z]]`.
-pub(crate) fn translate(value: &str) -> Option<MotionValue> {
-    if value == "none" {
-        return Some(MotionValue::Translate(Offset::ZERO, Offset::ZERO));
-    }
-    let mut parts = value.split_whitespace();
-    let x = offset(parts.next()?)?;
-    let y = parts.next().map_or(Some(Offset::ZERO), offset)?;
-    Some(MotionValue::Translate(x, y))
-}
-
-/// The translation in `transform: translate(…)`, `translateX(…)` or
-/// `translateY(…)`; other transform functions are not animated.
-fn transform_translate(value: &str) -> Option<MotionValue> {
-    if value == "none" {
-        return Some(MotionValue::Translate(Offset::ZERO, Offset::ZERO));
-    }
-    let (function, arguments) = value.strip_suffix(')')?.split_once('(')?;
-    let arguments: Vec<&str> = arguments.split(',').map(str::trim).collect();
-    let (x, y) = match (function.trim(), arguments.as_slice()) {
-        ("translate" | "translatex", [x]) => (offset(x)?, Offset::ZERO),
-        ("translate", [x, y]) => (offset(x)?, offset(y)?),
-        ("translatey", [y]) => (Offset::ZERO, offset(y)?),
-        _ => return None,
-    };
-    Some(MotionValue::Translate(x, y))
-}
-
-/// Computed values for every animated property, from declarations in
-/// cascade order (later wins).
-pub(crate) fn computed<'a>(
-    declarations: impl IntoIterator<Item = &'a StyleDeclaration>,
-) -> [Option<MotionValue>; 7] {
-    let mut values = [None; 7];
-    let mut important = [false; 7];
-    for declaration in declarations {
-        for property in Animated::ALL {
-            if let Some(value) = property.parse(declaration) {
-                let index = property.index();
-                if declaration.important || !important[index] {
-                    values[index] = Some(value);
-                    important[index] |= declaration.important;
-                }
-            }
-        }
-    }
-    values
-}
-
-#[derive(Clone, Debug)]
-struct Track {
-    from: MotionValue,
-    to: MotionValue,
-    started: Instant,
-    transition: Option<Transition>,
-}
-
-impl Track {
-    fn settled(value: MotionValue, now: Instant) -> Self {
-        Self {
-            from: value,
-            to: value,
-            started: now,
-            transition: None,
-        }
-    }
-
-    /// The value at `now`, and whether it is still moving.
-    fn sample(&self, now: Instant) -> (MotionValue, bool) {
-        let Some(transition) = &self.transition else {
-            return (self.to, false);
-        };
-        let elapsed = elapsed_ms(self.started, now);
-        match transition.progress(elapsed) {
-            Some(t) => (self.from.lerp(self.to, t).unwrap_or(self.to), true),
-            None => (self.to, false),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct RunningAnimation {
-    name: htmlswap::CompactString,
-    started: Instant,
-}
-
+/// What an element's motion produced.
 #[derive(Debug, Default)]
-struct ElementMotion {
-    tracks: [Option<Track>; 7],
-    animations: Vec<RunningAnimation>,
-    touched: u64,
-}
-
-/// What an element's motion produced for one frame.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Frame {
-    pub(crate) values: [Option<MotionValue>; 7],
+pub(crate) struct Output {
+    /// Values to draw over the element's computed style.
+    pub(crate) style: ComputedStyle,
+    /// Whether anything still moves, so another frame is needed.
     pub(crate) moving: bool,
 }
 
-impl Frame {
-    pub(crate) fn get(&self, property: Animated) -> Option<MotionValue> {
-        self.values[property.index()]
-    }
+/// Whether an element's styles involve motion at all.
+pub(crate) fn has_motion(computed: &Computed) -> bool {
+    computed
+        .transitions
+        .iter()
+        .any(htmlswap::motion::Transition::is_active)
+        || computed
+            .animations
+            .iter()
+            .any(|animation| animation.name.is_some())
 }
 
-/// Inputs for one element's motion this frame.
-pub(crate) struct Inputs<'a> {
-    /// Computed values after the cascade, interaction state and bindings.
-    pub(crate) targets: [Option<MotionValue>; 7],
-    /// Values from `@starting-style`, used the first time the element is seen.
-    pub(crate) starting: [Option<MotionValue>; 7],
-    pub(crate) transitions: &'a [Transition],
-    pub(crate) animations: &'a [Animation],
-    pub(crate) keyframes: &'a RenderMotionPlan,
+#[cfg(feature = "gpui-pre")]
+pub(crate) use kit::{animate, duration, easing, frames, keyframes, timing};
+
+/// Without GPUI Kit's motion runtime, values take their end state at once.
+#[cfg(not(feature = "gpui-pre"))]
+pub(crate) fn animate(_: &Inputs<'_>, _: &mut Window, _: &mut App) -> Output {
+    Output::default()
 }
 
-/// Motion for every rendered element of one live document.
-#[derive(Debug, Default)]
-pub(crate) struct MotionState {
-    elements: HashMap<ElementId, ElementMotion>,
-    generation: u64,
-}
+#[cfg(feature = "gpui-pre")]
+mod kit {
+    use std::time::Duration;
 
-impl MotionState {
-    /// Start a render pass.
-    pub(crate) fn begin(&mut self) {
-        self.generation += 1;
-    }
+    use gpui::{App, SharedString, Window};
+    use gpui_base::animation::Lerp;
+    use gpui_base::motion::{
+        Easing as KitEasing, Interpolate, IterationCount, Keyframe, Keyframes, MotionStatus,
+        PlaybackDirection, SignedDuration, StepPosition as KitStep, Timing,
+        Transition as KitTransition, animate_keyframes, transition_with_status,
+    };
+    use htmlswap::computed::{AnimatableProperty, AnimatedValue, ComputedStyle};
+    use htmlswap::motion::{
+        Animation, AnimationDirection, Easing, FillMode, Iterations, StepPosition, Transition,
+    };
+    use htmlswap::{RenderKeyframes, StyleDeclaration};
 
-    /// Forget elements that the last render pass did not draw.
-    pub(crate) fn end(&mut self) {
-        let generation = self.generation;
-        self.elements
-            .retain(|_, motion| motion.touched == generation);
-    }
+    use super::{Inputs, Output};
 
-    /// Advance one element and return the values to draw.
-    pub(crate) fn frame(&mut self, id: &ElementId, inputs: &Inputs<'_>, now: Instant) -> Frame {
-        let generation = self.generation;
-        let seen = self.elements.contains_key(id);
-        if !seen {
-            self.elements.insert(id.clone(), ElementMotion::default());
+    /// An animated value for GPUI Kit's runtime, blended as CSS specifies.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Value(AnimatedValue);
+
+    impl Lerp for Value {
+        fn lerp(&self, target: &Self, t: f32) -> Self {
+            Self(self.0.mix(target.0, t))
         }
-        let Some(motion) = self.elements.get_mut(id) else {
-            return Frame::default();
-        };
-        motion.touched = generation;
-        let mut frame = Frame::default();
+    }
 
-        for property in Animated::ALL {
-            let index = property.index();
-            let target = inputs.targets[index].or_else(|| property.initial());
-            let Some(target) = target else {
-                motion.tracks[index] = None;
-                continue;
-            };
-            let transition =
-                Transition::for_property(inputs.transitions, property.css_name()).cloned();
-            let track = match motion.tracks[index].take() {
-                // An entry transition from @starting-style.
-                None if !seen => match (inputs.starting[index], &transition) {
-                    (Some(start), Some(_)) => Track {
-                        from: start,
-                        to: target,
-                        started: now,
-                        transition,
-                    },
-                    _ => Track::settled(target, now),
-                },
-                None => Track::settled(target, now),
-                Some(track) if track.to == target => track,
-                Some(track) => {
-                    let (current, _) = track.sample(now);
-                    match transition {
-                        Some(transition) if current.lerp(target, 0.0).is_some() => Track {
-                            from: current,
-                            to: target,
-                            started: now,
-                            transition: Some(transition),
-                        },
-                        _ => Track::settled(target, now),
-                    }
-                }
-            };
-            let (value, moving) = track.sample(now);
-            // An initial value is drawn only while it animates, so it never
-            // overrides styling the motion engine does not model, such as a
-            // gradient background.
-            if inputs.targets[index].is_some() || moving {
-                frame.values[index] = Some(value);
+    pub(crate) fn easing(easing: Easing) -> KitEasing {
+        match easing {
+            Easing::Linear => KitEasing::Linear,
+            Easing::CubicBezier(x1, y1, x2, y2) => {
+                KitEasing::cubic_bezier(x1, y1, x2, y2).unwrap_or(KitEasing::Linear)
             }
-            frame.moving |= moving;
-            motion.tracks[index] = Some(track);
+            Easing::Steps(count, position) => KitEasing::steps(
+                count,
+                match position {
+                    StepPosition::JumpStart => KitStep::JumpStart,
+                    StepPosition::JumpEnd => KitStep::JumpEnd,
+                    StepPosition::JumpNone => KitStep::JumpNone,
+                    StepPosition::JumpBoth => KitStep::JumpBoth,
+                },
+            )
+            .unwrap_or(KitEasing::Linear),
         }
+    }
 
-        sync_animations(&mut motion.animations, inputs.animations, now);
-        for (animation, running) in inputs.animations.iter().zip(&motion.animations) {
-            let Some(keyframes) = animation
-                .name
-                .as_deref()
-                .and_then(|name| inputs.keyframes.keyframes(name))
+    pub(crate) fn duration(ms: f32) -> Duration {
+        Duration::from_secs_f32(ms.max(0.0) / 1000.0)
+    }
+
+    fn delay(ms: f32) -> SignedDuration {
+        if ms < 0.0 {
+            SignedDuration::negative(duration(-ms))
+        } else {
+            SignedDuration::positive(duration(ms))
+        }
+    }
+
+    fn policy(transition: &Transition) -> KitTransition {
+        KitTransition::new(duration(transition.duration_ms))
+            .delay(delay(transition.delay_ms))
+            .easing(easing(transition.easing))
+    }
+
+    fn channel(inputs: &Inputs<'_>, suffix: &str) -> (SharedString, SharedString) {
+        (
+            SharedString::from(format!("html-motion:{}", inputs.key)),
+            SharedString::from(suffix.to_owned()),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn animate(inputs: &Inputs<'_>, window: &mut Window, cx: &mut App) -> Output {
+        let mut output = Output::default();
+        let computed = inputs.computed;
+        // Entry transitions start from @starting-style (CSS Transitions 2
+        // §3.1): the first frame creates each value there and retargets it
+        // to the element's own value at once, so the transition starts on
+        // the frame the element first gets a style.
+        let starting = computed.starting.as_ref().filter(|_| inputs.entering);
+        for property in AnimatableProperty::ALL {
+            let Some(transition) =
+                Transition::for_property(&computed.transitions, property.css_name())
+                    .filter(|transition| transition.is_active())
             else {
                 continue;
             };
-            let elapsed = elapsed_ms(running.started, now);
-            frame.moving |= animation.end_ms().is_none_or(|end| elapsed < end);
-            if let Some(phase) = animation.phase(elapsed) {
-                apply_keyframes(&mut frame, keyframes, animation.easing, phase.progress);
+            let explicit = property.get(inputs.target);
+            let Some(target) = explicit.or_else(|| property.initial(&inputs.underlying)) else {
+                continue;
+            };
+            if let Some(from) = starting.and_then(|starting| property.get(starting)) {
+                transition_with_status(
+                    channel(inputs, property.css_name()),
+                    Value(from),
+                    policy(transition),
+                    window,
+                    cx,
+                );
+            }
+            let sample = transition_with_status(
+                channel(inputs, property.css_name()),
+                Value(target),
+                policy(transition),
+                window,
+                cx,
+            );
+            let moving = matches!(sample.status, MotionStatus::Running | MotionStatus::Delayed);
+            if explicit.is_some() || moving {
+                property.set(&mut output.style, sample.value.0);
+            }
+            output.moving |= moving;
+        }
+        for (index, animation) in computed.animations.iter().enumerate() {
+            let Some(name) = animation.name.as_deref() else {
+                continue;
+            };
+            let Some(source) = inputs.plan.keyframes(name) else {
+                continue;
+            };
+            let frames = frames(source, animation.easing, inputs.compute_keyframe);
+            let timing = timing(animation);
+            for property in AnimatableProperty::ALL {
+                if frames
+                    .iter()
+                    .all(|(_, style, _)| property.get(style).is_none())
+                {
+                    continue;
+                }
+                let underlying = property
+                    .get(&output.style)
+                    .or_else(|| property.get(inputs.target))
+                    .or_else(|| property.initial(&inputs.underlying));
+                let Some(keyframes) =
+                    keyframes(&frames, property, underlying, |value| Some(Value(value)))
+                else {
+                    continue;
+                };
+                let sample = animate_keyframes(
+                    channel(inputs, &format!("{index}:{name}:{}", property.css_name())),
+                    &keyframes,
+                    timing.clone(),
+                    window,
+                    cx,
+                );
+                let applies = match sample.status {
+                    MotionStatus::Running => true,
+                    MotionStatus::Delayed | MotionStatus::Idle => {
+                        matches!(animation.fill_mode, FillMode::Backwards | FillMode::Both)
+                    }
+                    MotionStatus::Finished => {
+                        matches!(animation.fill_mode, FillMode::Forwards | FillMode::Both)
+                    }
+                };
+                if applies {
+                    property.set(&mut output.style, sample.value.0);
+                }
+                output.moving |=
+                    matches!(sample.status, MotionStatus::Running | MotionStatus::Delayed);
             }
         }
-        frame
+        output
     }
-}
 
-/// Keep each running animation's start time while its name is unchanged.
-fn sync_animations(running: &mut Vec<RunningAnimation>, wanted: &[Animation], now: Instant) {
-    let same = running.len() == wanted.len()
-        && running
+    /// A `@keyframes` rule's frames as typed styles, with each frame's
+    /// easing (its `animation-timing-function`, else the animation's).
+    pub(crate) fn frames(
+        source: &RenderKeyframes,
+        easing: Easing,
+        compute: &dyn Fn(&[StyleDeclaration]) -> ComputedStyle,
+    ) -> Vec<(f32, ComputedStyle, Easing)> {
+        source
+            .frames
             .iter()
-            .zip(wanted)
-            .all(|(running, wanted)| wanted.name.as_deref() == Some(running.name.as_str()));
-    if same {
-        return;
-    }
-    let previous = std::mem::take(running);
-    running.extend(wanted.iter().map(|animation| {
-        let name = animation.name.clone().unwrap_or_default();
-        let started = previous
-            .iter()
-            .find(|running| running.name == name)
-            .map_or(now, |running| running.started);
-        RunningAnimation { name, started }
-    }));
-}
-
-/// Overlay keyframe values at `progress` onto the frame's underlying values.
-pub(crate) fn apply_keyframes(
-    frame: &mut Frame,
-    keyframes: &RenderKeyframes,
-    easing: Easing,
-    progress: f32,
-) {
-    for property in Animated::ALL {
-        let Some(interval) = keyframes.interval(property.css_name(), progress) else {
-            continue;
-        };
-        let index = property.index();
-        let underlying = frame.values[index].or_else(|| property.initial());
-        let parse = |declaration: Option<&StyleDeclaration>| match declaration {
-            Some(declaration) => property.parse(declaration),
-            None => underlying,
-        };
-        let (Some(from), Some(to)) = (parse(interval.from), parse(interval.to)) else {
-            continue;
-        };
-        let easing = interval
-            .start
-            .and_then(|frame| {
-                frame
+            .map(|frame| {
+                let easing = frame
                     .declarations
                     .iter()
                     .rev()
                     .find(|d| d.property.as_str() == "animation-timing-function")
+                    .and_then(|d| Easing::parse(d.value.as_str()))
+                    .unwrap_or(easing);
+                (frame.offset, compute(&frame.declarations), easing)
             })
-            .and_then(|declaration| Easing::parse(declaration.value.as_str()))
-            .unwrap_or(easing);
-        let t = easing.sample(interval.progress);
-        frame.values[index] = Some(from.lerp(to, t).unwrap_or(if t < 0.5 { from } else { to }));
+            .collect()
     }
-}
 
-pub(crate) fn elapsed_ms(started: Instant, now: Instant) -> f32 {
-    now.saturating_duration_since(started).as_secs_f32() * 1000.0
+    /// An animation's timing. Easing is per keyframe, as in CSS, so the
+    /// timing itself is linear.
+    pub(crate) fn timing(animation: &Animation) -> Timing {
+        Timing::new(duration(animation.duration_ms))
+            .delay(delay(animation.delay_ms))
+            .iterations(match animation.iterations {
+                Iterations::Infinite => IterationCount::Infinite,
+                // GPUI Kit plays whole iterations; a fractional count
+                // finishes its last iteration.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                Iterations::Count(count) => IterationCount::Finite(count.max(0.0).ceil() as u64),
+            })
+            .direction(match animation.direction {
+                AnimationDirection::Normal => PlaybackDirection::Normal,
+                AnimationDirection::Reverse => PlaybackDirection::Reverse,
+                AnimationDirection::Alternate => PlaybackDirection::Alternate,
+                AnimationDirection::AlternateReverse => PlaybackDirection::AlternateReverse,
+            })
+    }
+
+    /// One property's keyframes, with missing `0%` and `100%` keyframes
+    /// taking the underlying value (CSS Animations 1 §3), each value
+    /// converted by `value`.
+    pub(crate) fn keyframes<T: Interpolate>(
+        frames: &[(f32, ComputedStyle, Easing)],
+        property: AnimatableProperty,
+        underlying: Option<AnimatedValue>,
+        value: impl Fn(AnimatedValue) -> Option<T>,
+    ) -> Option<Keyframes<T>> {
+        let mut list = frames
+            .iter()
+            .filter_map(|(offset, style, ease)| {
+                Some(Keyframe::new(*offset, value(property.get(style)?)?).ease(easing(*ease)))
+            })
+            .collect::<Vec<_>>();
+        if list.first().is_none_or(|frame| frame.offset > 0.0) {
+            let ease = frames.first().map_or(Easing::Linear, |frame| frame.2);
+            list.insert(
+                0,
+                Keyframe::new(0.0, value(underlying?)?).ease(easing(ease)),
+            );
+        }
+        if list.last().is_none_or(|frame| frame.offset < 1.0) {
+            list.push(Keyframe::new(1.0, value(underlying?)?));
+        }
+        Keyframes::try_new(list).ok()
+    }
 }
 
 /// Paints its child moved by a `translate`, resolved against the child's own
@@ -516,12 +307,12 @@ pub(crate) fn elapsed_ms(started: Instant, now: Instant) -> f32 {
 /// follow the painted position.
 pub(crate) struct Translated {
     child: AnyElement,
-    x: Offset,
-    y: Offset,
+    x: LengthPercentage,
+    y: LengthPercentage,
 }
 
 impl Translated {
-    pub(crate) fn new(child: AnyElement, x: Offset, y: Offset) -> Self {
+    pub(crate) fn new(child: AnyElement, x: LengthPercentage, y: LengthPercentage) -> Self {
         Self { child, x, y }
     }
 }
@@ -566,8 +357,8 @@ impl Element for Translated {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let offset = point(
-            self.x.resolve(bounds.size.width),
-            self.y.resolve(bounds.size.height),
+            gpui::px(self.x.resolve(f32::from(bounds.size.width))),
+            gpui::px(self.y.resolve(f32::from(bounds.size.height))),
         );
         window.with_element_offset(offset, |window| self.child.prepaint(window, cx));
     }
@@ -586,116 +377,7 @@ impl Element for Translated {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::time::{Duration, Instant};
-
-    use htmlswap::StyleDeclaration;
-    use htmlswap::motion::{Easing, Transition, TransitionProperty};
-
-    use super::{Animated, Inputs, MotionState, MotionValue, Offset, computed, translate};
-    use crate::ElementId;
-
-    fn declarations(pairs: &[(&str, &str)]) -> Vec<StyleDeclaration> {
-        pairs
-            .iter()
-            .map(|(property, value)| StyleDeclaration::new(*property, *value, false, None))
-            .collect()
-    }
-
-    fn linear(property: &str, duration_ms: f32) -> Transition {
-        Transition {
-            property: TransitionProperty::Property(property.into()),
-            duration_ms,
-            delay_ms: 0.0,
-            easing: Easing::Linear,
-        }
-    }
-
-    #[test]
-    fn computed_values_cover_shorthands_and_importance() {
-        let values = computed(&declarations(&[
-            ("background", "#ff0000"),
-            ("opacity", "0.5"),
-            ("transform", "translateX(-100%)"),
-            ("width", "120px"),
-        ]));
-        assert_eq!(
-            values[Animated::BackgroundColor as usize].and_then(MotionValue::rgba),
-            Some(0xff00_00ff)
-        );
-        assert_eq!(
-            values[Animated::Opacity as usize],
-            Some(MotionValue::Number(0.5))
-        );
-        assert_eq!(
-            values[Animated::Width as usize],
-            Some(MotionValue::Pixels(120.0))
-        );
-        assert_eq!(
-            values[Animated::Translate as usize],
-            Some(MotionValue::Translate(
-                Offset {
-                    px: 0.0,
-                    fraction: -1.0
-                },
-                Offset::ZERO
-            ))
-        );
-        assert_eq!(translate("10px"), translate("10px 0"));
-    }
-
-    #[test]
-    fn transitions_retarget_from_the_value_on_screen() {
-        let mut state = MotionState::default();
-        let id = ElementId::new("box");
-        let transitions = [linear("width", 1000.0)];
-        let keyframes = htmlswap::RenderMotionPlan::default();
-        let inputs = |width: f32| Inputs {
-            targets: {
-                let mut targets = [None; 7];
-                targets[Animated::Width as usize] = Some(MotionValue::Pixels(width));
-                targets
-            },
-            starting: [None; 7],
-            transitions: &transitions,
-            animations: &[],
-            keyframes: &keyframes,
-        };
-        let start = Instant::now();
-        let width = |frame: super::Frame| frame.get(Animated::Width);
-
-        state.begin();
-        assert_eq!(
-            width(state.frame(&id, &inputs(100.0), start)),
-            Some(MotionValue::Pixels(100.0))
-        );
-        state.begin();
-        let half = state.frame(&id, &inputs(200.0), start);
-        assert!(!half.moving || width(half) == Some(MotionValue::Pixels(100.0)));
-        state.begin();
-        let mid = state.frame(&id, &inputs(200.0), start + Duration::from_millis(500));
-        assert_eq!(width(mid), Some(MotionValue::Pixels(150.0)));
-        assert!(mid.moving);
-        // Reversing half-way starts from 150px, not from 200px.
-        state.begin();
-        let reversed = state.frame(&id, &inputs(100.0), start + Duration::from_millis(500));
-        assert_eq!(width(reversed), Some(MotionValue::Pixels(150.0)));
-        state.begin();
-        let done = state.frame(&id, &inputs(100.0), start + Duration::from_millis(1600));
-        assert_eq!(width(done), Some(MotionValue::Pixels(100.0)));
-        assert!(!done.moving);
-        state.end();
-        state.begin();
-        state.end();
-        assert!(state.elements.is_empty(), "undrawn elements are forgotten");
-    }
-
-    #[test]
-    fn colors_fade_through_transparent_without_darkening() {
-        let from = MotionValue::color(0xff00_00ff);
-        let to = MotionValue::color(0xff00_0000);
-        let mid = from.lerp(to, 0.5).and_then(MotionValue::rgba);
-        assert_eq!(mid.map(|rgba| rgba >> 8), Some(0x00ff_0000));
-    }
+/// A translation that moves nothing.
+pub(crate) fn is_zero(translate: (LengthPercentage, LengthPercentage)) -> bool {
+    translate.0 == LengthPercentage::ZERO && translate.1 == LengthPercentage::ZERO
 }

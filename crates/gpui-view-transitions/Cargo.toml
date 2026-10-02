@@ -1,0 +1,19 @@
+[package]
+name = "gpui-view-transitions"
+description = "CSS view transitions for GPUI Kit, on gpui_base::motion"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+gpui_pre.workspace = true
+gpui-base.workspace = true
+
+[dev-dependencies]
+gpui_pre = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

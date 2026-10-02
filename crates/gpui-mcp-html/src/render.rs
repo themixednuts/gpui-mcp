@@ -1,35 +1,37 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
-use std::time::Instant;
 
 use gpui::{
-    AlignItems, AlignSelf, AnyElement, App, AppContext as _, BoxShadow, Context, DefiniteLength,
-    Div, Entity, FocusHandle, FontFallbacks, FontWeight, FrameAction, InteractiveElement as _,
-    IntoElement, Length, Overflow, ParentElement as _, Render, Role as AccessibleRole,
+    AnyElement, App, AppContext as _, Context, Div, Entity, FocusHandle, FrameAction,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, Role as AccessibleRole,
     ScrollHandle, SharedString, Stateful, StatefulInteractiveElement as _, Styled, Toggled, Window,
-    div, point, px, relative, rgba,
+    div, px, rgba,
 };
 use gpui_mcp::{Automation, MAX_LABEL_BYTES, MAX_TEXT_BYTES};
 use htmlswap::{
-    CompactString, RenderElement, RenderNode, RenderPlan, RenderStyleCondition, RenderStyleVariant,
-    StyleDeclaration, StyleProperty, UiRole,
+    RenderElement, RenderNode, RenderPlan, RenderStyleCondition, RenderStyleVariant,
+    StyleDeclaration, UiRole,
 };
 
+use crate::cascade::{self, Environment, Interaction, StateNeeds};
 use crate::components::{ComponentNode, ComponentRegistry};
 use crate::document::{attribute, is_text_editable};
-use crate::grid::GridProperty;
+use crate::gpui_style;
 use crate::input::{RuntimeTextInput, RuntimeTextInputOptions};
-use crate::motion::{Animated, Inputs, MotionState, MotionValue, Offset, Translated};
+use crate::motion::{self, Translated};
 use crate::view_transition::{
-    Measured, Morph, MorphMotion, NamedSlots, OldImage, OldRoot, OldState, PropertySnapshot, Shift,
-    Side, Stage, ViewTransition, declares_name, element_at, transition_classes, transition_name,
+    DocumentTransitions, OldState, PropertySnapshot, declares_name, element_at, transition_classes,
+    transition_name,
 };
 use crate::{
     Binding, BindingMode, ElementId, HandlerId, HookEvent, HookOutcome, HookRegistry,
     HookRegistryError, HtmlUi, StateValue, UiEvent, UiProperty,
 };
-use htmlswap::motion::{Animation, Transition};
+use htmlswap::computed::{
+    ColorScheme, ComputedScope, ComputedStyle, LengthPercentage, MediaEnvironment, Underlying,
+    Unsupported,
+};
 
 /// Minimal hover tooltip view that renders an element's `title` attribute text.
 struct TitleTooltip {
@@ -183,31 +185,66 @@ pub struct LiveHtml {
     /// Media-query dimensions for the render in progress, when overridden.
     viewport_override: Cell<Option<(f32, f32)>>,
     available_fonts: RefCell<Option<Rc<HashSet<String>>>>,
-    motion: Rc<RefCell<MotionState>>,
-    motion_rules: Rc<RefCell<MotionCache>>,
+    /// Computed styles, reused while an element's context is unchanged.
+    styles: Rc<RefCell<StyleCache>>,
+    /// Elements whose descendants' styles depend on their interaction state.
+    state_anchors: Rc<HashMap<ElementId, StateNeeds>>,
+    /// Scopes of the elements being rendered, innermost last.
+    scopes: RefCell<Vec<ComputedScope>>,
+    /// Interaction states of the elements being rendered, innermost last.
+    interactions: RefCell<Vec<Interaction>>,
+    /// Elements drawn by the previous and current passes, for entry
+    /// transitions from `@starting-style`.
+    drawn: Rc<RefCell<DrawnElements>>,
+    /// The preferred color scheme, or `None` to follow the window.
+    color_scheme: Option<ColorScheme>,
     /// Elements under the pointer, for elements whose interaction styles transition.
     pointer_hovered: Rc<RefCell<HashSet<ElementId>>>,
     /// The element the primary button is pressed on.
     pressed: Rc<RefCell<Option<ElementId>>>,
     /// Per-render clock and motion settings.
     frame: Cell<FrameContext>,
-    /// Types of the most recent view transition; `view_transition_active`
-    /// says whether it is still running.
-    view_transition_types: Vec<CompactString>,
-    view_transition_active: Cell<bool>,
-    view_transition: Rc<RefCell<Option<ViewTransition>>>,
+    transitions: DocumentTransitions,
     /// Elements that may carry a `view-transition-name`.
     named_elements: Rc<HashSet<ElementId>>,
-    named: Rc<RefCell<NamedSlots>>,
-    /// The document root's box from the latest prepaint.
-    root_measured: Measured,
-    shift: Shift,
+}
+
+/// What drawing the outgoing document of a view transition needs.
+#[derive(Clone, Copy)]
+struct Inert<'a> {
+    old: &'a OldState,
+    /// The named element being drawn as its own image, which fills its box.
+    keep: Option<&'a [usize]>,
+    /// Named elements, which the root image leaves out.
+    is_named: &'a dyn Fn(&[usize]) -> bool,
+    environment: Environment<'a>,
+    fonts: &'a HashSet<String>,
+}
+
+/// Elements drawn by the previous and the current render pass.
+#[derive(Default)]
+struct DrawnElements {
+    previous: HashSet<ElementId>,
+    current: HashSet<ElementId>,
+}
+
+impl DrawnElements {
+    fn begin(&mut self) {
+        self.previous = std::mem::take(&mut self.current);
+    }
+
+    /// Record an element, returning whether it is new this pass.
+    fn draw(&mut self, element_id: &ElementId) -> bool {
+        if !self.current.contains(element_id) {
+            self.current.insert(element_id.clone());
+        }
+        !self.previous.contains(element_id)
+    }
 }
 
 /// Values fixed for one render pass.
 #[derive(Clone, Copy, Debug)]
 struct FrameContext {
-    now: Option<Instant>,
     reduce_motion: bool,
     /// Whether anything drawn this pass is still moving.
     moving: bool,
@@ -237,8 +274,12 @@ impl LiveHtml {
         let bindings = index_bindings(ui.bindings().bindings.iter());
         let diagnostics = collect_render_diagnostics(ui.plan());
         let named_elements = Rc::new(collect_named_elements(ui.plan()));
+        let state_anchors = Rc::new(collect_state_anchors(ui.plan()));
+        let ui = Rc::new(ui);
+        let transitions = DocumentTransitions::default();
+        transitions.set_document(ui.clone());
         Ok(Self {
-            ui: Rc::new(ui),
+            ui,
             revision: 1,
             automation,
             hooks,
@@ -253,22 +294,20 @@ impl LiveHtml {
             embedded_namespace: None,
             viewport_override: Cell::new(None),
             available_fonts: RefCell::new(None),
-            motion: Rc::default(),
-            motion_rules: Rc::default(),
+            styles: Rc::default(),
+            state_anchors,
+            scopes: RefCell::default(),
+            interactions: RefCell::default(),
+            drawn: Rc::default(),
+            color_scheme: None,
             pointer_hovered: Rc::default(),
             pressed: Rc::default(),
             frame: Cell::new(FrameContext {
-                now: None,
                 reduce_motion: false,
                 moving: false,
             }),
-            view_transition_types: Vec::new(),
-            view_transition_active: Cell::new(false),
-            view_transition: Rc::default(),
+            transitions,
             named_elements,
-            named: Rc::default(),
-            root_measured: Rc::default(),
-            shift: Rc::default(),
         })
     }
 
@@ -332,26 +371,19 @@ impl LiveHtml {
         let diagnostics = collect_render_diagnostics(ui.plan());
         let element_ids = collect_element_ids(ui.plan());
         let named_elements = Rc::new(collect_named_elements(ui.plan()));
+        let state_anchors = Rc::new(collect_state_anchors(ui.plan()));
         // A swap between two documents that both opt in with
         // `@view-transition { navigation: auto; }` is a navigation.
         let navigation = &ui.plan().motion.view_transition;
-        let pending = self
-            .view_transition
-            .borrow()
-            .as_ref()
-            .is_some_and(ViewTransition::pending);
-        if !pending && navigation.navigation && self.ui.plan().motion.view_transition.navigation {
-            let types = navigation.types.clone();
+        let types = navigation
+            .types
+            .iter()
+            .map(|kind| SharedString::from(kind.to_string()))
+            .collect::<Vec<_>>();
+        if self.transitions.is_pending() {
+            self.transitions.add_types(types);
+        } else if navigation.navigation && self.ui.plan().motion.view_transition.navigation {
             self.begin_view_transition(types, None);
-        } else if pending {
-            for kind in &navigation.types {
-                if !self.view_transition_types.contains(kind) {
-                    self.view_transition_types.push(kind.clone());
-                }
-            }
-            if let Some(transition) = self.view_transition.borrow_mut().as_mut() {
-                transition.types.clone_from(&self.view_transition_types);
-            }
         }
 
         let previous_focus_handles = self.focus_handles.borrow().len();
@@ -381,15 +413,17 @@ impl LiveHtml {
             self.hovered_element.borrow_mut().take();
         }
 
-        self.motion_rules.borrow_mut().clear();
+        self.styles.borrow_mut().elements.clear();
         self.pointer_hovered
             .borrow_mut()
             .retain(|element_id| element_ids.contains(element_id));
         let previous_revision = self.revision;
         self.ui = Rc::new(ui);
+        self.transitions.set_document(self.ui.clone());
         self.bindings = bindings;
         self.diagnostics = diagnostics;
         self.named_elements = named_elements;
+        self.state_anchors = state_anchors;
         self.revision = revision;
 
         Ok(ReloadReport {
@@ -435,7 +469,7 @@ impl LiveHtml {
             .collect();
         let types = types
             .into_iter()
-            .map(|kind| CompactString::from(kind.as_ref()))
+            .map(|kind| SharedString::from(kind.as_ref().to_owned()))
             .collect();
         let started = self.begin_view_transition(types, Some(properties));
         if started {
@@ -447,38 +481,46 @@ impl LiveHtml {
     /// Whether a view transition is pending or running.
     #[must_use]
     pub fn view_transition_running(&self) -> bool {
-        self.view_transition.borrow().is_some()
+        self.transitions.is_active()
     }
 
     /// Finish the current view transition at once, like
     /// `ViewTransition.skipTransition()`.
     pub fn skip_view_transition(&mut self) {
-        self.view_transition.borrow_mut().take();
-        self.view_transition_active.set(false);
-        self.motion_rules.borrow_mut().clear();
+        self.transitions.skip();
     }
 
     fn begin_view_transition(
         &mut self,
-        types: Vec<CompactString>,
+        types: Vec<SharedString>,
         properties: Option<PropertySnapshot>,
     ) -> bool {
-        let Some(root) = self.root_measured.get() else {
-            return false;
-        };
-        let old = OldState::capture(
-            self.ui.clone(),
-            self.bindings.clone(),
+        let old = OldState {
+            ui: self.ui.clone(),
+            bindings: self.bindings.clone(),
             properties,
-            self.disclosures.borrow().clone(),
-            root,
-            &self.named.borrow(),
-        );
-        self.view_transition_types.clone_from(&types);
-        self.view_transition_active.set(true);
-        self.motion_rules.borrow_mut().clear();
-        *self.view_transition.borrow_mut() = Some(ViewTransition::new(types, old));
-        true
+            disclosures: self.disclosures.borrow().clone(),
+        };
+        self.transitions.start(types, old)
+    }
+
+    /// Prefer a color scheme for `prefers-color-scheme`, `light-dark()` and
+    /// system colors, or follow the window's appearance with `None`.
+    ///
+    /// Hosts following the window should redraw when it changes, for
+    /// example with `cx.observe_window_appearance(window, |_, _, cx| cx.notify())`.
+    pub fn set_color_scheme(&mut self, scheme: Option<ColorScheme>) {
+        if self.color_scheme != scheme {
+            self.color_scheme = scheme;
+            self.styles.borrow_mut().elements.clear();
+        }
+    }
+
+    /// Builder form of [`LiveHtml::set_color_scheme`].
+    #[must_use]
+    pub fn with_color_scheme(mut self, scheme: Option<ColorScheme>) -> Self {
+        self.set_color_scheme(scheme);
+        self
     }
 
     /// Build a live GPUI element tree. Call this from the owning view's `Render` implementation.
@@ -512,21 +554,24 @@ impl LiveHtml {
     ) -> AnyElement {
         self.automation.attach(window);
         self.viewport_override.set(viewport);
+        let now = cx.background_executor().now();
         self.frame.set(FrameContext {
-            now: Some(cx.background_executor().now()),
             reduce_motion: cx.reduce_motion(),
             moving: false,
         });
-        self.motion.borrow_mut().begin();
-        self.named.borrow_mut().begin();
-        if let Some(transition) = self.view_transition.borrow_mut().as_mut() {
-            transition.begin_frame(self.frame.get().now.unwrap_or_else(Instant::now));
-        }
-        let viewport = self.media_viewport(window);
+        self.drawn.borrow_mut().begin();
+        // A running transition's types match `:active-view-transition-type()`.
+        let types = self.transitions.types();
+        let environment = self.environment(window, types.as_deref());
+        self.transitions.begin_frame(now, environment.media);
         let available_fonts = self.available_fonts(cx);
-        let children = self
-            .ui
-            .plan()
+        let plan = self.ui.plan();
+        let root_declarations = cascade::root_declarations(&plan.root, &environment);
+        let initial = ComputedScope::root(&environment.media);
+        let root_scope = initial.document_root(root_declarations.iter().copied());
+        let root_style = cascade::typed(&root_scope, &initial, &root_declarations);
+        self.scopes.borrow_mut().push(root_scope.clone());
+        let children = plan
             .nodes
             .iter()
             .enumerate()
@@ -534,148 +579,61 @@ impl LiveHtml {
                 self.render_node(node, &[index], None, &available_fonts, window, cx)
             })
             .collect::<Vec<_>>();
-        let root = apply_declarations(
+        self.scopes.borrow_mut().pop();
+        let mut root = gpui_style::apply(
             children.into_iter().fold(div(), gpui::ParentElement::child),
-            self.ui.plan().root.styles.iter(),
+            &root_style,
             &available_fonts,
         );
-        let root = apply_media_variants(
-            root,
-            &self.ui.plan().root.style_variants,
-            viewport,
-            &available_fonts,
-        );
-        let mut root = root
+        // A document that declares its color scheme draws its text in that
+        // scheme's CanvasText unless it sets a color; otherwise text keeps
+        // inheriting from the host.
+        if root_style.color.is_none() && root_scope.declares_color_scheme() {
+            root = root.text_color(gpui_style::color(root_scope.color()));
+        }
+        let root = root
             .id(SharedString::from(self.scoped_id("html-root")))
             .role(AccessibleRole::Application);
-        let transition = self.root_transition(viewport, &available_fonts, window, cx);
-        if let Some((_, opacity, _)) = &transition
-            && *opacity < 1.0
-        {
-            let base = root.style().opacity.unwrap_or(1.0);
-            root.style().opacity = Some(base * opacity);
-        }
-        let stage = Stage::new(
-            root.into_any_element(),
-            self.root_measured.clone(),
-            self.shift.clone(),
-        );
-        let rendered = match transition {
-            Some((offset, _, old_root)) => stage.transition(offset, old_root),
-            None => stage,
-        }
-        .into_any_element();
+        let rendered = self.transitions.stage(root, |old, path, is_named| {
+            let image = match path {
+                None => self
+                    .render_old_root(old, is_named, environment, &available_fonts, window, cx)
+                    .size_full()
+                    .into_any_element(),
+                Some(path) => {
+                    let element = element_at(old.ui.plan(), path)?;
+                    let inert = Inert {
+                        old,
+                        keep: Some(path),
+                        is_named,
+                        environment,
+                        fonts: &available_fonts,
+                    };
+                    self.render_inert_element(&inert, element, &mut path.to_vec(), window, cx)
+                }
+            };
+            // The outgoing document is an image: hidden from semantics.
+            let id = match path {
+                None => self.scoped_id("html-view-transition-old"),
+                Some(path) => {
+                    self.scoped_id(&format!("html-view-transition-old-{}", generated_id(path)))
+                }
+            };
+            Some(
+                div()
+                    .id(SharedString::from(id))
+                    .aria_hidden(true)
+                    .size_full()
+                    .child(image)
+                    .into_any_element(),
+            )
+        });
         self.viewport_override.set(None);
-        self.motion.borrow_mut().end();
-        self.named.borrow_mut().end();
-        let finished = self
-            .view_transition
-            .borrow()
-            .as_ref()
-            .is_some_and(|transition| !transition.running);
-        if finished {
-            // This frame already shows the end state; the next one drops the
-            // old images and the active types.
-            self.view_transition.borrow_mut().take();
-            self.view_transition_active.set(false);
-            window.request_animation_frame();
-        }
-        if self.frame.get().moving || self.view_transition.borrow().is_some() {
+        self.transitions.end_frame(window);
+        if self.frame.get().moving {
             window.request_animation_frame();
         }
         rendered
-    }
-
-    /// The root's part of a running transition: the new root's offset and
-    /// opacity, and the old root image with the old named images over it.
-    fn root_transition(
-        &self,
-        viewport: MediaViewport<'_>,
-        available_fonts: &HashSet<String>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Option<((Offset, Offset), f32, OldRoot)> {
-        let mut guard = self.view_transition.borrow_mut();
-        let transition = guard.as_mut()?;
-        let motion = &self.ui.plan().motion;
-        let media = |condition: &RenderStyleCondition| condition_matches(condition, viewport);
-        let elapsed = transition.elapsed;
-        let timing = transition.timing("root", &[], motion, &media);
-        let old_part = timing.part(Side::Old, elapsed, motion);
-        let new_part = timing.part(Side::New, elapsed, motion);
-        let default_fade = timing.default_fade(Side::Old) && timing.default_fade(Side::New);
-        let mut running = old_part.running || new_part.running;
-        // The old image is drawn over the new one, so the default cross-fade
-        // only needs to fade the old side out.
-        let new_opacity = if default_fade { 1.0 } else { new_part.opacity };
-
-        let image = self
-            .render_old_root(&transition.old, viewport, available_fonts, window, cx)
-            .size_full()
-            .opacity(old_part.opacity);
-        let old = &transition.old;
-        let mut path = Vec::new();
-
-        let mut names = old
-            .named
-            .iter()
-            .map(|(name, captured)| (name.clone(), captured.clone()))
-            .collect::<Vec<_>>();
-        names.sort_by(|a, b| a.1.path.cmp(&b.1.path));
-        let mut images = Vec::with_capacity(names.len());
-        for (name, captured) in &names {
-            let incoming = self.named.borrow().incoming(name);
-            let timing = transition.timing(name, &captured.classes, motion, &media);
-            let group = timing.group(elapsed);
-            let part = timing.part(Side::Old, elapsed, motion);
-            running |= group.running || part.running;
-            let old = &transition.old;
-            let Some(element) = element_at(old.ui.plan(), &captured.path) else {
-                continue;
-            };
-            path.clear();
-            path.extend_from_slice(&captured.path);
-            let child = self.render_inert_element(
-                old,
-                element,
-                &mut path,
-                Some(&captured.path),
-                viewport,
-                available_fonts,
-                window,
-                cx,
-            );
-            let child = div()
-                .size_full()
-                .opacity(part.opacity)
-                .child(child)
-                .into_any_element();
-            images.push(OldImage::lifted(
-                child,
-                captured.bounds,
-                incoming,
-                group.progress,
-                part.translate,
-            ));
-        }
-        transition.running |= running;
-        let old = &transition.old;
-        let image = div()
-            .id(SharedString::from(self.scoped_id("html-view-transition")))
-            .aria_hidden(true)
-            .size_full()
-            .child(image)
-            .children(images)
-            .into_any_element();
-        Some((
-            new_part.translate,
-            new_opacity,
-            OldRoot {
-                image,
-                bounds: old.root,
-                translate: old_part.translate,
-            },
-        ))
     }
 
     fn available_fonts(&self, cx: &App) -> Rc<HashSet<String>> {
@@ -687,18 +645,32 @@ impl LiveHtml {
         fonts
     }
 
-    fn media_viewport(&self, window: &Window) -> MediaViewport<'_> {
-        let base = self.viewport_override.get().map_or_else(
-            || MediaViewport::from_window(window),
-            |(width, height)| MediaViewport::new(width, height),
-        );
-        MediaViewport {
-            reduce_motion: self.frame.get().reduce_motion,
-            view_transition_types: self
-                .view_transition_active
-                .get()
-                .then_some(self.view_transition_types.as_slice()),
-            ..base
+    fn environment<'a>(
+        &self,
+        window: &Window,
+        view_transition_types: Option<&'a [SharedString]>,
+    ) -> Environment<'a> {
+        let (width, height) = self.viewport_override.get().unwrap_or_else(|| {
+            let size = window.viewport_size();
+            (size.width.into(), size.height.into())
+        });
+        let color_scheme = self.color_scheme.unwrap_or(match window.appearance() {
+            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark => ColorScheme::Dark,
+            gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight => {
+                ColorScheme::Light
+            }
+        });
+        Environment {
+            media: MediaEnvironment {
+                width,
+                height,
+                font_size: 16.0,
+                color_scheme,
+                reduced_motion: self.frame.get().reduce_motion,
+                hover: true,
+                fine_pointer: true,
+            },
+            view_transition_types,
         }
     }
 
@@ -730,7 +702,20 @@ impl LiveHtml {
         cx: &mut App,
     ) -> AnyElement {
         match node {
-            RenderNode::Text(text) => text.value.clone().into_any_element(),
+            RenderNode::Text(text) => {
+                let transform = self
+                    .scopes
+                    .borrow()
+                    .last()
+                    .map(ComputedScope::text_transform)
+                    .unwrap_or_default();
+                match transform.apply(&text.value) {
+                    std::borrow::Cow::Borrowed(_) => text.value.clone().into_any_element(),
+                    std::borrow::Cow::Owned(transformed) => {
+                        SharedString::from(transformed).into_any_element()
+                    }
+                }
+            }
             RenderNode::Raw(raw) => raw.html.clone().into_any_element(),
             RenderNode::Element(element) => {
                 self.render_element(element, path, disclosure_owner, available_fonts, window, cx)
@@ -763,6 +748,22 @@ impl LiveHtml {
             properties: &property_values,
             enabled: state.enabled,
         };
+        let types = self.transitions.types();
+        let environment = self.environment(window, types.as_deref());
+        let interaction = self.interaction(&element_id, window, cx);
+        let needs = {
+            let mut needs = cascade::own_state_needs(element);
+            if let Some(anchor) = self.state_anchors.get(&element_id) {
+                needs.hover |= anchor.hover;
+                needs.focus |= anchor.focus;
+                needs.active |= anchor.active;
+            }
+            needs
+        };
+        let parent = self.scopes.borrow().last().cloned().unwrap_or_default();
+        let computed = self.computed(&element_id, element, &environment, interaction, &parent);
+        self.scopes.borrow_mut().push(computed.scope.clone());
+        self.interactions.borrow_mut().push(interaction);
         let (children, text_input) = self.render_element_children(
             element,
             path,
@@ -772,24 +773,87 @@ impl LiveHtml {
             window,
             cx,
         );
-        let mut host = self.render_styled_host(element, &id, children, available_fonts, window, cx);
+        self.interactions.borrow_mut().pop();
+        self.scopes.borrow_mut().pop();
+
+        // Bound sizes override the stylesheet, and are what size transitions
+        // move toward.
+        let bound = |property: UiProperty| {
+            property_values
+                .get(&property)
+                .and_then(StateValue::as_pixels)
+                .map(|pixels| htmlswap::computed::Size::Length(LengthPercentage::px(pixels)))
+        };
+        let (bound_width, bound_height) = (bound(UiProperty::Width), bound(UiProperty::Height));
+        let entering = self.drawn.borrow_mut().draw(&element_id);
+        let animated = motion::has_motion(&computed);
+        let overridden = bound_width.is_some() || bound_height.is_some();
+        let owned;
+        let style = if animated || overridden {
+            let mut target = computed.style.clone();
+            if bound_width.is_some() {
+                target.width = bound_width;
+            }
+            if bound_height.is_some() {
+                target.height = bound_height;
+            }
+            if animated {
+                let keyframe_scope = &computed.scope;
+                let compute_keyframe = |declarations: &[StyleDeclaration]| {
+                    let declarations = declarations.iter().collect::<Vec<_>>();
+                    cascade::typed(keyframe_scope, &parent, &declarations)
+                };
+                let output = motion::animate(
+                    &motion::Inputs {
+                        key: &runtime_id,
+                        computed: &computed,
+                        target: &target,
+                        entering,
+                        plan: &self.ui.plan().motion,
+                        underlying: Underlying {
+                            current_color: parent.color(),
+                            font_size: parent.font_size(),
+                        },
+                        compute_keyframe: &compute_keyframe,
+                    },
+                    window,
+                    cx,
+                );
+                if output.moving {
+                    let mut context = self.frame.get();
+                    context.moving = true;
+                    self.frame.set(context);
+                }
+                target.overlay(&output.style);
+            }
+            owned = target;
+            &owned
+        } else {
+            &computed.style
+        };
+
+        let host = self.render_host(element, &id, children, window, cx);
+        let mut host =
+            gpui_style::apply(apply_native_defaults(host, element), style, available_fonts);
+        if computed.scope.font_features() != parent.font_features() {
+            let features = computed
+                .scope
+                .font_features()
+                .features()
+                .into_iter()
+                .map(|(tag, value)| (tag.to_string(), value))
+                .collect::<Vec<_>>();
+            host.text_style().font_features =
+                Some(gpui::FontFeatures(std::sync::Arc::new(features)));
+        }
         host = apply_native_state(host, element, &state);
         if !state.visible {
             host = host.hidden();
         }
-        if let Some(width) = property_values
-            .get(&UiProperty::Width)
-            .and_then(StateValue::as_pixels)
-        {
-            host = host.w(px(width));
-        }
-        if let Some(height) = property_values
-            .get(&UiProperty::Height)
-            .and_then(StateValue::as_pixels)
-        {
-            host = host.h(px(height));
-        }
-        let scroll_axes = element_scroll_axes(element, self.media_viewport(window));
+        let translate = style
+            .translate
+            .filter(|translate| !motion::is_zero(*translate));
+        let scroll_axes = ScrollAxes::of(style);
         let scroll_handle = scroll_axes.any().then(|| {
             self.scroll_handles
                 .borrow_mut()
@@ -820,101 +884,36 @@ impl LiveHtml {
             });
         }
 
-        let hoverable = has_interactive_style(element, InteractiveStyle::Hover);
-        let focus_handle = self.resolve_focus_handle(element, runtime, text_input.as_ref(), cx);
+        let focus_handle = self.resolve_focus_handle(runtime, needs.focus, text_input.as_ref(), cx);
         if let Some(focus_handle) = &focus_handle {
             host = host.track_focus(focus_handle);
         }
-        let forced_hover = self.hovered_element.borrow().as_ref() == Some(&element_id);
-        let viewport = self.media_viewport(window);
-        let interaction = Interaction {
-            hovered: forced_hover || self.pointer_hovered.borrow().contains(&element_id),
-            focused: focus_handle
-                .as_ref()
-                .is_some_and(|handle| handle.is_focused(window)),
-            active: self.pressed.borrow().as_ref() == Some(&element_id),
-        };
-        let motion = self.motion_rules(&element_id, element, viewport, interaction);
-        let mut translate = None;
-        if let Some(rules) = &motion {
-            // Interaction styles are resolved here rather than by GPUI's paint-time
-            // refinements, so that their changes can be interpolated.
-            for (style, on) in [
-                (InteractiveStyle::Hover, interaction.hovered),
-                (InteractiveStyle::Focus, interaction.focused),
-                (InteractiveStyle::Active, interaction.active),
-            ] {
-                if on {
-                    let variants = interactive_variants(element, style, viewport);
-                    host = apply_variant_declarations(host, &variants, available_fonts);
-                }
-            }
-            let mut targets = rules.targets;
-            for (property, binding) in [
-                (Animated::Width, UiProperty::Width),
-                (Animated::Height, UiProperty::Height),
-            ] {
-                if let Some(pixels) = property_values
-                    .get(&binding)
-                    .and_then(StateValue::as_pixels)
-                {
-                    targets[property as usize] = Some(MotionValue::Pixels(pixels));
-                }
-            }
-            let frame = self.motion.borrow_mut().frame(
-                &element_id,
-                &Inputs {
-                    targets,
-                    starting: rules.starting,
-                    transitions: &rules.transitions,
-                    animations: &rules.animations,
-                    keyframes: &self.ui.plan().motion,
-                },
-                self.frame.get().now.unwrap_or_else(Instant::now),
-            );
-            if frame.moving {
-                let mut context = self.frame.get();
-                context.moving = true;
-                self.frame.set(context);
-            }
-            host = apply_motion_frame(host, &frame);
-            translate = frame
-                .get(Animated::Translate)
-                .and_then(MotionValue::translate)
-                .filter(|(x, y)| {
-                    *x != crate::motion::Offset::ZERO || *y != crate::motion::Offset::ZERO
-                });
-            if rules.active {
+        if needs.active {
+            let pressed = self.pressed.clone();
+            let pressed_id = element_id.clone();
+            host = host.on_mouse_down(gpui::MouseButton::Left, move |_, window, _| {
+                *pressed.borrow_mut() = Some(pressed_id.clone());
+                window.refresh();
+            });
+            for release in [false, true] {
                 let pressed = self.pressed.clone();
-                let pressed_id = element_id.clone();
-                host = host.on_mouse_down(gpui::MouseButton::Left, move |_, window, _| {
-                    *pressed.borrow_mut() = Some(pressed_id.clone());
-                    window.refresh();
-                });
-                for release in [false, true] {
-                    let pressed = self.pressed.clone();
-                    let release_listener =
-                        move |_: &gpui::MouseUpEvent, window: &mut Window, _: &mut App| {
-                            if pressed.borrow_mut().take().is_some() {
-                                window.refresh();
-                            }
-                        };
-                    host = if release {
-                        host.on_mouse_up_out(gpui::MouseButton::Left, release_listener)
-                    } else {
-                        host.on_mouse_up(gpui::MouseButton::Left, release_listener)
+                let release_listener =
+                    move |_: &gpui::MouseUpEvent, window: &mut Window, _: &mut App| {
+                        if pressed.borrow_mut().take().is_some() {
+                            window.refresh();
+                        }
                     };
-                }
+                host = if release {
+                    host.on_mouse_up_out(gpui::MouseButton::Left, release_listener)
+                } else {
+                    host.on_mouse_up(gpui::MouseButton::Left, release_listener)
+                };
             }
-        } else {
-            host = apply_interactive_styles(host, element, forced_hover, viewport, available_fonts);
         }
-        if hoverable || motion.as_ref().is_some_and(|rules| rules.hover) {
-            // GPUI's style-only hover hook does not itself retain enough state for a
-            // runtime document to reproduce the hovered cascade on every refreshed frame.
-            // Mirror native hit-test transitions into the same state used by semantic hover,
-            // so physical input, MCP PlatformInput, and semantic automation resolve one CSS
-            // :hover state instead of taking separate rendering paths.
+        if needs.hover {
+            // Interaction styles are resolved while rendering, from one hover
+            // state shared by pointer input, MCP platform input and semantic
+            // automation, so every path resolves the same CSS :hover.
             let hovered_element = self.hovered_element.clone();
             let pointer_hovered = self.pointer_hovered.clone();
             let hovered_id = element_id.clone();
@@ -994,25 +993,14 @@ impl LiveHtml {
             }
         }
 
-        let named = self.named_element(element, &element_id, path, viewport);
-        if let Some((_, Some((_, opacity)))) = &named
-            && *opacity < 1.0
-        {
-            let base = host.style().opacity.unwrap_or(1.0);
-            host.style().opacity = Some(base * opacity);
-        }
-        let rendered = match translate {
-            Some((x, y)) => Translated::new(host.into_any_element(), x, y).into_any_element(),
+        // A named element is captured and moved with its `translate`
+        // applied, as browsers capture an element's transformed box.
+        let rendered = match self.transition_name_of(element, &element_id, &environment) {
+            Some((name, classes)) => self.transitions.named(name, &classes, path.to_vec(), host),
             None => host.into_any_element(),
         };
-        match named {
-            Some((measured, motion)) => Morph::new(
-                rendered,
-                measured,
-                self.shift.clone(),
-                motion.map(|(motion, _)| motion),
-            )
-            .into_any_element(),
+        match translate {
+            Some((x, y)) => Translated::new(rendered, x, y).into_any_element(),
             None => rendered,
         }
     }
@@ -1021,12 +1009,25 @@ impl LiveHtml {
     fn render_old_root(
         &self,
         old: &OldState,
-        viewport: MediaViewport<'_>,
+        is_named: &dyn Fn(&[usize]) -> bool,
+        environment: Environment<'_>,
         available_fonts: &HashSet<String>,
         window: &mut Window,
         cx: &mut App,
     ) -> Div {
         let old_plan = old.ui.plan();
+        let root_declarations = cascade::root_declarations(&old_plan.root, &environment);
+        let initial = ComputedScope::root(&environment.media);
+        let root_scope = initial.document_root(root_declarations.iter().copied());
+        let root_style = cascade::typed(&root_scope, &initial, &root_declarations);
+        self.scopes.borrow_mut().push(root_scope);
+        let inert = Inert {
+            old,
+            keep: None,
+            is_named,
+            environment,
+            fonts: available_fonts,
+        };
         let mut path = Vec::new();
         let children = old_plan
             .nodes
@@ -1035,143 +1036,66 @@ impl LiveHtml {
             .map(|(index, node)| {
                 path.clear();
                 path.push(index);
-                self.render_inert(
-                    old,
-                    node,
-                    &mut path,
-                    None,
-                    viewport,
-                    available_fonts,
-                    window,
-                    cx,
-                )
+                self.render_inert(&inert, node, &mut path, window, cx)
             })
             .collect::<Vec<_>>();
-        apply_media_variants(
-            apply_declarations(
-                children.into_iter().fold(div(), gpui::ParentElement::child),
-                old_plan.root.styles.iter(),
-                available_fonts,
-            ),
-            &old_plan.root.style_variants,
-            viewport,
+        self.scopes.borrow_mut().pop();
+        gpui_style::apply(
+            children.into_iter().fold(div(), gpui::ParentElement::child),
+            &root_style,
             available_fonts,
         )
     }
 
-    /// A named element's slot, and its group motion and opacity while a
-    /// transition runs.
-    fn named_element(
+    /// A named element's `view-transition-name` and classes, if it has one.
+    fn transition_name_of(
         &self,
         element: &RenderElement,
         element_id: &ElementId,
-        path: &[usize],
-        viewport: MediaViewport<'_>,
-    ) -> Option<(Measured, Option<(MorphMotion, f32)>)> {
+        environment: &Environment<'_>,
+    ) -> Option<(SharedString, Vec<SharedString>)> {
         if !self.named_elements.contains(element_id) {
             return None;
         }
-        let declarations = || {
-            element
-                .stylesheet_declarations
-                .iter()
-                .chain(&element.styles)
-                .chain(
-                    element
-                        .style_variants
-                        .iter()
-                        .filter(|variant| media_only_variant_matches(variant, viewport))
-                        .flat_map(|variant| &variant.declarations),
-                )
-        };
-        let name = transition_name(declarations(), element_id.as_str())?;
-        let classes = transition_classes(declarations());
-        let measured = self.named.borrow_mut().visit(&name, path, classes)?;
-        let mut guard = self.view_transition.borrow_mut();
-        let Some(transition) = guard.as_mut() else {
-            return Some((measured, None));
-        };
-        let motion = &self.ui.plan().motion;
-        let media = |condition: &RenderStyleCondition| condition_matches(condition, viewport);
-        let elapsed = transition.elapsed;
-        let from = transition
-            .old
-            .named
-            .get(&name)
-            .map(|captured| captured.bounds.origin);
-        let classes = self
-            .named
-            .borrow()
-            .classes(&name)
-            .map(<[CompactString]>::to_vec)
-            .unwrap_or_default();
-        let timing = transition.timing(&name, &classes, motion, &media);
-        let group = timing.group(elapsed);
-        let part = timing.part(Side::New, elapsed, motion);
-        // When the old image is drawn over this one, the default cross-fade
-        // only needs to fade the old side out.
-        let opacity =
-            if from.is_some() && timing.default_fade(Side::Old) && timing.default_fade(Side::New) {
-                1.0
-            } else {
-                part.opacity
-            };
-        transition.running |= group.running || part.running;
-        Some((
-            measured,
-            Some((
-                MorphMotion {
-                    from,
-                    progress: group.progress,
-                    translate: part.translate,
-                },
-                opacity,
-            )),
-        ))
+        let declarations = cascade::declarations(element, environment, Interaction::default(), &[]);
+        let name = transition_name(declarations.iter().copied(), element_id.as_str())?;
+        Some((name, transition_classes(declarations.iter().copied())))
     }
 
-    /// Render an element of the outgoing document as a static image: its
-    /// styles and bound values, without ids, handlers, focus or semantics.
-    #[allow(clippy::too_many_arguments)]
+    /// Render a node of the outgoing document as a static image: its styles
+    /// and bound values, without ids, handlers, focus or semantics.
     fn render_inert(
         &self,
-        old: &OldState,
+        inert: &Inert<'_>,
         node: &RenderNode,
         path: &mut Vec<usize>,
-        keep: Option<&[usize]>,
-        viewport: MediaViewport<'_>,
-        available_fonts: &HashSet<String>,
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
         match node {
             RenderNode::Text(text) => text.value.clone().into_any_element(),
             RenderNode::Raw(raw) => raw.html.clone().into_any_element(),
-            RenderNode::Element(element) => self.render_inert_element(
-                old,
-                element,
-                path,
-                keep,
-                viewport,
-                available_fonts,
-                window,
-                cx,
-            ),
+            RenderNode::Element(element) => {
+                self.render_inert_element(inert, element, path, window, cx)
+            }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_inert_element(
         &self,
-        old: &OldState,
+        inert: &Inert<'_>,
         element: &RenderElement,
         path: &mut Vec<usize>,
-        keep: Option<&[usize]>,
-        viewport: MediaViewport<'_>,
-        available_fonts: &HashSet<String>,
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
+        let Inert {
+            old,
+            keep,
+            is_named,
+            environment: viewport,
+            fonts: available_fonts,
+        } = *inert;
         let element_id = ElementId::new(
             attribute(element, "id").map_or_else(|| generated_id(path), str::to_owned),
         );
@@ -1188,6 +1112,10 @@ impl LiveHtml {
         let empty = HashMap::new();
         let properties = properties.unwrap_or(&empty);
         let state = element_state(element, properties);
+        let parent = self.scopes.borrow().last().cloned().unwrap_or_default();
+        let declarations = cascade::declarations(element, &viewport, Interaction::default(), &[]);
+        let scope = parent.child(declarations.iter().copied());
+        let style = cascade::typed(&scope, &parent, &declarations);
         let text = properties
             .get(&UiProperty::Text)
             .or_else(|| properties.get(&UiProperty::Value));
@@ -1205,30 +1133,22 @@ impl LiveHtml {
                     .unwrap_or_else(|| attribute(element, "open").is_some())
             });
             let mut children = Vec::with_capacity(element.children.len());
+            self.scopes.borrow_mut().push(scope.clone());
             for (index, child) in element.children.iter().enumerate() {
                 if open == Some(false) && !is_summary_element(child) {
                     continue;
                 }
                 path.push(index);
-                children.push(self.render_inert(
-                    old,
-                    child,
-                    path,
-                    keep,
-                    viewport,
-                    available_fonts,
-                    window,
-                    cx,
-                ));
+                children.push(self.render_inert(inert, child, path, window, cx));
                 path.pop();
             }
+            self.scopes.borrow_mut().pop();
             children
         };
         let host = children.into_iter().fold(div(), gpui::ParentElement::child);
-        let mut host = apply_styles(
+        let mut host = gpui_style::apply(
             apply_native_defaults(host, element),
-            element,
-            viewport,
+            &style,
             available_fonts,
         );
         host = apply_native_state(host, element, &state);
@@ -1250,55 +1170,11 @@ impl LiveHtml {
         if keep == Some(path.as_slice()) {
             // The image of a named element fills its group's box.
             host = host.size_full();
-        } else if old.is_named(path) {
+        } else if is_named(path) {
             // Named elements are drawn as their own images.
             host.style().visibility = Some(gpui::Visibility::Hidden);
         }
         host.into_any_element()
-    }
-
-    /// The element's parsed motion rules in this interaction state, or `None`
-    /// when it declares no transition, animation or starting style.
-    fn motion_rules(
-        &self,
-        element_id: &ElementId,
-        element: &RenderElement,
-        viewport: MediaViewport<'_>,
-        interaction: Interaction,
-    ) -> Option<Rc<MotionRules>> {
-        let mut cache = self.motion_rules.borrow_mut();
-        let context = (
-            viewport.width.to_bits(),
-            viewport.height.to_bits(),
-            viewport.reduce_motion,
-            viewport.view_transition_types.map(<[CompactString]>::len),
-        );
-        if cache.context != Some(context) {
-            cache.clear();
-            cache.context = Some(context);
-        }
-        if let Some(cached) = cache.elements.get(element_id) {
-            if !cached.declares {
-                return None;
-            }
-            if let Some(rules) = &cached.states[interaction.bits()] {
-                return Some(rules.clone());
-            }
-        }
-        let declares = declares_motion(element);
-        let entry = cache
-            .elements
-            .entry(element_id.clone())
-            .or_insert_with(|| CachedMotion {
-                declares,
-                states: Default::default(),
-            });
-        if !declares {
-            return None;
-        }
-        let rules = Rc::new(MotionRules::resolve(element, viewport, interaction));
-        entry.states[interaction.bits()] = Some(rules.clone());
-        Some(rules)
     }
 
     fn disclosure_open(
@@ -1473,12 +1349,12 @@ impl LiveHtml {
 
     fn resolve_focus_handle(
         &self,
-        element: &RenderElement,
         runtime: ElementRuntime<'_>,
+        focus_styles: bool,
         text_input: Option<&Entity<RuntimeTextInput>>,
         cx: &mut App,
     ) -> Option<FocusHandle> {
-        let focusable = has_interactive_style(element, InteractiveStyle::Focus)
+        let focusable = focus_styles
             || runtime.bindings.iter().any(|binding| {
                 matches!(
                     binding,
@@ -1501,22 +1377,68 @@ impl LiveHtml {
             })
     }
 
-    fn render_styled_host(
+    /// The element's interaction state as of this frame, before its
+    /// children render so they can depend on it.
+    fn interaction(&self, element_id: &ElementId, window: &Window, cx: &App) -> Interaction {
+        let forced_hover = self.hovered_element.borrow().as_ref() == Some(element_id);
+        let focused = self
+            .focus_handles
+            .borrow()
+            .get(element_id)
+            .is_some_and(|handle| handle.is_focused(window))
+            || self
+                .text_inputs
+                .borrow()
+                .get(element_id)
+                .is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window));
+        Interaction {
+            hovered: forced_hover || self.pointer_hovered.borrow().contains(element_id),
+            focused,
+            active: self.pressed.borrow().as_ref() == Some(element_id),
+        }
+    }
+
+    /// The element's computed style in its current context, reused while
+    /// nothing it depends on has changed.
+    fn computed(
         &self,
+        element_id: &ElementId,
         element: &RenderElement,
-        id: &str,
-        children: Vec<AnyElement>,
-        available_fonts: &HashSet<String>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Div {
-        let viewport = self.media_viewport(window);
-        apply_styles(
-            apply_native_defaults(self.render_host(element, id, children, window, cx), element),
-            element,
-            viewport,
-            available_fonts,
-        )
+        environment: &Environment<'_>,
+        interaction: Interaction,
+        parent: &ComputedScope,
+    ) -> Rc<cascade::Computed> {
+        let ancestors = self.interactions.borrow();
+        let ancestors_key = if cascade::depends_on_ancestors(element) {
+            ancestors.iter().fold(ancestors.len() as u64, |key, state| {
+                key.wrapping_mul(8).wrapping_add(u64::from(state.bits()))
+            })
+        } else {
+            0
+        };
+        let key = (
+            parent.fingerprint(),
+            environment.key(),
+            interaction.bits(),
+            ancestors_key,
+        );
+        if let Some(cached) = self.styles.borrow().elements.get(element_id)
+            && cached.key == key
+        {
+            return cached.computed.clone();
+        }
+        let declarations = cascade::declarations(element, environment, interaction, &ancestors);
+        let starting =
+            cascade::starting_declarations(element, environment, interaction, &ancestors);
+        let computed = Rc::new(cascade::compute(parent, &declarations, starting.as_deref()));
+        self.styles.borrow_mut().elements.insert(
+            element_id.clone(),
+            CachedStyle {
+                key,
+                computed: computed.clone(),
+            },
+        );
+        computed
     }
 
     fn render_host(
@@ -1542,154 +1464,6 @@ impl LiveHtml {
             children.into_iter().fold(div(), gpui::ParentElement::child)
         }
     }
-}
-
-/// The interaction state an element's styles are resolved in.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct Interaction {
-    hovered: bool,
-    focused: bool,
-    active: bool,
-}
-
-impl Interaction {
-    const fn bits(self) -> usize {
-        self.hovered as usize | (self.focused as usize) << 1 | (self.active as usize) << 2
-    }
-}
-
-/// Parsed motion rules, cached per element and interaction state until the
-/// document, viewport, or view-transition state changes.
-#[derive(Default)]
-struct MotionCache {
-    context: Option<(u32, u32, bool, Option<usize>)>,
-    elements: HashMap<ElementId, CachedMotion>,
-}
-
-impl MotionCache {
-    fn clear(&mut self) {
-        self.context = None;
-        self.elements.clear();
-    }
-}
-
-struct CachedMotion {
-    declares: bool,
-    states: [Option<Rc<MotionRules>>; 8],
-}
-
-/// What motion an element has in one interaction state.
-struct MotionRules {
-    targets: [Option<MotionValue>; 7],
-    starting: [Option<MotionValue>; 7],
-    transitions: Vec<Transition>,
-    animations: Vec<Animation>,
-    hover: bool,
-    active: bool,
-}
-
-impl MotionRules {
-    fn resolve(
-        element: &RenderElement,
-        viewport: MediaViewport<'_>,
-        interaction: Interaction,
-    ) -> Self {
-        let conditional = element
-            .style_variants
-            .iter()
-            .filter(|variant| media_only_variant_matches(variant, viewport))
-            .flat_map(|variant| &variant.declarations);
-        let base: Vec<&StyleDeclaration> = element
-            .stylesheet_declarations
-            .iter()
-            .chain(&element.styles)
-            .chain(conditional)
-            .collect();
-        let mut current = base.clone();
-        for (style, on) in [
-            (InteractiveStyle::Hover, interaction.hovered),
-            (InteractiveStyle::Focus, interaction.focused),
-            (InteractiveStyle::Active, interaction.active),
-        ] {
-            if on {
-                current.extend(
-                    interactive_variants(element, style, viewport)
-                        .into_iter()
-                        .flat_map(|variant| &variant.declarations),
-                );
-            }
-        }
-        let starting = element
-            .style_variants
-            .iter()
-            .filter(|variant| {
-                variant
-                    .conditions
-                    .contains(&RenderStyleCondition::StartingStyle)
-                    && variant.conditions.iter().all(|condition| match condition {
-                        RenderStyleCondition::StartingStyle => true,
-                        RenderStyleCondition::Media(query) => {
-                            media_query_matches(query, viewport).unwrap_or(false)
-                        }
-                        _ => false,
-                    })
-            })
-            .flat_map(|variant| &variant.declarations);
-        let starting: Vec<&StyleDeclaration> = base.iter().copied().chain(starting).collect();
-        Self {
-            targets: crate::motion::computed(current.iter().copied()),
-            starting: crate::motion::computed(starting),
-            transitions: htmlswap::motion::transitions(current.iter().copied()),
-            animations: htmlswap::motion::animations(current.iter().copied()),
-            hover: has_interactive_style(element, InteractiveStyle::Hover),
-            active: has_interactive_style(element, InteractiveStyle::Active),
-        }
-    }
-}
-
-/// Whether an element declares any transition, animation, or starting style.
-fn declares_motion(element: &RenderElement) -> bool {
-    let is_motion = |declaration: &StyleDeclaration| {
-        let name = declaration.property.as_str();
-        name.starts_with("transition") || name.starts_with("animation")
-    };
-    element
-        .stylesheet_declarations
-        .iter()
-        .chain(&element.styles)
-        .any(is_motion)
-        || element.style_variants.iter().any(|variant| {
-            variant
-                .conditions
-                .contains(&RenderStyleCondition::StartingStyle)
-                || variant.declarations.iter().any(is_motion)
-        })
-}
-
-/// Draw the interpolated values of animated properties.
-fn apply_motion_frame<T: Styled>(mut host: T, frame: &crate::motion::Frame) -> T {
-    if let Some(color) = frame
-        .get(Animated::BackgroundColor)
-        .and_then(MotionValue::rgba)
-    {
-        host = host.bg(rgba(color));
-    }
-    if let Some(color) = frame.get(Animated::Color).and_then(MotionValue::rgba) {
-        host = host.text_color(rgba(color));
-    }
-    if let Some(color) = frame.get(Animated::BorderColor).and_then(MotionValue::rgba) {
-        host = host.border_color(rgba(color));
-    }
-    if let Some(opacity) = frame.get(Animated::Opacity).and_then(MotionValue::number) {
-        host = host.opacity(opacity.clamp(0.0, 1.0));
-    }
-    if let Some(width) = frame.get(Animated::Width).and_then(MotionValue::length) {
-        host = host.w(width);
-    }
-    if let Some(height) = frame.get(Animated::Height).and_then(MotionValue::length) {
-        host = host.h(height);
-    }
-    host
 }
 
 fn apply_native_defaults(host: Div, element: &RenderElement) -> Div {
@@ -2283,582 +2057,6 @@ pub(crate) fn dispatch_input_change(
     }
 }
 
-fn apply_styles(
-    host: Div,
-    element: &RenderElement,
-    viewport: MediaViewport<'_>,
-    available_fonts: &HashSet<String>,
-) -> Div {
-    let host = apply_declarations(
-        host,
-        element
-            .stylesheet_declarations
-            .iter()
-            .chain(&element.styles),
-        available_fonts,
-    );
-    apply_media_variants(host, &element.style_variants, viewport, available_fonts)
-}
-
-fn apply_media_variants<T: Styled>(
-    host: T,
-    variants: &[RenderStyleVariant],
-    viewport: MediaViewport<'_>,
-    available_fonts: &HashSet<String>,
-) -> T {
-    variants
-        .iter()
-        .filter(|variant| media_only_variant_matches(variant, viewport))
-        .fold(host, |host, variant| {
-            apply_declarations(host, &variant.declarations, available_fonts)
-        })
-}
-
-fn apply_declarations<'a, T: Styled>(
-    mut host: T,
-    declarations: impl IntoIterator<Item = &'a StyleDeclaration>,
-    available_fonts: &HashSet<String>,
-) -> T {
-    let declarations = declarations.into_iter().collect::<Vec<_>>();
-    for declaration in &declarations {
-        host = apply_style(host, declaration, available_fonts);
-    }
-
-    if declarations
-        .iter()
-        .any(|declaration| declaration.property == StyleProperty::BorderWidth)
-    {
-        host = match effective_border_style(&declarations) {
-            BorderStyle::None => host.border(px(0.)),
-            BorderStyle::Solid => host,
-            BorderStyle::Dashed => host.border_dashed(),
-        };
-    }
-    host
-}
-
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "the live renderer deliberately implements a documented CSS subset"
-)]
-fn apply_style<T: Styled>(
-    host: T,
-    declaration: &StyleDeclaration,
-    available_fonts: &HashSet<String>,
-) -> T {
-    macro_rules! with_value {
-        ($value:expr, |$binding:ident| $expression:expr) => {
-            match $value {
-                Some($binding) => $expression,
-                None => host,
-            }
-        };
-    }
-    let raw_value = declaration.value.as_str().trim();
-    let value = raw_value.to_ascii_lowercase();
-    if let Some(grid) = GridProperty::of(&declaration.property) {
-        return grid.apply(host, &value);
-    }
-    if layout_property(&declaration.property) {
-        return apply_layout_style(host, &declaration.property, &value);
-    }
-    match declaration.property {
-        StyleProperty::Background | StyleProperty::BackgroundColor => {
-            with_value!(color(&value), |value| host.bg(rgba(value)))
-        }
-        StyleProperty::Color => {
-            with_value!(color(&value), |value| host.text_color(rgba(value)))
-        }
-        StyleProperty::FontSize => {
-            with_value!(length_px(&value), |value| host.text_size(px(value)))
-        }
-        StyleProperty::FontFamily => {
-            with_value!(font_family(raw_value, available_fonts), |value| {
-                apply_font_family(host, value)
-            })
-        }
-        StyleProperty::FontWeight => {
-            with_value!(font_weight(&value), |value| host.font_weight(value))
-        }
-        StyleProperty::LineHeight => match line_height(&value) {
-            Some(LineHeight::Pixels(value)) => host.line_height(px(value)),
-            Some(LineHeight::Relative(value)) => host.line_height(relative(value)),
-            Some(LineHeight::Normal) | None => host,
-        },
-        StyleProperty::WhiteSpace => match value.as_str() {
-            "nowrap" | "pre" => host.whitespace_nowrap(),
-            // GPUI currently exposes wrapping rather than CSS's full whitespace-collapse matrix.
-            "normal" | "pre-wrap" | "pre-line" | "break-spaces" => host.whitespace_normal(),
-            _ => host,
-        },
-        StyleProperty::TextAlign => match value.as_str() {
-            "left" | "start" => host.text_left(),
-            "center" => host.text_center(),
-            "right" | "end" => host.text_right(),
-            _ => host,
-        },
-        StyleProperty::TextOverflow if value == "ellipsis" => host.text_ellipsis(),
-        StyleProperty::Opacity => with_value!(opacity(&value), |value| host.opacity(value)),
-        StyleProperty::BoxShadow => {
-            with_value!(box_shadows(&value), |value| host.shadow(value))
-        }
-        StyleProperty::Cursor => apply_cursor(host, &value),
-        // GPUI's definite dimensions already use border-box sizing.
-        StyleProperty::BoxSizing if value == "border-box" => host,
-        StyleProperty::BorderWidth => {
-            with_value!(length_px(&value), |value| host.border(px(value)))
-        }
-        StyleProperty::Border => with_value!(border_value(&value), |value| {
-            apply_border(host, value, BorderSide::All)
-        }),
-        StyleProperty::BorderTop => with_value!(border_value(&value), |value| {
-            apply_border(host, value, BorderSide::Top)
-        }),
-        StyleProperty::BorderRight => with_value!(border_value(&value), |value| {
-            apply_border(host, value, BorderSide::Right)
-        }),
-        StyleProperty::BorderBottom => with_value!(border_value(&value), |value| {
-            apply_border(host, value, BorderSide::Bottom)
-        }),
-        StyleProperty::BorderLeft => with_value!(border_value(&value), |value| {
-            apply_border(host, value, BorderSide::Left)
-        }),
-        StyleProperty::BorderColor => {
-            with_value!(color(&value), |value| host.border_color(rgba(value)))
-        }
-        StyleProperty::BorderRadius => {
-            with_value!(length_px(&value), |value| host.rounded(px(value)))
-        }
-        StyleProperty::Outline if matches!(value.as_str(), "none" | "0") => host,
-        _ => host,
-    }
-}
-
-fn layout_property(property: &StyleProperty) -> bool {
-    matches!(
-        property,
-        StyleProperty::Display
-            | StyleProperty::FlexDirection
-            | StyleProperty::FlexWrap
-            | StyleProperty::AlignItems
-            | StyleProperty::AlignSelf
-            | StyleProperty::JustifyContent
-            | StyleProperty::Position
-            | StyleProperty::Top
-            | StyleProperty::Right
-            | StyleProperty::Bottom
-            | StyleProperty::Left
-            | StyleProperty::Inset
-            | StyleProperty::Gap
-            | StyleProperty::Padding
-            | StyleProperty::PaddingTop
-            | StyleProperty::PaddingRight
-            | StyleProperty::PaddingBottom
-            | StyleProperty::PaddingLeft
-            | StyleProperty::Margin
-            | StyleProperty::MarginTop
-            | StyleProperty::MarginRight
-            | StyleProperty::MarginBottom
-            | StyleProperty::MarginLeft
-            | StyleProperty::Width
-            | StyleProperty::Height
-            | StyleProperty::MinWidth
-            | StyleProperty::MinHeight
-            | StyleProperty::MaxWidth
-            | StyleProperty::MaxHeight
-            | StyleProperty::Flex
-            | StyleProperty::FlexBasis
-            | StyleProperty::FlexGrow
-            | StyleProperty::FlexShrink
-            | StyleProperty::Overflow
-            | StyleProperty::OverflowX
-            | StyleProperty::OverflowY
-    )
-}
-
-#[allow(
-    clippy::too_many_lines,
-    clippy::wildcard_enum_match_arm,
-    reason = "keeping the CSS-to-GPUI layout mapping together makes its supported subset auditable"
-)]
-fn apply_layout_style<T: Styled>(host: T, property: &StyleProperty, value: &str) -> T {
-    macro_rules! with_value {
-        ($value:expr, |$binding:ident| $expression:expr) => {
-            match $value {
-                Some($binding) => $expression,
-                None => host,
-            }
-        };
-    }
-    match property {
-        StyleProperty::Display => match value {
-            "flex" | "inline-flex" => host.flex(),
-            "grid" | "inline-grid" => host.grid(),
-            "block" | "inline" | "inline-block" => host.block(),
-            "none" => host.hidden(),
-            _ => host,
-        },
-        StyleProperty::FlexDirection => match value {
-            "column" => host.flex_col(),
-            "column-reverse" => host.flex_col_reverse(),
-            "row-reverse" => host.flex_row_reverse(),
-            _ => host.flex_row(),
-        },
-        StyleProperty::FlexWrap => match value {
-            "wrap" => host.flex_wrap(),
-            "wrap-reverse" => host.flex_wrap_reverse(),
-            _ => host.flex_nowrap(),
-        },
-        StyleProperty::AlignItems => match value {
-            "start" | "flex-start" => host.items_start(),
-            "end" | "flex-end" => host.items_end(),
-            "center" => host.items_center(),
-            "baseline" => host.items_baseline(),
-            "stretch" => apply_align_items(host, AlignItems::Stretch),
-            _ => host,
-        },
-        StyleProperty::AlignSelf => apply_align_self(host, value),
-        StyleProperty::JustifyContent => match value {
-            "start" | "flex-start" => host.justify_start(),
-            "end" | "flex-end" => host.justify_end(),
-            "center" => host.justify_center(),
-            "space-between" => host.justify_between(),
-            "space-around" => host.justify_around(),
-            _ => host,
-        },
-        StyleProperty::Position => match value {
-            "relative" => host.relative(),
-            "absolute" => host.absolute(),
-            _ => host,
-        },
-        StyleProperty::Top => with_value!(length(value), |value| host.top(value)),
-        StyleProperty::Right => with_value!(length(value), |value| host.right(value)),
-        StyleProperty::Bottom => with_value!(length(value), |value| host.bottom(value)),
-        StyleProperty::Left => with_value!(length(value), |value| host.left(value)),
-        StyleProperty::Inset => with_value!(box_values(value, length), |value| {
-            host.top(value[0])
-                .right(value[1])
-                .bottom(value[2])
-                .left(value[3])
-        }),
-        StyleProperty::Gap => with_value!(definite_length(value), |value| host.gap(value)),
-        StyleProperty::Padding => with_value!(box_values(value, definite_length), |value| {
-            host.pt(value[0]).pr(value[1]).pb(value[2]).pl(value[3])
-        }),
-        StyleProperty::PaddingTop => with_value!(definite_length(value), |value| host.pt(value)),
-        StyleProperty::PaddingRight => with_value!(definite_length(value), |value| host.pr(value)),
-        StyleProperty::PaddingBottom => with_value!(definite_length(value), |value| host.pb(value)),
-        StyleProperty::PaddingLeft => with_value!(definite_length(value), |value| host.pl(value)),
-        StyleProperty::Margin => with_value!(box_values(value, length), |value| {
-            host.mt(value[0]).mr(value[1]).mb(value[2]).ml(value[3])
-        }),
-        StyleProperty::MarginTop => with_value!(length(value), |value| host.mt(value)),
-        StyleProperty::MarginRight => with_value!(length(value), |value| host.mr(value)),
-        StyleProperty::MarginBottom => with_value!(length(value), |value| host.mb(value)),
-        StyleProperty::MarginLeft => with_value!(length(value), |value| host.ml(value)),
-        StyleProperty::Width => with_value!(length(value), |value| host.w(value)),
-        StyleProperty::Height => with_value!(length(value), |value| host.h(value)),
-        StyleProperty::MinWidth => with_value!(length(value), |value| host.min_w(value)),
-        StyleProperty::MinHeight => with_value!(length(value), |value| host.min_h(value)),
-        StyleProperty::MaxWidth => with_value!(length(value), |value| host.max_w(value)),
-        StyleProperty::MaxHeight => with_value!(length(value), |value| host.max_h(value)),
-        StyleProperty::Flex => {
-            with_value!(flex_value(value), |value| apply_flex_value(host, value))
-        }
-        StyleProperty::FlexBasis => with_value!(length(value), |value| host.flex_basis(value)),
-        StyleProperty::FlexGrow => {
-            with_value!(flex_factor(value), |value| apply_flex_grow(host, value))
-        }
-        StyleProperty::FlexShrink => {
-            with_value!(flex_factor(value), |value| apply_flex_shrink(host, value))
-        }
-        StyleProperty::Overflow => with_value!(overflow(value), |value| {
-            apply_overflow(host, value, OverflowAxis::Both)
-        }),
-        StyleProperty::OverflowX => with_value!(overflow(value), |value| {
-            apply_overflow(host, value, OverflowAxis::X)
-        }),
-        StyleProperty::OverflowY => with_value!(overflow(value), |value| {
-            apply_overflow(host, value, OverflowAxis::Y)
-        }),
-        _ => host,
-    }
-}
-
-fn apply_align_self<T: Styled>(mut host: T, value: &str) -> T {
-    host.style().align_self = match value {
-        "auto" => None,
-        "start" => Some(AlignSelf::Start),
-        "end" => Some(AlignSelf::End),
-        "flex-start" => Some(AlignSelf::FlexStart),
-        "flex-end" => Some(AlignSelf::FlexEnd),
-        "center" => Some(AlignSelf::Center),
-        "baseline" => Some(AlignSelf::Baseline),
-        "stretch" => Some(AlignSelf::Stretch),
-        _ => return host,
-    };
-    host
-}
-
-fn apply_align_items<T: Styled>(mut host: T, value: AlignItems) -> T {
-    host.style().align_items = Some(value);
-    host
-}
-
-/// What CSS conditions are evaluated against while rendering.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct MediaViewport<'a> {
-    width: f32,
-    height: f32,
-    /// `prefers-reduced-motion: reduce`, from GPUI's reduce-motion setting.
-    reduce_motion: bool,
-    /// Types of the active view transition, for `:active-view-transition-type()`.
-    view_transition_types: Option<&'a [CompactString]>,
-}
-
-impl MediaViewport<'static> {
-    const fn new(width: f32, height: f32) -> Self {
-        Self {
-            width,
-            height,
-            reduce_motion: false,
-            view_transition_types: None,
-        }
-    }
-
-    fn from_window(window: &Window) -> Self {
-        let size = window.viewport_size();
-        Self::new(size.width.into(), size.height.into())
-    }
-}
-
-/// Whether a variant depends only on conditions the renderer evaluates while
-/// rendering (media queries and view-transition types), as opposed to
-/// interaction state.
-fn media_only_variant_supported(variant: &RenderStyleVariant) -> bool {
-    !variant.conditions.is_empty()
-        && variant.conditions.iter().all(|condition| match condition {
-            RenderStyleCondition::Media(query) => {
-                media_query_matches(query, MediaViewport::new(1024.0, 768.0)).is_some()
-            }
-            RenderStyleCondition::ActiveViewTransitionType(_) => true,
-            _ => false,
-        })
-}
-
-fn media_only_variant_matches(variant: &RenderStyleVariant, viewport: MediaViewport<'_>) -> bool {
-    media_only_variant_supported(variant) && media_conditions_match(variant, viewport)
-}
-
-fn media_conditions_match(variant: &RenderStyleVariant, viewport: MediaViewport<'_>) -> bool {
-    variant.conditions.iter().all(|condition| {
-        matches!(condition, RenderStyleCondition::PseudoClass(_))
-            || condition_matches(condition, viewport)
-    })
-}
-
-/// Whether a rendering-time condition holds. Interaction state is evaluated
-/// elsewhere, so pseudo-classes do not match here.
-fn condition_matches(condition: &RenderStyleCondition, viewport: MediaViewport<'_>) -> bool {
-    match condition {
-        RenderStyleCondition::Media(query) => media_query_matches(query, viewport).unwrap_or(false),
-        RenderStyleCondition::ActiveViewTransitionType(types) => viewport
-            .view_transition_types
-            .is_some_and(|active| types.iter().any(|kind| active.contains(kind))),
-        // Starting styles only seed entry transitions; see `motion`.
-        RenderStyleCondition::StartingStyle
-        | RenderStyleCondition::PseudoClass(_)
-        | RenderStyleCondition::PseudoElement(_)
-        | RenderStyleCondition::Supports(_)
-        | RenderStyleCondition::Container(_) => false,
-    }
-}
-
-fn media_query_matches(query: &str, viewport: MediaViewport<'_>) -> Option<bool> {
-    query
-        .to_ascii_lowercase()
-        .split(',')
-        .map(|branch| media_query_branch_matches(branch.trim(), viewport))
-        .collect::<Option<Vec<_>>>()
-        .map(|branches| branches.into_iter().any(|matches| matches))
-}
-
-fn media_query_branch_matches(query: &str, viewport: MediaViewport<'_>) -> Option<bool> {
-    if query.is_empty() {
-        return None;
-    }
-    let query = query.strip_prefix("only ").unwrap_or(query);
-    if query.starts_with("not ") {
-        return None;
-    }
-    query
-        .split(" and ")
-        .map(str::trim)
-        .filter(|part| !matches!(*part, "all" | "screen"))
-        .map(|part| media_query_part_matches(part, viewport))
-        .collect::<Option<Vec<_>>>()
-        .map(|parts| parts.into_iter().all(|matches| matches))
-}
-
-fn media_query_part_matches(part: &str, viewport: MediaViewport<'_>) -> Option<bool> {
-    let feature = part.strip_prefix('(')?.strip_suffix(')')?.trim();
-    if let Some(matches) = media_range_matches(feature, viewport) {
-        return Some(matches);
-    }
-    let (name, value) = feature.split_once(':')?;
-    let name = name.trim();
-    let value = value.trim();
-    match name {
-        "min-width" => Some(viewport.width >= media_length(value)?),
-        "max-width" => Some(viewport.width <= media_length(value)?),
-        "width" => Some((viewport.width - media_length(value)?).abs() < f32::EPSILON),
-        "min-height" => Some(viewport.height >= media_length(value)?),
-        "max-height" => Some(viewport.height <= media_length(value)?),
-        "height" => Some((viewport.height - media_length(value)?).abs() < f32::EPSILON),
-        "orientation" if value == "landscape" => Some(viewport.width >= viewport.height),
-        "orientation" if value == "portrait" => Some(viewport.height > viewport.width),
-        // GPUI Studio targets desktop windows, where hover and a fine pointer are available.
-        "hover" | "any-hover" => Some(value == "hover"),
-        "pointer" | "any-pointer" => Some(value == "fine"),
-        "prefers-reduced-motion" => match value {
-            "reduce" => Some(viewport.reduce_motion),
-            "no-preference" => Some(!viewport.reduce_motion),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn media_range_matches(feature: &str, viewport: MediaViewport<'_>) -> Option<bool> {
-    for operator in ["<=", ">=", "<", ">", "="] {
-        let Some((left, right)) = feature.split_once(operator) else {
-            continue;
-        };
-        let left = left.trim();
-        let right = right.trim();
-        if let Some(actual) = media_dimension(left, viewport) {
-            return Some(compare_media_range(actual, media_length(right)?, operator));
-        }
-        if let Some(actual) = media_dimension(right, viewport) {
-            return Some(compare_media_range(media_length(left)?, actual, operator));
-        }
-        return None;
-    }
-    None
-}
-
-fn media_dimension(value: &str, viewport: MediaViewport<'_>) -> Option<f32> {
-    match value {
-        "width" => Some(viewport.width),
-        "height" => Some(viewport.height),
-        _ => None,
-    }
-}
-
-fn compare_media_range(left: f32, right: f32, operator: &str) -> bool {
-    match operator {
-        "<=" => left <= right,
-        ">=" => left >= right,
-        "<" => left < right,
-        ">" => left > right,
-        "=" => (left - right).abs() < f32::EPSILON,
-        _ => false,
-    }
-}
-
-fn media_length(value: &str) -> Option<f32> {
-    value
-        .strip_suffix("px")
-        .and_then(|value| value.trim().parse::<f32>().ok())
-        .or_else(|| {
-            value
-                .strip_suffix("rem")
-                .or_else(|| value.strip_suffix("em"))
-                .and_then(|value| value.trim().parse::<f32>().ok())
-                .map(|value| value * 16.0)
-        })
-        .filter(|value| value.is_finite() && *value >= 0.0)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InteractiveStyle {
-    Hover,
-    Focus,
-    Active,
-}
-
-fn interactive_style(variant: &RenderStyleVariant) -> Option<InteractiveStyle> {
-    let mut pseudo_class = None;
-    for condition in &variant.conditions {
-        match condition {
-            RenderStyleCondition::PseudoClass(value) if pseudo_class.is_none() => {
-                pseudo_class = Some(value.as_str());
-            }
-            RenderStyleCondition::Media(query)
-                if media_query_matches(query, MediaViewport::new(1024.0, 768.0)).is_some() => {}
-            _ => return None,
-        }
-    }
-    match pseudo_class? {
-        "hover" => Some(InteractiveStyle::Hover),
-        // GPUI exposes a single focus style hook. Preserve `:focus-visible`
-        // through that hook instead of dropping the authored keyboard-focus
-        // treatment from the live runtime.
-        "focus" | "focus-visible" => Some(InteractiveStyle::Focus),
-        "active" => Some(InteractiveStyle::Active),
-        _ => None,
-    }
-}
-
-fn has_interactive_style(element: &RenderElement, style: InteractiveStyle) -> bool {
-    element
-        .style_variants
-        .iter()
-        .any(|variant| interactive_style(variant) == Some(style))
-}
-
-fn apply_interactive_styles(
-    mut host: Stateful<Div>,
-    element: &RenderElement,
-    forced_hover: bool,
-    viewport: MediaViewport<'_>,
-    available_fonts: &HashSet<String>,
-) -> Stateful<Div> {
-    let hover_variants = interactive_variants(element, InteractiveStyle::Hover, viewport);
-    let focus_variants = interactive_variants(element, InteractiveStyle::Focus, viewport);
-    let active_variants = interactive_variants(element, InteractiveStyle::Active, viewport);
-    if forced_hover {
-        host = apply_variant_declarations(host, &hover_variants, available_fonts);
-    }
-    if !hover_variants.is_empty() {
-        host =
-            host.hover(|style| apply_variant_declarations(style, &hover_variants, available_fonts));
-    }
-    if !focus_variants.is_empty() {
-        host =
-            host.focus(|style| apply_variant_declarations(style, &focus_variants, available_fonts));
-    }
-    if !active_variants.is_empty() {
-        host = host
-            .active(|style| apply_variant_declarations(style, &active_variants, available_fonts));
-    }
-    host
-}
-
-fn interactive_variants<'a>(
-    element: &'a RenderElement,
-    style: InteractiveStyle,
-    viewport: MediaViewport<'_>,
-) -> Vec<&'a RenderStyleVariant> {
-    element
-        .style_variants
-        .iter()
-        .filter(|variant| {
-            interactive_style(variant) == Some(style) && media_conditions_match(variant, viewport)
-        })
-        .collect()
-}
-
 fn update_hovered_element(
     hovered_element: &Rc<RefCell<Option<ElementId>>>,
     element_id: &ElementId,
@@ -2872,230 +2070,12 @@ fn update_hovered_element(
     }
 }
 
-fn apply_variant_declarations<T: Styled>(
-    host: T,
-    variants: &[&RenderStyleVariant],
-    available_fonts: &HashSet<String>,
-) -> T {
-    variants.iter().fold(host, |host, variant| {
-        apply_declarations(host, &variant.declarations, available_fonts)
-    })
-}
-
-fn length_px(value: &str) -> Option<f32> {
-    if value == "0" {
-        return Some(0.0);
-    }
-    value.strip_suffix("px")?.trim().parse().ok()
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum LineHeight {
-    Normal,
-    Pixels(f32),
-    Relative(f32),
-}
-
-fn line_height(value: &str) -> Option<LineHeight> {
-    let value = value.trim();
-    if value == "normal" {
-        return Some(LineHeight::Normal);
-    }
-    if let Some(value) = length_px(value) {
-        return Some(LineHeight::Pixels(value));
-    }
-    if let Some(percent) = value.strip_suffix('%') {
-        return percent
-            .trim()
-            .parse::<f32>()
-            .ok()
-            .filter(|value| value.is_finite() && *value >= 0.)
-            .map(|value| LineHeight::Relative(value / 100.));
-    }
-    value
-        .parse::<f32>()
-        .ok()
-        .filter(|value| value.is_finite() && *value >= 0.)
-        .map(LineHeight::Relative)
-}
-
-fn definite_length(value: &str) -> Option<DefiniteLength> {
-    if value == "0" {
-        return Some(px(0.).into());
-    }
-    value.try_into().ok()
-}
-
-fn length(value: &str) -> Option<Length> {
-    if value == "auto" {
-        return Some(Length::Auto);
-    }
-    definite_length(value).map(Into::into)
-}
-
-fn box_values<T: Copy>(value: &str, parse: impl Fn(&str) -> Option<T>) -> Option<[T; 4]> {
-    let values = value
-        .split_whitespace()
-        .map(parse)
-        .collect::<Option<Vec<_>>>()?;
-    match values.as_slice() {
-        [all] => Some([*all; 4]),
-        [vertical, horizontal] => Some([*vertical, *horizontal, *vertical, *horizontal]),
-        [top, horizontal, bottom] => Some([*top, *horizontal, *bottom, *horizontal]),
-        [top, right, bottom, left] => Some([*top, *right, *bottom, *left]),
-        _ => None,
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct FlexValue {
-    grow: f32,
-    shrink: f32,
-    basis: Length,
-}
-
-fn flex_value(value: &str) -> Option<FlexValue> {
-    match value {
-        "none" => Some(FlexValue {
-            grow: 0.,
-            shrink: 0.,
-            basis: Length::Auto,
-        }),
-        "auto" => Some(FlexValue {
-            grow: 1.,
-            shrink: 1.,
-            basis: Length::Auto,
-        }),
-        "initial" => Some(FlexValue {
-            grow: 0.,
-            shrink: 1.,
-            basis: Length::Auto,
-        }),
-        _ => {
-            let tokens = value.split_whitespace().collect::<Vec<_>>();
-            match tokens.as_slice() {
-                [grow] => Some(FlexValue {
-                    grow: flex_factor(grow)?,
-                    shrink: 1.,
-                    basis: definite_length("0%").map(Into::into)?,
-                }),
-                [grow, second] => {
-                    let grow = flex_factor(grow)?;
-                    if let Some(shrink) = flex_factor(second) {
-                        Some(FlexValue {
-                            grow,
-                            shrink,
-                            basis: definite_length("0%").map(Into::into)?,
-                        })
-                    } else {
-                        Some(FlexValue {
-                            grow,
-                            shrink: 1.,
-                            basis: length(second)?,
-                        })
-                    }
-                }
-                [grow, shrink, basis] => Some(FlexValue {
-                    grow: flex_factor(grow)?,
-                    shrink: flex_factor(shrink)?,
-                    basis: length(basis)?,
-                }),
-                _ => None,
-            }
-        }
-    }
-}
-
-fn flex_factor(value: &str) -> Option<f32> {
-    value
-        .parse::<f32>()
-        .ok()
-        .filter(|value| value.is_finite() && *value >= 0.)
-}
-
-fn apply_flex_value<T: Styled>(mut host: T, value: FlexValue) -> T {
-    host.style().flex_grow = Some(value.grow);
-    host.style().flex_shrink = Some(value.shrink);
-    host.style().flex_basis = Some(value.basis);
-    host
-}
-
-fn apply_flex_grow<T: Styled>(mut host: T, value: f32) -> T {
-    host.style().flex_grow = Some(value);
-    host
-}
-
-fn apply_flex_shrink<T: Styled>(mut host: T, value: f32) -> T {
-    host.style().flex_shrink = Some(value);
-    host
-}
-
-pub(crate) fn opacity(value: &str) -> Option<f32> {
-    value
-        .parse::<f32>()
-        .ok()
-        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
-}
-
-fn apply_cursor<T: Styled>(host: T, value: &str) -> T {
-    match value {
-        "auto" | "default" => host.cursor_default(),
-        "pointer" => host.cursor_pointer(),
-        "text" => host.cursor_text(),
-        "move" => host.cursor_move(),
-        "not-allowed" | "no-drop" => host.cursor_not_allowed(),
-        "context-menu" => host.cursor_context_menu(),
-        "crosshair" => host.cursor_crosshair(),
-        "vertical-text" => host.cursor_vertical_text(),
-        "alias" => host.cursor_alias(),
-        "copy" => host.cursor_copy(),
-        "grab" => host.cursor_grab(),
-        "grabbing" => host.cursor_grabbing(),
-        "ew-resize" | "e-resize" | "w-resize" => host.cursor_ew_resize(),
-        "ns-resize" | "n-resize" | "s-resize" => host.cursor_ns_resize(),
-        "nesw-resize" | "ne-resize" | "sw-resize" => host.cursor_nesw_resize(),
-        "nwse-resize" | "nw-resize" | "se-resize" => host.cursor_nwse_resize(),
-        _ => host,
-    }
-}
-
-fn cursor_supported(value: &str) -> bool {
-    matches!(
-        value,
-        "auto"
-            | "default"
-            | "pointer"
-            | "text"
-            | "move"
-            | "not-allowed"
-            | "no-drop"
-            | "context-menu"
-            | "crosshair"
-            | "vertical-text"
-            | "alias"
-            | "copy"
-            | "grab"
-            | "grabbing"
-            | "ew-resize"
-            | "e-resize"
-            | "w-resize"
-            | "ns-resize"
-            | "n-resize"
-            | "s-resize"
-            | "nesw-resize"
-            | "ne-resize"
-            | "sw-resize"
-            | "nwse-resize"
-            | "nw-resize"
-            | "se-resize"
-    )
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OverflowAxis {
-    Both,
-    X,
-    Y,
+fn available_fonts(cx: &App) -> HashSet<String> {
+    cx.text_system()
+        .all_font_names()
+        .into_iter()
+        .map(|family| family.to_ascii_lowercase())
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3108,405 +2088,111 @@ impl ScrollAxes {
     const fn any(self) -> bool {
         self.x || self.y
     }
-}
 
-fn element_scroll_axes(element: &RenderElement, viewport: MediaViewport<'_>) -> ScrollAxes {
-    let mut axes = ScrollAxes::default();
-    for declaration in element
-        .stylesheet_declarations
-        .iter()
-        .chain(&element.styles)
-        .chain(
-            element
-                .style_variants
-                .iter()
-                .filter(|variant| media_only_variant_matches(variant, viewport))
-                .flat_map(|variant| &variant.declarations),
-        )
-    {
-        let is_scroll = matches!(
-            overflow(&declaration.value.as_str().trim().to_ascii_lowercase()),
-            Some(Overflow::Scroll)
-        );
-        match declaration.property {
-            StyleProperty::Overflow => {
-                axes = ScrollAxes {
-                    x: is_scroll,
-                    y: is_scroll,
-                }
-            }
-            StyleProperty::OverflowX => axes.x = is_scroll,
-            StyleProperty::OverflowY => axes.y = is_scroll,
-            _ => {}
+    fn of(style: &ComputedStyle) -> Self {
+        use htmlswap::computed::Overflow;
+        let scrolls =
+            |value: Option<Overflow>| matches!(value, Some(Overflow::Scroll | Overflow::Auto));
+        Self {
+            x: scrolls(style.overflow_x),
+            y: scrolls(style.overflow_y),
         }
     }
-    axes
 }
 
-fn overflow(value: &str) -> Option<Overflow> {
-    match value {
-        "visible" => Some(Overflow::Visible),
-        "clip" => Some(Overflow::Clip),
-        "hidden" => Some(Overflow::Hidden),
-        "auto" | "scroll" => Some(Overflow::Scroll),
-        _ => None,
-    }
+/// What an element computed to, cached while its context is unchanged.
+struct CachedStyle {
+    key: (u64, u64, u8, u64),
+    computed: Rc<cascade::Computed>,
 }
 
-fn apply_overflow<T: Styled>(mut host: T, value: Overflow, axis: OverflowAxis) -> T {
-    if matches!(axis, OverflowAxis::Both | OverflowAxis::X) {
-        host.style().overflow.x = Some(value);
-    }
-    if matches!(axis, OverflowAxis::Both | OverflowAxis::Y) {
-        host.style().overflow.y = Some(value);
-    }
-    host
+/// Computed styles of the rendered elements of one document.
+#[derive(Default)]
+struct StyleCache {
+    elements: HashMap<ElementId, CachedStyle>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BorderSide {
-    All,
-    Top,
-    Right,
-    Bottom,
-    Left,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct BorderValue {
-    width: f32,
-    style: BorderStyle,
-    color: Option<u32>,
-}
-
-fn border_value(value: &str) -> Option<BorderValue> {
-    if matches!(value, "none" | "hidden") {
-        return Some(BorderValue {
-            width: 0.,
-            style: BorderStyle::None,
-            color: None,
-        });
-    }
-
-    let mut width = None;
-    let mut style = None;
-    let mut parsed_color = None;
-    for token in value.split_whitespace() {
-        if let Some(value) = length_px(token) {
-            width = Some(value);
-        } else if let Some(value) = match token {
-            "none" | "hidden" => Some(BorderStyle::None),
-            "solid" => Some(BorderStyle::Solid),
-            "dashed" => Some(BorderStyle::Dashed),
-            _ => None,
-        } {
-            style = Some(value);
-        } else if let Some(value) = color(token) {
-            parsed_color = Some(value);
-        } else {
-            return None;
-        }
-    }
-
-    let width = width?;
-    Some(BorderValue {
-        width,
-        style: style.unwrap_or(BorderStyle::None),
-        color: parsed_color,
-    })
-}
-
-fn apply_border<T: Styled>(mut host: T, value: BorderValue, side: BorderSide) -> T {
-    let width = if value.style == BorderStyle::None {
-        0.
-    } else {
-        value.width
-    };
-    host = match side {
-        BorderSide::All => host.border(px(width)),
-        BorderSide::Top => host.border_t(px(width)),
-        BorderSide::Right => host.border_r(px(width)),
-        BorderSide::Bottom => host.border_b(px(width)),
-        BorderSide::Left => host.border_l(px(width)),
-    };
-    if let Some(value) = value.color {
-        host = host.border_color(rgba(value));
-    }
-    if value.style == BorderStyle::Dashed {
-        host = host.border_dashed();
-    }
-    host
-}
-
-fn box_shadows(value: &str) -> Option<Vec<BoxShadow>> {
-    if matches!(value.trim(), "none" | "0") {
-        return Some(Vec::new());
-    }
-    split_top_level(value, ',')
-        .into_iter()
-        .map(single_box_shadow)
-        .collect()
-}
-
-fn single_box_shadow(value: &str) -> Option<BoxShadow> {
-    let mut lengths = Vec::new();
-    let mut parsed_color = None;
-    for token in split_top_level_whitespace(value) {
-        if token.eq_ignore_ascii_case("inset") {
-            return None;
-        }
-        if let Some(value) = length_px(token) {
-            lengths.push(value);
-        } else if parsed_color.is_none() {
-            parsed_color = color(token);
-            parsed_color?;
-        } else {
-            return None;
-        }
-    }
-    if !(2..=4).contains(&lengths.len()) {
-        return None;
-    }
-    Some(BoxShadow {
-        color: rgba(parsed_color.unwrap_or(0x0000_00ff)).into(),
-        offset: point(px(lengths[0]), px(lengths[1])),
-        blur_radius: px(lengths.get(2).copied().unwrap_or(0.)),
-        spread_radius: px(lengths.get(3).copied().unwrap_or(0.)),
-        inset: false,
-    })
-}
-
-fn split_top_level(value: &str, delimiter: char) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut depth = 0u32;
-    for (index, character) in value.char_indices() {
-        match character {
-            '(' => depth = depth.saturating_add(1),
-            ')' => depth = depth.saturating_sub(1),
-            _ if character == delimiter && depth == 0 => {
-                parts.push(value[start..index].trim());
-                start = index + character.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    parts.push(value[start..].trim());
-    parts
-}
-
-fn split_top_level_whitespace(value: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = None;
-    let mut depth = 0u32;
-    for (index, character) in value.char_indices() {
-        match character {
-            '(' => {
-                depth = depth.saturating_add(1);
-                start.get_or_insert(index);
-            }
-            ')' => depth = depth.saturating_sub(1),
-            _ if character.is_whitespace() && depth == 0 => {
-                if let Some(start_index) = start.take() {
-                    parts.push(&value[start_index..index]);
-                }
-            }
-            _ => {
-                start.get_or_insert(index);
-            }
-        }
-    }
-    if let Some(start) = start {
-        parts.push(&value[start..]);
-    }
-    parts
-}
-
-pub(crate) fn color(value: &str) -> Option<u32> {
-    let value = value.trim();
-    if let Some(arguments) = value
-        .strip_prefix("rgba(")
-        .and_then(|value| value.strip_suffix(')'))
-    {
-        let channels = arguments.split(',').map(str::trim).collect::<Vec<_>>();
-        let [red, green, blue, alpha] = channels.as_slice() else {
-            return None;
-        };
-        let channel = |value: &str| value.parse::<u8>().ok();
-        let alpha = alpha
-            .parse::<f32>()
-            .ok()
-            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))?;
-        let alpha = format!("{:.0}", alpha * 255.).parse::<u8>().ok()?;
-        return Some(
-            (u32::from(channel(red)?) << 24)
-                | (u32::from(channel(green)?) << 16)
-                | (u32::from(channel(blue)?) << 8)
-                | u32::from(alpha),
-        );
-    }
-    let hex = value.strip_prefix('#');
-    match hex.map(str::len) {
-        Some(3) => {
-            let value = hex?;
-            let mut expanded = String::with_capacity(8);
-            for character in value.chars() {
-                expanded.push(character);
-                expanded.push(character);
-            }
-            expanded.push_str("ff");
-            u32::from_str_radix(&expanded, 16).ok()
-        }
-        Some(4) => {
-            let value = hex?;
-            let mut expanded = String::with_capacity(8);
-            for character in value.chars() {
-                expanded.push(character);
-                expanded.push(character);
-            }
-            u32::from_str_radix(&expanded, 16).ok()
-        }
-        Some(6) => u32::from_str_radix(&format!("{}ff", hex?), 16).ok(),
-        Some(8) => u32::from_str_radix(hex?, 16).ok(),
-        _ => match value {
-            "transparent" => Some(0x0000_0000),
-            "black" => Some(0x0000_00ff),
-            "white" => Some(0xffff_ffff),
-            "red" => Some(0xff00_00ff),
-            "green" => Some(0x0080_00ff),
-            "blue" => Some(0x0000_ffff),
-            _ => None,
-        },
-    }
-}
-
-fn font_weight(value: &str) -> Option<FontWeight> {
-    match value {
-        "normal" => Some(FontWeight::NORMAL),
-        "bold" => Some(FontWeight::BOLD),
-        _ => value
-            .parse::<f32>()
-            .ok()
-            .filter(|value| (100.0..=900.0).contains(value))
-            .map(FontWeight),
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FontFamily {
-    primary: String,
-    fallbacks: Vec<String>,
-}
-
-fn available_fonts(cx: &App) -> HashSet<String> {
-    cx.text_system()
-        .all_font_names()
-        .into_iter()
-        .map(|family| family.to_ascii_lowercase())
-        .collect()
-}
-
-fn font_family(value: &str, available_fonts: &HashSet<String>) -> Option<FontFamily> {
-    let families = value
-        .split(',')
-        .map(str::trim)
-        .map(|family| family.trim_matches(['\'', '"']))
-        .filter(|family| !family.is_empty())
-        .map(normalize_font_family)
-        .collect::<Vec<_>>();
-    if families.is_empty() {
-        return None;
-    }
-    let selected = families
-        .iter()
-        .position(|family| available_fonts.contains(&family.to_ascii_lowercase()));
-    let primary_index = selected.unwrap_or(families.len());
-    let primary = selected.map_or_else(
-        || ".SystemUIFont".to_owned(),
-        |index| families[index].clone(),
-    );
-    let fallbacks = families
-        .into_iter()
-        .skip(primary_index.saturating_add(1))
-        .collect();
-    Some(FontFamily { primary, fallbacks })
-}
-
-fn normalize_font_family(family: &str) -> String {
-    if matches!(
-        family.to_ascii_lowercase().as_str(),
-        "system-ui"
-            | "ui-sans-serif"
-            | "ui-serif"
-            | "ui-monospace"
-            | "sans-serif"
-            | "serif"
-            | "monospace"
+/// Elements whose descendants' styles depend on their interaction state,
+/// with the states they depend on.
+fn collect_state_anchors(plan: &RenderPlan) -> HashMap<ElementId, StateNeeds> {
+    fn collect(
+        nodes: &[RenderNode],
+        path: &mut Vec<usize>,
+        ancestors: &mut Vec<ElementId>,
+        anchors: &mut HashMap<ElementId, StateNeeds>,
     ) {
-        ".SystemUIFont".to_owned()
-    } else {
-        family.to_owned()
-    }
-}
-
-fn apply_font_family<T: Styled>(mut host: T, family: FontFamily) -> T {
-    let text_style = host.text_style();
-    text_style.font_family = Some(SharedString::from(family.primary));
-    text_style.font_fallbacks =
-        (!family.fallbacks.is_empty()).then(|| FontFallbacks::from_fonts(family.fallbacks));
-    host
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BorderStyle {
-    None,
-    Solid,
-    Dashed,
-}
-
-fn effective_border_style(declarations: &[&StyleDeclaration]) -> BorderStyle {
-    declarations
-        .iter()
-        .rev()
-        .find(|declaration| declaration.property == StyleProperty::BorderStyle)
-        .map_or(BorderStyle::None, |declaration| {
-            match declaration
-                .value
-                .as_str()
-                .trim()
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "solid" => BorderStyle::Solid,
-                "dashed" => BorderStyle::Dashed,
-                _ => BorderStyle::None,
+        for (index, node) in nodes.iter().enumerate() {
+            let RenderNode::Element(element) = node else {
+                continue;
+            };
+            path.push(index);
+            let id = ElementId::new(
+                attribute(element, "id").map_or_else(|| generated_id(path), str::to_owned),
+            );
+            for variant in &element.style_variants {
+                for condition in &variant.conditions {
+                    if let RenderStyleCondition::ElementState {
+                        pseudo, ancestor, ..
+                    } = condition
+                        && *ancestor > 0
+                        && let Some(anchor) = ancestors
+                            .len()
+                            .checked_sub(usize::from(*ancestor))
+                            .map(|index| ancestors[index].clone())
+                    {
+                        anchors.entry(anchor).or_default().add(pseudo);
+                    }
+                }
             }
-        })
+            ancestors.push(id);
+            collect(&element.children, path, ancestors, anchors);
+            ancestors.pop();
+            path.pop();
+        }
+    }
+
+    let mut anchors = HashMap::new();
+    collect(&plan.nodes, &mut Vec::new(), &mut Vec::new(), &mut anchors);
+    anchors
+}
+
+/// Properties applied outside the typed style: by the inherited scope,
+/// motion, and view transitions.
+fn handled_outside_style(property: &str) -> bool {
+    property.starts_with("--")
+        || property.starts_with("transition")
+        || property.starts_with("animation")
+        || property.starts_with("view-transition")
+        || property.starts_with("font-variant")
+        || matches!(
+            property,
+            "color-scheme" | "text-transform" | "font-kerning" | "font-feature-settings"
+        )
 }
 
 fn collect_render_diagnostics(plan: &RenderPlan) -> Vec<RenderDiagnostic> {
     let mut diagnostics = Vec::new();
-    collect_declaration_diagnostics("html-root", &plan.root.styles, &mut diagnostics);
+    let root = ComputedScope::root(&MediaEnvironment::default());
+    let root_declarations = plan.root.styles.iter().collect::<Vec<_>>();
+    let scope = root.document_root(root_declarations.iter().copied());
+    diagnose_declarations(
+        "html-root",
+        &root_declarations,
+        &scope,
+        &root,
+        &mut diagnostics,
+    );
     for variant in &plan.root.style_variants {
-        if media_only_variant_supported(variant) {
-            collect_declaration_diagnostics("html-root", &variant.declarations, &mut diagnostics);
-        } else {
-            diagnostics.push(RenderDiagnostic {
-                node_id: "html-root".to_owned(),
-                feature: "conditional CSS".to_owned(),
-                message:
-                    "root style condition is preserved but unsupported by the live GPUI renderer"
-                        .to_owned(),
-            });
-        }
+        diagnose_variant("html-root", variant, &scope, &root, &mut diagnostics);
     }
-    collect_node_diagnostics(&plan.nodes, &mut Vec::new(), &mut diagnostics);
+    collect_node_diagnostics(&plan.nodes, &mut Vec::new(), &scope, &mut diagnostics);
     diagnostics
 }
 
 fn collect_node_diagnostics(
     nodes: &[RenderNode],
     path: &mut Vec<usize>,
+    parent: &ComputedScope,
     diagnostics: &mut Vec<RenderDiagnostic>,
 ) {
     for (index, node) in nodes.iter().enumerate() {
@@ -3519,22 +2205,11 @@ fn collect_node_diagnostics(
             .stylesheet_declarations
             .iter()
             .chain(&element.styles)
-            .cloned()
             .collect::<Vec<_>>();
-        collect_declaration_diagnostics(&id, &declarations, diagnostics);
+        let scope = parent.child(declarations.iter().copied());
+        diagnose_declarations(&id, &declarations, &scope, parent, diagnostics);
         for variant in &element.style_variants {
-            if interactive_style(variant).is_some() || media_only_variant_supported(variant) {
-                collect_declaration_diagnostics(&id, &variant.declarations, diagnostics);
-            } else {
-                diagnostics.push(RenderDiagnostic {
-                    node_id: id.clone(),
-                    feature: "conditional CSS".to_owned(),
-                    message: format!(
-                        "live renderer does not support style conditions {:?}",
-                        variant.conditions
-                    ),
-                });
-            }
+            diagnose_variant(&id, variant, &scope, parent, diagnostics);
         }
         if !element.dynamic_styles.is_empty() || !element.pseudo_elements.is_empty() {
             diagnostics.push(RenderDiagnostic {
@@ -3544,355 +2219,89 @@ fn collect_node_diagnostics(
                     .to_owned(),
             });
         }
-        collect_node_diagnostics(&element.children, path, diagnostics);
+        collect_node_diagnostics(&element.children, path, &scope, diagnostics);
         path.pop();
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "ordered validation mirrors the renderer's explicit supported CSS subset"
-)]
-fn collect_declaration_diagnostics(
+fn diagnose_variant(
     node_id: &str,
-    declarations: &[StyleDeclaration],
+    variant: &RenderStyleVariant,
+    scope: &ComputedScope,
+    parent: &ComputedScope,
     diagnostics: &mut Vec<RenderDiagnostic>,
 ) {
-    for declaration in declarations {
-        let value = declaration.value.as_str().trim();
-        let normalized = value.to_ascii_lowercase();
-        if !supported_property(&declaration.property) {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message:
-                    "CSS property is preserved in the document but unsupported by the live GPUI renderer"
-                        .to_owned(),
-            });
-        } else if declaration.property == StyleProperty::BoxSizing
-            && !value.eq_ignore_ascii_case("border-box")
-        {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer supports only border-box sizing".to_owned(),
-            });
-        } else if declaration.property == StyleProperty::BorderStyle
-            && !matches!(normalized.as_str(), "none" | "hidden" | "solid" | "dashed")
-        {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer supports none, hidden, solid, and dashed borders"
-                    .to_owned(),
-            });
-        } else if let Some(grid) = GridProperty::of(&declaration.property)
-            && !grid.accepts(&normalized)
-        {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: grid.accepted().to_owned(),
-            });
-        } else if declaration.property == StyleProperty::Position
-            && !matches!(normalized.as_str(), "relative" | "absolute")
-        {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer supports relative and absolute positioning".to_owned(),
-            });
-        } else if declaration.property == StyleProperty::AlignSelf
-            && !matches!(
-                normalized.as_str(),
-                "auto"
-                    | "start"
-                    | "end"
-                    | "flex-start"
-                    | "flex-end"
-                    | "center"
-                    | "baseline"
-                    | "stretch"
-            )
-        {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer does not support this align-self value".to_owned(),
-            });
-        } else if declaration.property == StyleProperty::WhiteSpace
-            && !matches!(
-                normalized.as_str(),
-                "normal" | "nowrap" | "pre" | "pre-wrap" | "pre-line" | "break-spaces"
-            )
-        {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer does not support this white-space value".to_owned(),
-            });
-        } else if declaration.property == StyleProperty::TextOverflow && normalized != "ellipsis" {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer supports ellipsis text overflow".to_owned(),
-            });
-        } else if declaration.property == StyleProperty::TextAlign
-            && !matches!(
-                normalized.as_str(),
-                "left" | "start" | "center" | "right" | "end"
-            )
-        {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message:
-                    "live renderer supports left, start, center, right, and end text alignment"
-                        .to_owned(),
-            });
-        } else if declaration.property == StyleProperty::Cursor && !cursor_supported(&normalized) {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer does not support this cursor value".to_owned(),
-            });
-        } else if declaration.property == StyleProperty::Opacity && opacity(&normalized).is_none() {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer accepts opacity from 0 through 1".to_owned(),
-            });
-        } else if declaration.property == StyleProperty::BoxShadow
-            && box_shadows(&normalized).is_none()
-        {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer accepts non-inset pixel box shadows with CSS colors"
-                    .to_owned(),
-            });
-        } else if declaration.property == StyleProperty::LineHeight
-            && line_height(&normalized).is_none()
-        {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer accepts normal, unitless, percentage, zero, or pixel line heights"
-                    .to_owned(),
-            });
-        } else if declaration.property == StyleProperty::Outline
-            && !matches!(normalized.as_str(), "none" | "0")
-        {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer supports only disabling the native outline".to_owned(),
-            });
-        } else if responsive_length_property(&declaration.property) && length(&normalized).is_none()
-        {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer accepts auto, zero, pixel, rem, or percentage lengths for this property"
-                    .to_owned(),
-            });
-        } else if definite_length_property(&declaration.property)
-            && definite_length(&normalized).is_none()
-        {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer accepts zero, pixel, rem, or percentage lengths for this property"
-                    .to_owned(),
-            });
-        } else if pixel_length_property(&declaration.property) && length_px(&normalized).is_none() {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer currently accepts zero or pixel lengths for this property"
-                    .to_owned(),
-            });
-        } else if (declaration.property == StyleProperty::Padding
-            && box_values(&normalized, definite_length).is_none())
-            || (matches!(
-                declaration.property,
-                StyleProperty::Margin | StyleProperty::Inset
-            ) && box_values(&normalized, length).is_none())
-        {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer accepts one to four CSS box lengths".to_owned(),
-            });
-        } else if declaration.property == StyleProperty::Flex && flex_value(&normalized).is_none() {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: format!(
-                    "live renderer accepts none, auto, initial, a grow factor, or grow shrink basis; received `{value}`"
-                ),
-            });
-        } else if matches!(
-            declaration.property,
-            StyleProperty::FlexGrow | StyleProperty::FlexShrink
-        ) && flex_factor(&normalized).is_none()
-        {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer accepts finite, non-negative flex factors".to_owned(),
-            });
-        } else if matches!(
-            declaration.property,
-            StyleProperty::Overflow | StyleProperty::OverflowX | StyleProperty::OverflowY
-        ) && overflow(&normalized).is_none()
-        {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: "live renderer accepts visible, clip, hidden, auto, or scroll overflow"
-                    .to_owned(),
-            });
-        } else if border_shorthand_property(&declaration.property)
-            && border_value(&normalized).is_none()
-        {
-            diagnostics.push(RenderDiagnostic {
-                node_id: node_id.to_owned(),
-                feature: declaration.property.to_string(),
-                message: format!(
-                    "live renderer accepts none or a pixel width, solid/dashed style, and color; received `{value}`"
-                ),
-            });
-        }
+    if cascade::supported(variant) {
+        let declarations = variant.declarations.iter().collect::<Vec<_>>();
+        diagnose_declarations(node_id, &declarations, scope, parent, diagnostics);
+    } else {
+        diagnostics.push(RenderDiagnostic {
+            node_id: node_id.to_owned(),
+            feature: "conditional CSS".to_owned(),
+            message: format!(
+                "live renderer does not support style conditions {:?}",
+                variant.conditions
+            ),
+        });
     }
 }
 
-fn supported_property(property: &StyleProperty) -> bool {
-    GridProperty::of(property).is_some()
-        || matches!(
-            property,
-            StyleProperty::Display
-                | StyleProperty::FlexDirection
-                | StyleProperty::FlexWrap
-                | StyleProperty::Flex
-                | StyleProperty::FlexBasis
-                | StyleProperty::FlexGrow
-                | StyleProperty::FlexShrink
-                | StyleProperty::AlignItems
-                | StyleProperty::AlignSelf
-                | StyleProperty::JustifyContent
-                | StyleProperty::Position
-                | StyleProperty::Top
-                | StyleProperty::Right
-                | StyleProperty::Bottom
-                | StyleProperty::Left
-                | StyleProperty::Inset
-                | StyleProperty::Gap
-                | StyleProperty::Padding
-                | StyleProperty::PaddingTop
-                | StyleProperty::PaddingRight
-                | StyleProperty::PaddingBottom
-                | StyleProperty::PaddingLeft
-                | StyleProperty::Margin
-                | StyleProperty::MarginTop
-                | StyleProperty::MarginRight
-                | StyleProperty::MarginBottom
-                | StyleProperty::MarginLeft
-                | StyleProperty::Width
-                | StyleProperty::Height
-                | StyleProperty::MinWidth
-                | StyleProperty::MinHeight
-                | StyleProperty::MaxWidth
-                | StyleProperty::MaxHeight
-                | StyleProperty::Overflow
-                | StyleProperty::OverflowX
-                | StyleProperty::OverflowY
-                | StyleProperty::Background
-                | StyleProperty::BackgroundColor
-                | StyleProperty::BoxSizing
-                | StyleProperty::Color
-                | StyleProperty::FontFamily
-                | StyleProperty::FontSize
-                | StyleProperty::FontWeight
-                | StyleProperty::LineHeight
-                | StyleProperty::WhiteSpace
-                | StyleProperty::TextAlign
-                | StyleProperty::TextOverflow
-                | StyleProperty::Cursor
-                | StyleProperty::Opacity
-                | StyleProperty::BoxShadow
-                | StyleProperty::BorderWidth
-                | StyleProperty::BorderStyle
-                | StyleProperty::BorderColor
-                | StyleProperty::Border
-                | StyleProperty::BorderTop
-                | StyleProperty::BorderRight
-                | StyleProperty::BorderBottom
-                | StyleProperty::BorderLeft
-                | StyleProperty::BorderRadius
-                | StyleProperty::Outline
-        )
-}
-
-fn responsive_length_property(property: &StyleProperty) -> bool {
-    matches!(
-        property,
-        StyleProperty::MarginTop
-            | StyleProperty::MarginRight
-            | StyleProperty::MarginBottom
-            | StyleProperty::MarginLeft
-            | StyleProperty::Top
-            | StyleProperty::Right
-            | StyleProperty::Bottom
-            | StyleProperty::Left
-            | StyleProperty::Width
-            | StyleProperty::Height
-            | StyleProperty::MinWidth
-            | StyleProperty::MinHeight
-            | StyleProperty::MaxWidth
-            | StyleProperty::MaxHeight
-            | StyleProperty::FlexBasis
-    )
-}
-
-fn definite_length_property(property: &StyleProperty) -> bool {
-    matches!(
-        property,
-        StyleProperty::Gap
-            | StyleProperty::PaddingTop
-            | StyleProperty::PaddingRight
-            | StyleProperty::PaddingBottom
-            | StyleProperty::PaddingLeft
-    )
-}
-
-fn pixel_length_property(property: &StyleProperty) -> bool {
-    matches!(
-        property,
-        StyleProperty::FontSize | StyleProperty::BorderWidth | StyleProperty::BorderRadius
-    )
-}
-
-fn border_shorthand_property(property: &StyleProperty) -> bool {
-    matches!(
-        property,
-        StyleProperty::Border
-            | StyleProperty::BorderTop
-            | StyleProperty::BorderRight
-            | StyleProperty::BorderBottom
-            | StyleProperty::BorderLeft
-    )
+fn diagnose_declarations(
+    node_id: &str,
+    declarations: &[&StyleDeclaration],
+    scope: &ComputedScope,
+    parent: &ComputedScope,
+    diagnostics: &mut Vec<RenderDiagnostic>,
+) {
+    let mut push = |feature: &str, message: String| {
+        let diagnostic = RenderDiagnostic {
+            node_id: node_id.to_owned(),
+            feature: feature.to_owned(),
+            message,
+        };
+        if !diagnostics.contains(&diagnostic) {
+            diagnostics.push(diagnostic);
+        }
+    };
+    let resolved = declarations
+        .iter()
+        .filter(|declaration| !handled_outside_style(declaration.property.as_str()))
+        .filter_map(|declaration| scope.resolve(declaration))
+        .collect::<Vec<_>>();
+    let style = ComputedStyle::compute(
+        resolved.iter().map(std::borrow::Cow::as_ref),
+        &scope.style_context(parent),
+        |declaration, reason| {
+            let property = declaration.property.as_str();
+            let value = declaration.value.as_str().trim();
+            if property == "outline" && matches!(value, "none" | "0") {
+                return;
+            }
+            let message = match reason {
+                Unsupported::Property => {
+                    format!("live renderer does not support the {property} property")
+                }
+                Unsupported::Invalid => format!("invalid {property} value {value:?}"),
+                Unsupported::Value(reason) => reason.to_owned(),
+            };
+            push(property, message);
+        },
+    );
+    for (property, reason) in gpui_style::limits(&style) {
+        push(property, reason.to_owned());
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::rc::Rc;
 
-    use gpui::{Role as AccessibleRole, px};
+    use gpui::Role as AccessibleRole;
     use gpui_mcp::Automation;
-    use htmlswap::{RenderNode, StyleDeclaration, StyleProperty};
+    use htmlswap::computed::{ComputedScope, MediaEnvironment};
+    use htmlswap::{RenderNode, StyleDeclaration};
 
     use crate::{
         Binding, BindingDocument, BindingTarget, ElementId, HandlerId, HookRegistry, HtmlUi,
@@ -3900,10 +2309,8 @@ mod tests {
     };
 
     use super::{
-        BorderStyle, MediaViewport, ReloadError, SemanticNamespace, accessible_label, aria_role,
-        border_value, box_shadows, box_values, collect_declaration_diagnostics, color,
-        cursor_supported, definite_length, effective_border_style, flex_value, font_family, length,
-        line_height, media_query_matches, opacity, overflow, update_hovered_element,
+        ReloadError, SemanticNamespace, accessible_label, aria_role, diagnose_declarations,
+        update_hovered_element,
     };
 
     #[test]
@@ -3990,198 +2397,105 @@ mod tests {
         assert!(SemanticNamespace::new("x".repeat(65)).is_err());
     }
 
-    #[test]
-    fn borders_default_to_none_and_accept_supported_styles() {
-        let width = StyleDeclaration::new(StyleProperty::BorderWidth, "1px", false, None);
-        let solid = StyleDeclaration::new(StyleProperty::BorderStyle, "solid", false, None);
-        let dashed = StyleDeclaration::new(StyleProperty::BorderStyle, "dashed", false, None);
-        let hidden = StyleDeclaration::new(StyleProperty::BorderStyle, "hidden", false, None);
-
-        assert_eq!(effective_border_style(&[&width]), BorderStyle::None);
-        assert_eq!(
-            effective_border_style(&[&width, &solid]),
-            BorderStyle::Solid
-        );
-        assert_eq!(
-            effective_border_style(&[&width, &dashed]),
-            BorderStyle::Dashed
-        );
-        assert_eq!(
-            effective_border_style(&[&width, &solid, &hidden]),
-            BorderStyle::None
-        );
-    }
-
-    #[test]
-    fn explicit_font_family_preserves_case() {
-        let available = HashSet::from(["segoe ui".to_owned(), ".systemuifont".to_owned()]);
-        assert_eq!(
-            font_family("'Segoe UI', sans-serif", &available),
-            Some(super::FontFamily {
-                primary: "Segoe UI".to_owned(),
-                fallbacks: vec![".SystemUIFont".to_owned()],
-            })
-        );
-        assert_eq!(
-            font_family("SYSTEM-UI", &available),
-            Some(super::FontFamily {
-                primary: ".SystemUIFont".to_owned(),
-                fallbacks: Vec::new(),
-            })
-        );
-        assert_eq!(
-            font_family("'Missing Font', sans-serif", &available),
-            Some(super::FontFamily {
-                primary: ".SystemUIFont".to_owned(),
-                fallbacks: Vec::new(),
-            })
-        );
+    fn diagnose(declarations: &[(&str, &str)]) -> Vec<super::RenderDiagnostic> {
+        let declarations = declarations
+            .iter()
+            .map(|(property, value)| StyleDeclaration::new(*property, *value, false, None))
+            .collect::<Vec<_>>();
+        let declarations = declarations.iter().collect::<Vec<_>>();
+        let root = ComputedScope::root(&MediaEnvironment::default());
+        let scope = root.child(declarations.iter().copied());
+        let mut diagnostics = Vec::new();
+        diagnose_declarations("test", &declarations, &scope, &root, &mut diagnostics);
+        diagnostics
     }
 
     #[test]
     fn grid_css_is_supported_and_invalid_values_are_diagnosed() {
-        let unknown = |name: &str| StyleProperty::Unknown(name.into());
-        let supported = [
-            (
-                StyleProperty::GridTemplateColumns,
-                "240px repeat(2, minmax(0, 1fr))",
-            ),
-            (unknown("grid-template-rows"), "auto 1fr fit-content(120px)"),
-            (unknown("grid-auto-rows"), "minmax(32px, auto)"),
-            (unknown("grid-auto-flow"), "row dense"),
-            (unknown("grid-row"), "2 / span 2"),
-            (unknown("grid-column-start"), "-1"),
-            (unknown("row-gap"), "8px"),
-            (unknown("column-gap"), "12px"),
-        ]
-        .into_iter()
-        .map(|(property, value)| StyleDeclaration::new(property, value, false, None))
-        .collect::<Vec<_>>();
-        let mut diagnostics = Vec::new();
-        collect_declaration_diagnostics("grid", &supported, &mut diagnostics);
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let supported = diagnose(&[
+            ("grid-template-columns", "240px repeat(2, minmax(0, 1fr))"),
+            ("grid-template-rows", "auto 1fr fit-content(120px)"),
+            ("grid-auto-rows", "minmax(32px, auto)"),
+            ("grid-auto-flow", "row dense"),
+            ("grid-row", "2 / span 2"),
+            ("grid-column-start", "-1"),
+            ("row-gap", "8px"),
+            ("column-gap", "12px"),
+        ]);
+        assert!(supported.is_empty(), "{supported:#?}");
 
-        let rejected = [
-            StyleDeclaration::new(StyleProperty::GridTemplateColumns, "[a] 1fr", false, None),
-            StyleDeclaration::new(StyleProperty::GridColumn, "0 / span 2", false, None),
-            StyleDeclaration::new(unknown("grid-auto-flow"), "diagonal", false, None),
-        ];
-        collect_declaration_diagnostics("grid", &rejected, &mut diagnostics);
-        assert_eq!(diagnostics.len(), 3, "{diagnostics:#?}");
-        assert!(diagnostics[0].message.contains("track lists"));
+        let rejected = diagnose(&[
+            ("grid-column", "0 / span 2"),
+            ("grid-auto-flow", "diagonal"),
+        ]);
+        assert_eq!(rejected.len(), 2, "{rejected:#?}");
     }
 
     #[test]
     fn responsive_layout_css_is_a_supported_live_renderer_contract() {
-        let declarations = [
-            (StyleProperty::Width, "100%"),
-            (StyleProperty::Height, "100%"),
-            (StyleProperty::MinWidth, "0"),
-            (StyleProperty::Flex, "1 1 0%"),
-            (StyleProperty::FlexGrow, "1"),
-            (StyleProperty::FlexShrink, "0"),
-            (StyleProperty::FlexBasis, "240px"),
-            (StyleProperty::Overflow, "hidden"),
-            (StyleProperty::Padding, "10px 14px"),
-            (StyleProperty::Margin, "0 auto"),
-            (StyleProperty::BorderBottom, "1px solid #393b31"),
-            (StyleProperty::Position, "absolute"),
-            (StyleProperty::Inset, "0 12px"),
-            (StyleProperty::AlignSelf, "center"),
-            (StyleProperty::GridColumn, "1 / span 2"),
-            (StyleProperty::WhiteSpace, "nowrap"),
-            (StyleProperty::TextAlign, "center"),
-            (StyleProperty::TextOverflow, "ellipsis"),
-            (StyleProperty::Cursor, "pointer"),
-            (StyleProperty::Opacity, "0.76"),
-            (StyleProperty::BoxShadow, "0 30px 80px rgba(0, 0, 0, 0.6)"),
-            (StyleProperty::LineHeight, "1.6"),
-        ]
-        .into_iter()
-        .map(|(property, value)| StyleDeclaration::new(property, value, false, None))
-        .collect::<Vec<_>>();
-        let mut diagnostics = Vec::new();
-
-        collect_declaration_diagnostics("responsive-shell", &declarations, &mut diagnostics);
+        let diagnostics = diagnose(&[
+            ("box-sizing", "border-box"),
+            ("width", "100%"),
+            ("height", "100%"),
+            ("min-width", "0"),
+            ("max-width", "80vw"),
+            ("flex", "1 1 0%"),
+            ("flex-grow", "1"),
+            ("flex-shrink", "0"),
+            ("flex-basis", "240px"),
+            ("overflow", "hidden"),
+            ("padding", "10px 14px"),
+            ("margin", "0 auto"),
+            ("border-bottom", "1px solid #393b31"),
+            ("position", "absolute"),
+            ("inset", "0 12px"),
+            ("align-self", "center"),
+            ("grid-column", "1 / span 2"),
+            ("white-space", "nowrap"),
+            ("text-align", "center"),
+            ("text-overflow", "ellipsis"),
+            ("cursor", "pointer"),
+            ("opacity", "0.76"),
+            ("box-shadow", "0 30px 80px rgba(0, 0, 0, 0.6)"),
+            ("line-height", "1.6"),
+            ("color", "light-dark(#111, #eee)"),
+            ("outline", "none"),
+        ]);
 
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
     }
 
     #[test]
-    fn responsive_value_parsers_reject_invalid_or_ambiguous_values() {
-        assert!(length("100%").is_some());
-        assert!(length("auto").is_some());
-        assert!(length("12vw").is_none());
-        assert!(box_values("1px 2px 3px 4px", definite_length).is_some());
-        assert!(box_values("1px 2px 3px 4px 5px", definite_length).is_none());
-        assert!(flex_value("1 1 0%").is_some());
-        assert!(flex_value("0 250px").is_some());
-        assert!(flex_value("0 auto").is_some());
-        assert!(flex_value("1 0").is_some());
-        assert!(flex_value("grow please").is_none());
-        assert!(overflow("hidden").is_some());
-        assert_eq!(overflow("auto"), Some(gpui::Overflow::Scroll));
-        assert!(border_value("1px solid #393b31").is_some());
-        assert!(border_value("0 solid #0000").is_some());
-        assert!(border_value("wavy 1px red").is_none());
-        assert!(cursor_supported("crosshair"));
-        assert!(!cursor_supported("magic"));
-        assert_eq!(opacity("0.5"), Some(0.5));
-        assert_eq!(opacity("2"), None);
-        assert_eq!(definite_length("2px"), Some(px(2.).into()));
-        assert_eq!(line_height("1.6"), Some(super::LineHeight::Relative(1.6)));
-        assert_eq!(line_height("150%"), Some(super::LineHeight::Relative(1.5)));
-        assert_eq!(line_height("18px"), Some(super::LineHeight::Pixels(18.)));
-        assert_eq!(line_height("normal"), Some(super::LineHeight::Normal));
-        assert_eq!(line_height("-1"), None);
-        assert_eq!(color("rgba(0, 0, 0, 0.6)"), Some(0x0000_0099));
-        assert_eq!(
-            box_shadows("0 30px 80px rgba(0, 0, 0, 0.6)").map(|value| value.len()),
-            Some(1)
-        );
-        assert!(box_shadows("inset 0 1px black").is_none());
-    }
-
-    #[test]
-    fn desktop_media_queries_follow_the_live_gpui_viewport() {
-        let wide = MediaViewport::new(1280.0, 900.0);
-        let compact = MediaViewport::new(900.0, 650.0);
+    fn invalid_and_undrawable_values_are_diagnosed_once_each() {
+        let diagnostics = diagnose(&[
+            ("flex", "grow please"),
+            ("border", "wavy 1px red"),
+            ("cursor", "magic"),
+            ("position", "sticky"),
+            ("width", "calc(50% + 10px)"),
+            ("border-style", "double"),
+            ("letter-spacing", "1px"),
+            ("height", "50%"),
+            ("padding-top", "4px"),
+        ]);
+        let properties = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.feature.as_str())
+            .collect::<Vec<_>>();
 
         assert_eq!(
-            media_query_matches("(max-width: 1120px)", wide),
-            Some(false)
-        );
-        assert_eq!(
-            media_query_matches("(max-width: 1120px)", compact),
-            Some(true)
-        );
-        assert_eq!(
-            media_query_matches("(width <= 1120px)", compact),
-            Some(true)
-        );
-        assert_eq!(
-            media_query_matches("screen and (max-height: 720px)", compact),
-            Some(true)
-        );
-        assert_eq!(
-            media_query_matches("(min-width: 60rem) and (orientation: landscape)", wide),
-            Some(true)
-        );
-        assert_eq!(
-            media_query_matches("(prefers-reduced-motion: reduce)", wide),
-            Some(false)
-        );
-        let reduced = MediaViewport {
-            reduce_motion: true,
-            ..wide
-        };
-        assert_eq!(
-            media_query_matches("(prefers-reduced-motion: reduce)", reduced),
-            Some(true)
-        );
-        assert_eq!(
-            media_query_matches("(prefers-reduced-motion: no-preference)", reduced),
-            Some(false)
+            properties,
+            [
+                "flex",
+                "border",
+                "cursor",
+                "position",
+                "width",
+                "height",
+                "border-style",
+                "letter-spacing"
+            ],
+            "{diagnostics:#?}"
         );
     }
 

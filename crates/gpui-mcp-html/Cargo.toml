@@ -14,7 +14,16 @@ default = ["zed", "json", "ron"]
 # (GPUI Kit). Select exactly one, as for gpui-mcp itself.
 runtime = ["dep:gpui-mcp", "dep:htmlswap"]
 zed = ["runtime", "dep:gpui", "gpui-mcp/zed"]
-gpui-pre = ["runtime", "dep:gpui_pre", "gpui-mcp/gpui-pre"]
+# GPUI Kit's backend. CSS transitions and @keyframes run on GPUI Kit's motion
+# runtime (`gpui_base::motion`), which generated GPUI Kit code uses too. On
+# `zed`, animated properties take their end values at once.
+gpui-pre = [
+    "runtime",
+    "dep:gpui_pre",
+    "dep:gpui-base",
+    "dep:gpui-view-transitions",
+    "gpui-mcp/gpui-pre",
+]
 # GPUI test contexts for this crate's tests and for apps testing rendered HTML.
 test-support = ["gpui?/test-support", "gpui_pre?/test-support", "gpui-mcp/test-support"]
 dev-watch = ["runtime", "dep:notify", "ron"]
@@ -38,6 +47,8 @@ gpui_pre = { workspace = true, optional = true }
 gpui_platform = { workspace = true, optional = true }
 gpui-mcp = { path = "../gpui-mcp", default-features = false, optional = true }
 gpui-mcp-capture = { path = "../gpui-mcp-capture", optional = true }
+gpui-base = { workspace = true, optional = true }
+gpui-view-transitions = { path = "../gpui-view-transitions", optional = true }
 htmlswap = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }
