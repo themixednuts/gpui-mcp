@@ -1,0 +1,49 @@
+diff --git a/src/text_system.rs b/src/text_system.rs
+index cf6bb10..a0a96a3 100644
+--- a/src/text_system.rs
++++ b/src/text_system.rs
+@@ -372,7 +372,8 @@ impl TextSystem {
+             return font_id;
+         }
+         for fallback in &self.fallback_font_stack {
+-            if let Ok(font_id) = self.font_id(fallback) {
++            let fallback = fallback_with_requested_traits(fallback, font);
++            if let Ok(font_id) = self.font_id(&fallback) {
+                 return font_id;
+             }
+         }
+@@ -597,6 +598,34 @@ impl TextSystem {
+     }
+ }
+ 
++fn fallback_with_requested_traits(fallback: &Font, requested: &Font) -> Font {
++    Font {
++        family: fallback.family.clone(),
++        features: requested.features.clone(),
++        fallbacks: fallback.fallbacks.clone(),
++        weight: requested.weight,
++        style: requested.style,
++    }
++}
++
++#[cfg(test)]
++mod fallback_tests {
++    use super::{FontStyle, FontWeight, fallback_with_requested_traits, font};
++
++    #[test]
++    fn fallback_replaces_only_the_unavailable_family() {
++        let fallback = font("Available Sans");
++        let requested = font("Unavailable Sans").bold().italic();
++
++        let resolved = fallback_with_requested_traits(&fallback, &requested);
++
++        assert_eq!(resolved.family.as_ref(), "Available Sans");
++        assert_eq!(resolved.weight, FontWeight::BOLD);
++        assert_eq!(resolved.style, FontStyle::Italic);
++        assert_eq!(resolved.features, requested.features);
++    }
++}
++
+ /// The GPUI text layout subsystem.
+ #[derive(Deref)]
+ pub struct WindowTextSystem {

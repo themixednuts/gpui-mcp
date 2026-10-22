@@ -196,19 +196,19 @@ Besides Zed's own GPUI, the bridge works with two GPUI releases on crates.io:
 
 | GPUI crate | Used by | Supported versions | Bridge feature |
 | --- | --- | --- | --- |
-| `gpui-pre` | GPUI Kit, `gpui-component` | 0.3.5, 0.3.6, 0.3.7 | `gpui-pre` |
+| `gpui-pre` | GPUI Kit, `gpui-component` | 0.3.5, 0.3.6, 0.3.7, 0.3.8, 0.3.9 | `gpui-pre` |
 | `gpui-ce` | The community fork and apps built on it | 0.2.2 | `gpui-ce` |
 
 Each needs a small set of GPUI patches, which this repository provides. The
 recipes below pull in a patched copy from here.
 
-### GPUI Kit 0.7.0 (`gpui-pre` 0.3.7)
+### GPUI Kit 0.8.0 (`gpui-pre` 0.3.9)
 
 Add this to your workspace's `Cargo.toml`:
 
 ```toml
 [dependencies]
-gpui-kit = "=0.7.0"
+gpui-kit = "=0.8.0"
 gpui-mcp = { git = "https://github.com/themixednuts/gpui-mcp", branch = "main", default-features = false, features = ["gpui-pre"] }
 
 [patch.crates-io]
@@ -290,7 +290,7 @@ patches are kept working.
   `default-features = false, features = ["gpui-pre", "json", "ron"]`. Its CSS
   transitions and animations run on GPUI Kit's `gpui_base::motion`, which it
   resolves to the Kit release matching your gpui-pre (0.6.4+ for 0.3.5 and
-  0.3.6, 0.7 for 0.3.7). Its
+  0.3.6, 0.7 for 0.3.7 and 0.3.8, 0.8 for 0.3.9). Its
   `grid-template-*` support needs the `grid.patch` described below, which the
   `[patch]` recipe already includes.
 

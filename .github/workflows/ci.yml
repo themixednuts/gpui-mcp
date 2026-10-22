@@ -169,12 +169,16 @@ jobs:
             version: 0.3.5
           - crate: gpui-pre
             version: 0.3.6
+          - crate: gpui-pre
+            version: 0.3.7
+          - crate: gpui-pre
+            version: 0.3.8
           # The optional patches must stay independent of the automation patch.
           - crate: gpui-pre
-            version: 0.3.7
+            version: 0.3.9
             without: font-fallback
           - crate: gpui-pre
-            version: 0.3.7
+            version: 0.3.9
             without: grid
           - crate: gpui-ce
             version: 0.2.2
@@ -213,8 +217,9 @@ jobs:
 
       # The committed lockfile resolves the newest releases. For an older
       # gpui-pre, move GPUI Kit's base layer to the oldest release the
-      # workspace accepts (it accepts every gpui-pre the bridge does), then
-      # select the patched release.
+      # workspace accepts (it accepts every gpui-pre the bridge does), select
+      # the patched release, then move the base layer to the newest release
+      # that accepts it, as an app's resolver would.
       - name: Resolve the patched release
         if: matrix.crate == 'gpui-pre'
         env:
@@ -225,6 +230,7 @@ jobs:
           patch="patch.crates-io.$CRATE.path='$RUNNER_TEMP/$CRATE'"
           cargo update -p gpui-base --precise "$base" --config "$patch"
           cargo update -p "$CRATE" --precise "$VERSION" --config "$patch"
+          cargo update -p gpui-base --config "$patch"
 
       # The committed lockfile names the vendored release, so these steps
       # resolve the patched release instead of using --locked.

@@ -7,7 +7,7 @@ GPUI ships an equivalent.
 | Directory | What it is | Used by |
 | --- | --- | --- |
 | `gpui/` | GPUI 0.2.2 from Zed commit `16c9aa7ea6d897a8044d9501cde1b295256722f2` | The `zed` backend |
-| `gpui-pre/` | The crates.io `gpui-pre` 0.3.7 release (Zed commit `1a28cff4b409169bac058bca40dfbfeb7621d19b`), as used by GPUI Kit 0.7.0 | The `gpui-pre` backend |
+| `gpui-pre/` | The crates.io `gpui-pre` 0.3.9 release (Zed commit `93d745668805029476e6d7fbb19652116fed51de`), as used by GPUI Kit 0.8.0 | The `gpui-pre` backend |
 | `gpui-ce/` | The crates.io `gpui-ce` 0.2.2 release, the community fork of GPUI | The `gpui-ce` backend |
 | `patches/<crate>/<version>/` | The patches for each supported `gpui-pre` and `gpui-ce` version | `gpui-pre/`, `gpui-ce/` and downstream apps |
 
@@ -38,7 +38,7 @@ source files use LF line endings, and the published `Cargo.lock` is removed.
 
 | Crate | Versions | Vendored here |
 | --- | --- | --- |
-| `gpui-pre` | 0.3.5, 0.3.6, 0.3.7 | 0.3.7 |
+| `gpui-pre` | 0.3.5, 0.3.6, 0.3.7, 0.3.8, 0.3.9 | 0.3.9 |
 | `gpui-ce` | 0.2.2 | 0.2.2 |
 
 Each version has its own folder in `patches/<crate>/<version>/` with three
@@ -102,9 +102,9 @@ workspace `Cargo.toml` doesn't match its `.json` file.
 - Both vendored copies match the published crate plus their patches.
 - The bridge builds, passes its tests and passes Clippy on every OS against
   both vendored copies.
-- On Linux it does the same against patched `gpui-pre` 0.3.5 and 0.3.6,
-  against `gpui-pre` 0.3.7 and `gpui-ce` 0.2.2 without the font patch, and
-  against `gpui-pre` 0.3.7 without the grid patch.
+- On Linux it does the same against patched `gpui-pre` 0.3.5 to 0.3.8,
+  against `gpui-pre` 0.3.9 and `gpui-ce` 0.2.2 without the font patch, and
+  against `gpui-pre` 0.3.9 without the grid patch.
 - `gpui-mcp-html` builds, passes its tests and passes Clippy against the
   vendored `gpui-pre` as well as the Zed tree.
 - The Kit demo builds and passes its tests.

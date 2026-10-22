@@ -1,5 +1,5 @@
 {
-  "vendored": "0.3.7",
+  "vendored": "0.3.9",
   "versions": {
     "0.3.5": {
       "sha256": "2a9ca98fdcad06276de623c2f48ebd710f1e7724eebef2f2673c583e85dc8335",
@@ -12,6 +12,14 @@
     "0.3.7": {
       "sha256": "0e87a42bb37c7cb4e76dd1ac0ce88851e46e976e0373a47ab3e0757abffee54d",
       "zed_rev": "1a28cff4b409169bac058bca40dfbfeb7621d19b"
+    },
+    "0.3.8": {
+      "sha256": "d7f0bc3ebba070f8981b3f8e905a12f47d27794a30d029e59cdb9edf7a4b3360",
+      "zed_rev": "279fe070bb389b79652e52065b2f001edcc0b11b"
+    },
+    "0.3.9": {
+      "sha256": "34f61c1cfd36fc9c436af09308c963822ae27a45a84feb21a77ba5c9e051f1c0",
+      "zed_rev": "93d745668805029476e6d7fbb19652116fed51de"
     }
   }
 }

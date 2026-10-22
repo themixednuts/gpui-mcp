@@ -18,7 +18,7 @@ use serde_json::Value;
 
 #[derive(Clone, Copy, ValueEnum)]
 pub(crate) enum Backend {
-    /// GPUI Kit 0.7.0 on gpui-pre 0.3.7.
+    /// GPUI Kit 0.8.0 on gpui-pre 0.3.9.
     #[value(name = "gpui-kit")]
     GpuiKit,
     /// gpui-ce 0.2.2 with `gpui_ce_platform`.
@@ -50,9 +50,9 @@ impl Backend {
     fn recipe(self) -> Recipe {
         match self {
             Self::GpuiKit => Recipe {
-                dependencies: "gpui-kit = \"=0.7.0\"",
+                dependencies: "gpui-kit = \"=0.8.0\"",
                 feature: "gpui-pre",
-                gpui: ("gpui-pre", "0.3.7"),
+                gpui: ("gpui-pre", "0.3.9"),
                 types: "gpui_kit",
                 owners: &[
                     "gpui-base",

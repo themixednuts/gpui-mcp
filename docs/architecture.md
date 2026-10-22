@@ -76,7 +76,7 @@ one owner; the others call it rather than re-implementing it.
    follow the CSS specifications; state pseudo-classes apply to the element
    they are written on (`.card:hover .title` lowers to a GPUI group hover).
 5. **Version ranges, not pins.** Dependencies accept every release they work
-   with (`gpui-pre >=0.3.5, <=0.3.7`, `gpui-base >=0.6.4, <0.8`), and CI tests
+   with (`gpui-pre >=0.3.5, <=0.3.9`, `gpui-base >=0.6.4, <0.9`), and CI tests
    each supported release. A pin is only for a vendored tree or an upstream
    that pins itself.
 
@@ -90,7 +90,7 @@ one owner; the others call it rather than re-implementing it.
 | `LiveHtml` had its own transition and animation engine | `gpui_base::motion` on the `gpui-pre` backend; end states on Zed | Done |
 | htmlswap attached dynamic pseudo-classes to the subject element | State attached to the element written on (`ElementState { ancestor }`) | Done |
 | View-transition elements inside `LiveHtml` | `gpui-view-transitions` crate on `gpui_base::motion`; `LiveHtml` keeps only CSS-to-style mapping and inert drawing of the old document | Done |
-| `gpui-mcp-html` pinned one GPUI Kit release | `gpui-base >=0.6.4, <0.8`: a Kit release for every gpui-pre the bridge supports (0.3.5–0.3.7), each tested in CI | Done |
+| `gpui-mcp-html` pinned one GPUI Kit release | `gpui-base >=0.6.4, <0.9`: a Kit release for every gpui-pre the bridge supports (0.3.5–0.3.9), each tested in CI | Done |
 | htmlswap code generators target `gpui` 0.2.2 and `gpui-component` 0.5.1 | `GpuiTarget::Kit` (`--gpui-kit`): `gpui-pre` 0.3 and `gpui-component` 0.7, styles from the shared plan, `:hover` transitions on `gpui_base::motion` | Done |
 | Generated GPUI Kit code animates `@keyframes` and view transitions | `gpui_base::motion::animate_keyframes`; view transitions need the app to provide its outgoing state | Next |
 | gpui-studio on Zed `gpui` 0.2.2, themes via generated CSS strings | GPUI Kit on gpui-pre; themes as CSS custom properties | Planned |
