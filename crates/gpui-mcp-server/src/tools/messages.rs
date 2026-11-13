@@ -128,11 +128,7 @@ impl GpuiMcp {
         Parameters(args): Parameters<SendMessageArgs>,
     ) -> Result<Json<Value>, String> {
         let client = self.client().await?;
-        if !client
-            .descriptor()
-            .capabilities
-            .supports(Capability::Messages)
-        {
+        if !client.capabilities().supports(Capability::Messages) {
             return Err(
                 "the selected application does not read messages (it has not registered BridgeHandle::on_message)"
                     .to_owned(),

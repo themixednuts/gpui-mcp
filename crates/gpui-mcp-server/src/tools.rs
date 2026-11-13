@@ -871,10 +871,7 @@ impl ServerHandler for GpuiMcp {
     ) -> Result<ListResourcesResult, ErrorData> {
         let mut resources = vec![apps_resource(), messages_resource()];
         if let Ok(client) = self.registry.client().await
-            && client
-                .descriptor()
-                .capabilities
-                .supports(Capability::ContextResources)
+            && client.capabilities().supports(Capability::ContextResources)
         {
             match client.call(Operation::ListContextResources).await {
                 Ok(BridgeResult::ContextResources(context_resources)) => {
