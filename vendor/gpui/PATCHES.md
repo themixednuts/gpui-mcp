@@ -1,12 +1,15 @@
 # GPUI patch inventory
 
 This directory tracks Zed GPUI at commit
-`16c9aa7ea6d897a8044d9501cde1b295256722f2` (`gpui` 0.2.2).
+`27bbbc1cc480a7500cec122f120e796d1fb8500c` (`gpui` 0.2.2), Zed `main` on
+2026-11-12. That is the first refresh whose `gpui_wgpu` uses wgpu 30.
 
 gpui-mcp carries ten focused changes that are not available from upstream
-GPUI yet. The first six were last checked against `zed-industries/zed` `main`
-on 2026-09-22, at the commit named above; the next three were written against
-the same commit on 2026-09-23, and the last on 2026-10-02:
+GPUI yet. The first six were written against Zed commit
+`16c9aa7ea6d897a8044d9501cde1b295256722f2` on 2026-09-22, the next three
+against the same commit on 2026-09-23, and the last on 2026-10-02. On
+2026-11-12 all ten were rebased onto the commit named above and were still
+unmerged upstream that day:
 
 - read-only observation of each completed rendered AccessKit tree, with stable
   GPUI element paths, frame-unique node identities, bounds, text provenance,
@@ -105,4 +108,20 @@ available. The rest of this directory is an unmodified snapshot of that Zed
 commit, except that `Cargo.toml` has Zed workspace inheritance unwound (and
 `[dev-dependencies]` dropped) so the crate can build outside the Zed workspace,
 and two blank doc comments in `_accessibility.rs` have trailing spaces removed.
-The manifest rewrite carries no behavior change.
+The manifest rewrite carries no behavior change. Its `windows` dependency
+keeps GPUI's own feature list rather than the Zed workspace's, plus
+`Win32_Foundation` and `Win32_System_Threading`, which GPUI's source uses and
+Zed's workspace supplies.
+
+Rebasing onto Zed `27bbbc1` changed three patches where upstream had moved
+the code they touch:
+
+- Font resolution now caches each font and its fallback. The fallback that
+  keeps the requested weight, style and features is applied in
+  `resolve_font_uncached`, and upstream's `caches_resolved_font_fallbacks`
+  test looks fallbacks up with those traits.
+- A view's cache key gained the element opacity upstream. `view_cache_miss`
+  compares it by bits, as upstream does, and reports a change as
+  `ViewRenderCause::LayoutChanged`.
+- `Window::bounds_changed` keeps upstream's window-bounds bookkeeping and
+  moves the pointer through the patched pointer owner.

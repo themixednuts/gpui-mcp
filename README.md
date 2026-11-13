@@ -25,7 +25,7 @@ Add the bridge and its GPUI build to your app:
 ```toml
 [dependencies]
 gpui = "=0.2.2"
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "16c9aa7ea6d897a8044d9501cde1b295256722f2", features = ["font-kit", "wayland", "x11"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "27bbbc1cc480a7500cec122f120e796d1fb8500c", features = ["font-kit", "wayland", "x11"] }
 gpui-mcp = { git = "https://github.com/themixednuts/gpui-mcp", branch = "main" }
 
 [patch.crates-io]

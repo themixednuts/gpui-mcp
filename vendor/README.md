@@ -6,7 +6,7 @@ GPUI ships an equivalent.
 
 | Directory | What it is | Used by |
 | --- | --- | --- |
-| `gpui/` | GPUI 0.2.2 from Zed commit `16c9aa7ea6d897a8044d9501cde1b295256722f2` | The `zed` backend |
+| `gpui/` | GPUI 0.2.2 from Zed commit `27bbbc1cc480a7500cec122f120e796d1fb8500c` | The `zed` backend |
 | `gpui-pre/` | The crates.io `gpui-pre` 0.3.7 release (Zed commit `1a28cff4b409169bac058bca40dfbfeb7621d19b`), as used by GPUI Kit 0.7.0 | The `gpui-pre` backend |
 | `gpui-ce/` | The crates.io `gpui-ce` 0.2.2 release, the community fork of GPUI | The `gpui-ce` backend |
 | `patches/<crate>/<version>/` | The patches for each supported `gpui-pre` and `gpui-ce` version | `gpui-pre/`, `gpui-ce/` and downstream apps |
@@ -15,9 +15,11 @@ Each copy keeps its Apache-2.0 license in `LICENSE-APACHE`.
 
 ## `gpui/`
 
-The changes are listed in [`gpui/PATCHES.md`](gpui/PATCHES.md). The ones
-present on 2026-09-22 were still unmerged upstream that day. The frame-cost
-changes added on 2026-09-23 were written against the same commit.
+The changes are listed in [`gpui/PATCHES.md`](gpui/PATCHES.md). They were
+rebased onto Zed `main` on 2026-11-12 and were still unmerged upstream that
+day. The Zed crates the `zed` backend builds against (`gpui_platform`,
+`gpui_wgpu` and the rest) come from the same commit, which puts the renderer on
+wgpu 30.
 
 ## `gpui-pre/` and `gpui-ce/`
 
