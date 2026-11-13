@@ -1,0 +1,60 @@
+[package]
+name = "gpui_wgpu"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(rust_analyzer)"] }
+
+[lib]
+path = "src/gpui_wgpu.rs"
+doctest = false
+
+[features]
+default = []
+bench-support = ["gpui/bench-support", "dep:image"]
+font-kit = ["dep:font-kit"]
+test-support = ["gpui/test-support", "dep:image"]
+
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "27bbbc1cc480a7500cec122f120e796d1fb8500c", default-features = false }
+anyhow = "1.0.86"
+bytemuck = "1"
+collections = { git = "https://github.com/zed-industries/zed", rev = "27bbbc1cc480a7500cec122f120e796d1fb8500c", version = "0.1.0" }
+cosmic-text = "0.19.0"
+etagere = "0.2"
+itertools = "0.14.0"
+image = { version = "0.25.1", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "rayon", "tga", "tiff", "webp"], optional = true }
+log = { version = "0.4", default-features = false, features = ["std"] }
+parking_lot = "0.12.1"
+profiling = "1"
+raw-window-handle = "0.6"
+smallvec = { version = "1.6", features = ["union", "const_new"] }
+swash = "0.2.6"
+unicode-bidi = { version = "0.3.18", default-features = false, features = ["hardcoded-data"] }
+unicode-segmentation = "1.10"
+gpui_util = { git = "https://github.com/zed-industries/zed", rev = "27bbbc1cc480a7500cec122f120e796d1fb8500c" }
+
+# Optional: only needed on platforms with multiple font sources (e.g. Linux)
+# WARNING: If you change this, you must also publish a new version of zed-font-kit to crates.io
+font-kit = { git = "https://github.com/zed-industries/font-kit", rev = "94b0f28166665e8fd2f53ff6d268a14955c82269", default-features = false, package = "zed-font-kit", version = "0.14.1-zed", optional = true }
+
+# Zed takes wgpu from a gfx-rs commit after 30.0.1; this copy builds against
+# the wgpu 30 release on crates.io, so apps that already use wgpu 30 link one
+# wgpu. PATCHES.md lists the two API differences.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "metal", "gles", "vulkan", "wgsl", "webgpu"] }
+
+[target.'cfg(not(any(target_os = "linux", target_os = "freebsd")))'.dependencies]
+wgpu = "30.0.1"
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["webgl"] }
+
+[[bench]]
+name = "layout_line"
+harness = false

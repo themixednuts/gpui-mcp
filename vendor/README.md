@@ -7,6 +7,7 @@ GPUI ships an equivalent.
 | Directory | What it is | Used by |
 | --- | --- | --- |
 | `gpui/` | GPUI 0.2.2 from Zed commit `27bbbc1cc480a7500cec122f120e796d1fb8500c` | The `zed` backend |
+| `gpui_wgpu/` | GPUI's wgpu renderer from the same Zed commit, built against the wgpu 30 release | The `zed` backend on Linux, FreeBSD and the web |
 | `gpui-pre/` | The crates.io `gpui-pre` 0.3.7 release (Zed commit `1a28cff4b409169bac058bca40dfbfeb7621d19b`), as used by GPUI Kit 0.7.0 | The `gpui-pre` backend |
 | `gpui-ce/` | The crates.io `gpui-ce` 0.2.2 release, the community fork of GPUI | The `gpui-ce` backend |
 | `patches/<crate>/<version>/` | The patches for each supported `gpui-pre` and `gpui-ce` version | `gpui-pre/`, `gpui-ce/` and downstream apps |
@@ -17,9 +18,15 @@ Each copy keeps its Apache-2.0 license in `LICENSE-APACHE`.
 
 The changes are listed in [`gpui/PATCHES.md`](gpui/PATCHES.md). They were
 rebased onto Zed `main` on 2026-11-12 and were still unmerged upstream that
-day. The Zed crates the `zed` backend builds against (`gpui_platform`,
-`gpui_wgpu` and the rest) come from the same commit, which puts the renderer on
-wgpu 30.
+day. The Zed crates the `zed` backend builds against (`gpui_platform` and the
+rest) come from the same commit.
+
+## `gpui_wgpu/`
+
+Zed's renderer takes wgpu from a gfx-rs commit after 30.0.1, so an app on the
+wgpu 30 release would link two wgpus. This copy builds against the release;
+[`gpui_wgpu/PATCHES.md`](gpui_wgpu/PATCHES.md) lists the two API differences
+and the two wgpu fixes it goes without.
 
 ## `gpui-pre/` and `gpui-ce/`
 

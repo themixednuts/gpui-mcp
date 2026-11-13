@@ -10,7 +10,7 @@ members = [
     "examples/runtime-showcase",
     "xtask",
 ]
-exclude = ["vendor/gpui", "vendor/gpui-pre", "vendor/gpui-ce", "examples/gpui-kit"]
+exclude = ["vendor/gpui", "vendor/gpui_wgpu", "vendor/gpui-pre", "vendor/gpui-ce", "examples/gpui-kit"]
 default-members = ["crates/gpui-mcp-server"]
 resolver = "3"
 
@@ -95,3 +95,6 @@ gpui-ce = { path = "vendor/gpui-ce" }
 
 [patch."https://github.com/zed-industries/zed"]
 gpui = { path = "vendor/gpui" }
+# GPUI's renderer on the wgpu 30 release rather than Zed's wgpu commit; see
+# vendor/gpui_wgpu/PATCHES.md.
+gpui_wgpu = { path = "vendor/gpui_wgpu" }
