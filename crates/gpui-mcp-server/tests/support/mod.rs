@@ -81,18 +81,25 @@ mod tests {
         trees: usize,
     }
     impl FixtureClient for DelayedTree {
-        async fn call_json(&mut self, tool: &str, _: Value) -> Result<Value, String> {
-            if tool == "list_apps" {
-                return Ok(json!({ "count": 1 }));
-            }
-            self.trees += 1;
-            Ok(if self.trees < 2 {
-                json!({ "nodes": {} })
+        // Answers at once, so the future is already complete.
+        fn call_json(
+            &mut self,
+            tool: &str,
+            _: Value,
+        ) -> impl Future<Output = Result<Value, String>> {
+            let response = if tool == "list_apps" {
+                json!({ "count": 1 })
             } else {
-                // Readiness accepts an incorrect enabled state: the actual
-                // semantic assertion must remain responsible for rejecting it.
-                json!({ "nodes": { "locked": { "state": { "enabled": true } } } })
-            })
+                self.trees += 1;
+                if self.trees < 2 {
+                    json!({ "nodes": {} })
+                } else {
+                    // Readiness accepts an incorrect enabled state: the actual
+                    // semantic assertion must remain responsible for rejecting it.
+                    json!({ "nodes": { "locked": { "state": { "enabled": true } } } })
+                }
+            };
+            std::future::ready(Ok(response))
         }
     }
 
