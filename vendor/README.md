@@ -118,7 +118,9 @@ workspace `Cargo.toml` doesn't match its `.json` file.
   vendored `gpui-pre` as well as the Zed tree.
 - The Kit demo builds and passes its tests.
 - The bridge builds and passes its tests on Rust 1.95, the oldest version it
-  supports.
+  supports, on Linux. Zed's `gpui_macos` at the vendored commit calls
+  `Option::map_or_default`, so the `zed` backend on macOS needs a newer Rust;
+  the workspace builds with 1.98.1, the toolchain Zed pins.
 - Fresh apps that install the bridge from the pushed Git commit build, one for
   GPUI Kit and one for `gpui-ce`. In each, the app's GPUI crates and the bridge
   must share a single patched GPUI.
