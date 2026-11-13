@@ -668,7 +668,8 @@ mod tests {
         for force_disabled in [false, true] {
             for active in [false, true] {
                 let mut a11y = A11y::new(Arc::new(AtomicBool::new(active)), force_disabled, None);
-                a11y.sync_active_flag();
+                // No frame observer: activation follows the platform alone.
+                a11y.sync_active_flag(false);
 
                 assert_eq!(a11y.is_enabled(), !force_disabled);
                 assert_eq!(a11y.is_active(), !force_disabled && active);

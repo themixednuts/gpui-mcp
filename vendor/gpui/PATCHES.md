@@ -125,3 +125,7 @@ the code they touch:
   `ViewRenderCause::LayoutChanged`.
 - `Window::bounds_changed` keeps upstream's window-bounds bookkeeping and
   moves the pointer through the patched pointer owner.
+
+Upstream's `accessibility_enabled_is_independent_of_activation` test calls
+`A11y::sync_active_flag` with no frame observer (`false`), since the patch
+added that argument.
