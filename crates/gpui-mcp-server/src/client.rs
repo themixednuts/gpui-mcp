@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use gpui_mcp_protocol::{
-    AppId, BridgeResult, Capability, EndpointDescriptor, LocalEndpoint, MAX_REQUEST_BYTES,
-    MAX_RESPONSE_BYTES, Operation, PROTOCOL_VERSION, ProcessId, RequestId, WireRequest,
-    WireResponse,
+    AppId, BridgeResult, Capabilities, Capability, EndpointDescriptor, LocalEndpoint,
+    MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, Operation, PROTOCOL_VERSION, ProcessId, RequestId,
+    WireRequest, WireResponse,
 };
 use interprocess::local_socket::{
     GenericFilePath, GenericNamespaced, Name, ToFsName as _, ToNsName as _,
@@ -59,11 +59,22 @@ impl ConnectionPool {
 #[derive(Clone)]
 pub(crate) struct BridgeClient {
     descriptor: Arc<EndpointDescriptor>,
+    /// The descriptor file, reread for capabilities published after discovery.
+    path: Arc<Path>,
     next_request_id: Arc<AtomicU64>,
     pool: Arc<ConnectionPool>,
 }
 
 impl BridgeClient {
+    fn new(path: &Path, descriptor: EndpointDescriptor) -> Self {
+        Self {
+            descriptor: Arc::new(descriptor),
+            path: Arc::from(path),
+            next_request_id: Arc::new(AtomicU64::new(1)),
+            pool: Arc::new(ConnectionPool::new()),
+        }
+    }
+
     fn from_path(path: &Path, app_id: Option<&AppId>) -> Result<Self> {
         let descriptor = read_descriptor(path)?;
         if let Some(expected) = app_id
@@ -76,15 +87,29 @@ impl BridgeClient {
             );
         }
         validate_descriptor(&descriptor, path)?;
-        Ok(Self {
-            descriptor: Arc::new(descriptor),
-            next_request_id: Arc::new(AtomicU64::new(1)),
-            pool: Arc::new(ConnectionPool::new()),
-        })
+        Ok(Self::new(path, descriptor))
     }
 
+    /// The descriptor as read at discovery. Its identity and endpoint never
+    /// change; read capabilities through [`Self::capabilities`].
     pub(crate) fn descriptor(&self) -> &EndpointDescriptor {
         &self.descriptor
+    }
+
+    /// The capabilities the application advertises now.
+    ///
+    /// The bridge writes its descriptor when it is installed and rewrites it
+    /// when the application registers a callback such as
+    /// `BridgeHandle::on_message`, so the copy read at discovery can predate
+    /// a capability. This rereads the file, and keeps the discovered
+    /// capabilities if the file is gone or now belongs to another instance.
+    pub(crate) fn capabilities(&self) -> Capabilities {
+        match read_descriptor(&self.path) {
+            Ok(current) if TargetId::from_descriptor(&current) == self.target_id() => {
+                current.capabilities
+            }
+            _ => self.descriptor.capabilities.clone(),
+        }
     }
 
     pub(crate) fn target_id(&self) -> TargetId {
@@ -212,7 +237,7 @@ impl AppInfo {
             app_name: descriptor.app_name.clone(),
             pid: descriptor.pid,
             selected,
-            capabilities: descriptor.capabilities.clone(),
+            capabilities: client.capabilities(),
         }
     }
 }
@@ -443,14 +468,8 @@ async fn discover_clients(
         if app_id.is_none_or(|expected| descriptor.app_id == *expected)
             && validate_descriptor(&descriptor, &path).is_ok()
         {
-            probes.spawn(async move {
-                let client = BridgeClient {
-                    descriptor: Arc::new(descriptor),
-                    next_request_id: Arc::new(AtomicU64::new(1)),
-                    pool: Arc::new(ConnectionPool::new()),
-                };
-                probe(&client).await.then_some(client)
-            });
+            let client = BridgeClient::new(&path, descriptor);
+            probes.spawn(async move { probe(&client).await.then_some(client) });
         }
     }
     let mut clients = Vec::new();

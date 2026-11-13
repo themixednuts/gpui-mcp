@@ -20,7 +20,7 @@ pub(crate) async fn capture(
     area: ScreenshotTarget,
 ) -> Result<Screenshot, String> {
     let descriptor = client.descriptor();
-    if !descriptor.capabilities.supports(Capability::Screenshot) {
+    if !client.capabilities().supports(Capability::Screenshot) {
         return Err("the application platform does not expose native window capture".to_owned());
     }
     let window = descriptor
