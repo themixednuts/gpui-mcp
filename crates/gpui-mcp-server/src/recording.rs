@@ -510,8 +510,10 @@ fn rgba_to_rgb(rgba: &[u8], rgb: &mut [u8]) -> Result<(), String> {
     {
         return Err("video RGBA and RGB conversion buffers do not match".to_owned());
     }
-    for (source, destination) in rgba.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
-        destination.copy_from_slice(&source[..3]);
+    let (pixels, _) = rgba.as_chunks::<4>();
+    let (outputs, _) = rgb.as_chunks_mut::<3>();
+    for ([red, green, blue, _], destination) in pixels.iter().zip(outputs) {
+        *destination = [*red, *green, *blue];
     }
     Ok(())
 }

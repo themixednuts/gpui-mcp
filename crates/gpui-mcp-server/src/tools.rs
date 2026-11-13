@@ -18,12 +18,12 @@ use rmcp::{
     model::{
         CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
         ContentBlock, CreateTaskResult, ErrorData, GetTaskParams, GetTaskResult, Implementation,
-        ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams, ProtocolVersion,
-        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-        ResourceContents, ServerCapabilities, ServerInfo, SubscribeRequestParams,
-        SubscriptionFilter, UnsubscribeRequestParams, UpdateTaskParams,
+        ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+        ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
+        Resource, ResourceContents, ResultType, ServerCapabilities, ServerInfo,
+        SubscribeRequestParams, SubscriptionFilter, UnsubscribeRequestParams, UpdateTaskParams,
     },
-    service::{RequestContext, SubscriptionContext},
+    service::{MaybeSendFuture, RequestContext, SubscriptionContext},
     task_manager::{TaskExit, TaskManager, TaskOptions},
     tool, tool_handler, tool_router,
 };
@@ -894,12 +894,35 @@ impl ServerHandler for GpuiMcp {
         Ok(ListResourcesResult::with_all_items(resources).uncacheable(&context))
     }
 
-    async fn list_resource_templates(
+    fn list_resource_templates(
         &self,
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
-    ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        Ok(ListResourceTemplatesResult::with_all_items(Vec::new()).uncacheable(&context))
+    ) -> impl Future<Output = Result<ListResourceTemplatesResult, ErrorData>> + MaybeSendFuture + '_
+    {
+        std::future::ready(Ok(
+            ListResourceTemplatesResult::with_all_items(Vec::new()).uncacheable(&context)
+        ))
+    }
+
+    // `#[tool_handler]` would generate this as an `async fn` with no `.await`;
+    // defining it here keeps its result and skips the generated one.
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + MaybeSendFuture + '_ {
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
+        std::future::ready(Ok(ListToolsResult {
+            result_type: Some(ResultType::COMPLETE),
+            tools: self.tool_router.list_all(),
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(CacheScope::Public),
+        }))
     }
 
     async fn read_resource(
@@ -990,29 +1013,35 @@ impl ServerHandler for GpuiMcp {
         Ok(CallToolResponse::Task(CreateTaskResult::new(task)))
     }
 
-    async fn get_task(
+    fn get_task(
         &self,
         request: GetTaskParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetTaskResult, ErrorData> {
-        Ok(GetTaskResult::new(self.tasks.get_task(&request.task_id)?))
+    ) -> impl Future<Output = Result<GetTaskResult, ErrorData>> + MaybeSendFuture + '_ {
+        std::future::ready(
+            self.tasks
+                .get_task(&request.task_id)
+                .map(GetTaskResult::new),
+        )
     }
 
-    async fn update_task(
+    fn update_task(
         &self,
         request: UpdateTaskParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<(), ErrorData> {
-        self.tasks
-            .update_task(&request.task_id, request.input_responses)
+    ) -> impl Future<Output = Result<(), ErrorData>> + MaybeSendFuture + '_ {
+        std::future::ready(
+            self.tasks
+                .update_task(&request.task_id, request.input_responses),
+        )
     }
 
-    async fn cancel_task(
+    fn cancel_task(
         &self,
         request: CancelTaskParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<(), ErrorData> {
-        self.tasks.cancel_task(&request.task_id)
+    ) -> impl Future<Output = Result<(), ErrorData>> + MaybeSendFuture + '_ {
+        std::future::ready(self.tasks.cancel_task(&request.task_id))
     }
 
     fn accepted_subscription_filter(
@@ -1053,7 +1082,28 @@ impl ServerHandler for GpuiMcp {
     }
 
     #[allow(deprecated)]
-    async fn subscribe(
+    fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), ErrorData>> + MaybeSendFuture + '_ {
+        std::future::ready(self.subscribe_to_messages(request, context))
+    }
+
+    #[allow(deprecated)]
+    fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), ErrorData>> + MaybeSendFuture + '_ {
+        std::future::ready(self.unsubscribe_from(&request.uri))
+    }
+}
+
+impl GpuiMcp {
+    /// Start notifying the peer of `gpui://messages` updates, replacing any
+    /// earlier watcher for that URI. The watcher runs on its own task.
+    fn subscribe_to_messages(
         &self,
         request: SubscribeRequestParams,
         context: RequestContext<RoleServer>,
@@ -1096,17 +1146,13 @@ impl ServerHandler for GpuiMcp {
         Ok(())
     }
 
-    #[allow(deprecated)]
-    async fn unsubscribe(
-        &self,
-        request: UnsubscribeRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<(), ErrorData> {
+    /// Stop the watcher for `uri`, if there is one.
+    fn unsubscribe_from(&self, uri: &str) -> Result<(), ErrorData> {
         if let Some(watcher) = self
             .resource_watchers
             .lock()
             .map_err(|_| ErrorData::internal_error("subscription state is poisoned", None))?
-            .remove(&request.uri)
+            .remove(uri)
         {
             watcher.cancel();
         }
