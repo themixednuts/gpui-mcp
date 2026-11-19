@@ -8,6 +8,7 @@ GPUI ships an equivalent.
 | --- | --- | --- |
 | `gpui/` | GPUI 0.2.2 from Zed commit `27bbbc1cc480a7500cec122f120e796d1fb8500c` | The `zed` backend |
 | `gpui_wgpu/` | GPUI's wgpu renderer from the same Zed commit, built against the wgpu 30 release | The `zed` backend on Linux, FreeBSD and the web |
+| `gpui_macos/` | GPUI's macOS platform from the same Zed commit, drawing without its Metal display link when the link stops answering | The `zed` backend on macOS |
 | `gpui-pre/` | The crates.io `gpui-pre` 0.3.7 release (Zed commit `1a28cff4b409169bac058bca40dfbfeb7621d19b`), as used by GPUI Kit 0.7.0 | The `gpui-pre` backend |
 | `gpui-ce/` | The crates.io `gpui-ce` 0.2.2 release, the community fork of GPUI | The `gpui-ce` backend |
 | `patches/<crate>/<version>/` | The patches for each supported `gpui-pre` and `gpui-ce` version | `gpui-pre/`, `gpui-ce/` and downstream apps |
@@ -27,6 +28,14 @@ Zed's renderer takes wgpu from a gfx-rs commit after 30.0.1, so an app on the
 wgpu 30 release would link two wgpus. This copy builds against the release;
 [`gpui_wgpu/PATCHES.md`](gpui_wgpu/PATCHES.md) lists the two API differences
 and the two wgpu fixes it goes without.
+
+## `gpui_macos/`
+
+Zed draws a macOS window only when its `CAMetalDisplayLink` calls back. On
+GitHub's macOS runners the link sometimes stopped calling back, so the window
+stopped drawing. When a wake goes unanswered, this copy draws the frame
+without the link and attaches a new one;
+[`gpui_macos/PATCHES.md`](gpui_macos/PATCHES.md) has the evidence.
 
 ## `gpui-pre/` and `gpui-ce/`
 

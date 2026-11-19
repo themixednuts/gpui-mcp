@@ -34,6 +34,7 @@ gpui = { git = "https://github.com/themixednuts/gpui-mcp", branch = "main" }
 [patch."https://github.com/zed-industries/zed"]
 gpui = { git = "https://github.com/themixednuts/gpui-mcp", branch = "main" }
 gpui_wgpu = { git = "https://github.com/themixednuts/gpui-mcp", branch = "main" }
+gpui_macos = { git = "https://github.com/themixednuts/gpui-mcp", branch = "main" }
 ```
 
 Both `gpui` patches are required. They keep your app, `gpui_platform`, and the
@@ -41,7 +42,10 @@ bridge on one GPUI build. They can go away once the additions in the
 [vendor patch inventory](vendor/gpui/PATCHES.md) land upstream. The
 `gpui_wgpu` patch puts GPUI's renderer on the wgpu 30 release, so an app that
 uses wgpu itself links one wgpu; see
-[`vendor/gpui_wgpu/PATCHES.md`](vendor/gpui_wgpu/PATCHES.md).
+[`vendor/gpui_wgpu/PATCHES.md`](vendor/gpui_wgpu/PATCHES.md). The
+`gpui_macos` patch keeps a macOS window drawing when its display link stops
+calling back; see
+[`vendor/gpui_macos/PATCHES.md`](vendor/gpui_macos/PATCHES.md).
 
 Install the bridge when you open a window:
 
