@@ -8,8 +8,8 @@ use std::rc::Rc;
 
 use gpui::{
     App, Context, IntoElement, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PlatformInput, Render, ScrollDelta, ScrollWheelEvent, Styled as _,
-    TestAppContext, TouchPhase, Window, div, point, px, size,
+    MouseUpEvent, PlatformInput, Render, ScrollDelta, Styled as _, TestAppContext, TouchPhase,
+    Window, div, point, px, size,
 };
 use gpui_mcp::{Automation, NodeAction, Role, UiTree, ValueInfo};
 use gpui_mcp_html::{
@@ -317,15 +317,25 @@ fn dispatch_pointer_test_input(
             );
         }
         TestInput::Scroll { delta_x, delta_y } => {
-            window.dispatch_event(
-                PlatformInput::ScrollWheel(ScrollWheelEvent {
-                    position: center,
-                    delta: ScrollDelta::Pixels(point(px(-*delta_x), px(-*delta_y))),
-                    modifiers: Modifiers::default(),
-                    touch_phase: TouchPhase::Moved,
-                }),
-                cx,
-            );
+            let delta = ScrollDelta::Pixels(point(px(-*delta_x), px(-*delta_y)));
+            // Zed's GPUI renamed `ScrollWheelEvent` to `ScrollEvent` and records
+            // which device produced it.
+            #[cfg(feature = "zed")]
+            let event = PlatformInput::Scroll(gpui::ScrollEvent {
+                position: center,
+                delta,
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+                source: gpui::ScrollSource::Pointer,
+            });
+            #[cfg(not(feature = "zed"))]
+            let event = PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                position: center,
+                delta,
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+            });
+            window.dispatch_event(event, cx);
         }
         TestInput::SetValue { .. } => {
             window.dispatch_event(

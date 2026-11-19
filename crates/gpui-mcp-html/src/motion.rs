@@ -9,7 +9,7 @@
 
 use gpui::{
     AnyElement, App, Bounds, Element, ElementId as GpuiElementId, GlobalElementId,
-    InspectorElementId, IntoElement, LayoutId, Pixels, Window, point,
+    InspectorElementId, LayoutId, Pixels, Window, point,
 };
 use htmlswap::computed::{ComputedStyle, LengthPercentage, Underlying};
 use htmlswap::{RenderMotionPlan, StyleDeclaration};
@@ -317,7 +317,9 @@ impl Translated {
     }
 }
 
-impl IntoElement for Translated {
+// Zed's GPUI implements `IntoElement` for every `Element`; gpui-pre does not.
+#[cfg(not(feature = "zed"))]
+impl gpui::IntoElement for Translated {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {

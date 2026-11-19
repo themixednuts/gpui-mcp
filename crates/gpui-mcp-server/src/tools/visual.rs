@@ -131,7 +131,7 @@ impl GpuiMcp {
         let _transition = self.target_transition.lock().await;
         let target = self.client().await?;
         let descriptor = target.descriptor();
-        if !descriptor.capabilities.supports(Capability::Screenshot) {
+        if !target.capabilities().supports(Capability::Screenshot) {
             return Err(
                 "the application platform does not expose native window capture".to_owned(),
             );

@@ -1,17 +1,50 @@
 use gpui::{
     App, Keystroke, Modifiers, MouseButton as GpuiMouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px,
+    MouseUpEvent, PlatformInput, ScrollDelta, TouchPhase, Window, point, px,
 };
 use gpui_mcp_protocol::{
     BridgeError, ErrorCode, InputCommand, MAX_KEY_SEQUENCE, MAX_TEXT_BYTES, MouseButton, Point,
     PointerCommand, PointerScrollDelta,
 };
 
+/// The OS whose conventions resolve `secondary-` when a keystroke is checked
+/// without an [`App`]. It decides only which modifier `secondary-` becomes,
+/// never whether the keystroke parses.
+#[cfg(feature = "zed")]
+const BUILD_TARGET_OS: gpui::OperatingSystem = if cfg!(target_os = "macos") {
+    gpui::OperatingSystem::Mac
+} else if cfg!(target_os = "windows") {
+    gpui::OperatingSystem::Windows
+} else if cfg!(target_os = "freebsd") {
+    gpui::OperatingSystem::FreeBsd
+} else {
+    gpui::OperatingSystem::Linux
+};
+
+/// Parse a keystroke received at run time, resolving `secondary-` for the
+/// running app's OS, or for the build target when there is no app.
+///
+/// Zed's GPUI keeps `Keystroke::parse` for static strings; run-time text goes
+/// through `Keystroke::parse_with_os`.
+fn parse_keystroke(source: &str, cx: Option<&App>) -> Result<Keystroke, BridgeError> {
+    #[cfg(feature = "zed")]
+    let parsed = Keystroke::parse_with_os(
+        source,
+        cx.map_or(BUILD_TARGET_OS, |cx| cx.platform_info().os),
+    );
+    #[cfg(not(feature = "zed"))]
+    let parsed = {
+        let _ = cx;
+        Keystroke::parse(source)
+    };
+    parsed.map_err(|_| invalid("invalid GPUI keystroke syntax"))
+}
+
 pub(crate) fn validate(command: &InputCommand) -> Result<(), BridgeError> {
     match command {
         InputCommand::Key { keystroke } => {
             validate_text(keystroke)?;
-            Keystroke::parse(keystroke).map_err(|_| invalid("invalid GPUI keystroke syntax"))?;
+            parse_keystroke(keystroke, None)?;
         }
         InputCommand::KeySequence { keystrokes } => {
             if keystrokes.is_empty() || keystrokes.len() > MAX_KEY_SEQUENCE {
@@ -19,8 +52,7 @@ pub(crate) fn validate(command: &InputCommand) -> Result<(), BridgeError> {
             }
             for keystroke in keystrokes {
                 validate_text(keystroke)?;
-                Keystroke::parse(keystroke)
-                    .map_err(|_| invalid("invalid GPUI keystroke syntax"))?;
+                parse_keystroke(keystroke, None)?;
             }
         }
         InputCommand::TypeText { text } | InputCommand::ReplaceText { text } => {
@@ -92,9 +124,9 @@ pub(crate) fn dispatch_pointer(
         PointerCommand::ScrollWheel {
             point: position,
             delta,
-        } => PlatformInput::ScrollWheel(ScrollWheelEvent {
-            position: native_point(*position),
-            delta: match delta {
+        } => scroll_input(
+            native_point(*position),
+            match delta {
                 PointerScrollDelta::Pixels { delta_x, delta_y } => {
                     ScrollDelta::Pixels(point(px(*delta_x), px(*delta_y)))
                 }
@@ -102,12 +134,34 @@ pub(crate) fn dispatch_pointer(
                     ScrollDelta::Lines(point(*delta_x, *delta_y))
                 }
             },
-            modifiers: Modifiers::default(),
-            touch_phase: TouchPhase::Moved,
-        }),
+        ),
     };
     window.dispatch_event(event, cx);
     Ok(())
+}
+
+/// A mouse-wheel scroll at `position`. Zed's GPUI renamed `ScrollWheelEvent`
+/// to `ScrollEvent` and records which device produced it.
+#[cfg(feature = "zed")]
+fn scroll_input(position: gpui::Point<gpui::Pixels>, delta: ScrollDelta) -> PlatformInput {
+    PlatformInput::Scroll(gpui::ScrollEvent {
+        position,
+        delta,
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+        source: gpui::ScrollSource::Pointer,
+    })
+}
+
+/// A mouse-wheel scroll at `position`.
+#[cfg(not(feature = "zed"))]
+fn scroll_input(position: gpui::Point<gpui::Pixels>, delta: ScrollDelta) -> PlatformInput {
+    PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+        position,
+        delta,
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+    })
 }
 
 /// Return the GPUI input pipeline's latest pointer position in window-relative logical pixels.
@@ -128,14 +182,12 @@ pub(crate) fn dispatch_keyboard(
     validate(&command)?;
     match command {
         InputCommand::Key { keystroke } => {
-            let parsed = Keystroke::parse(&keystroke)
-                .map_err(|_| invalid("invalid GPUI keystroke syntax"))?;
+            let parsed = parse_keystroke(&keystroke, Some(cx))?;
             window.dispatch_keystroke(parsed, cx);
         }
         InputCommand::KeySequence { keystrokes } => {
             for keystroke in keystrokes {
-                let parsed = Keystroke::parse(&keystroke)
-                    .map_err(|_| invalid("invalid GPUI keystroke syntax"))?;
+                let parsed = parse_keystroke(&keystroke, Some(cx))?;
                 window.dispatch_keystroke(parsed, cx);
             }
         }

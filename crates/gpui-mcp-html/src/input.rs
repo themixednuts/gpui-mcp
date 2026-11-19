@@ -637,6 +637,8 @@ struct PaintedLine {
     origin: Point<Pixels>,
 }
 
+// Zed's GPUI implements `IntoElement` for every `Element`; gpui-pre does not.
+#[cfg(not(feature = "zed"))]
 impl IntoElement for TextElement {
     type Element = Self;
 

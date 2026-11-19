@@ -53,7 +53,7 @@ impl GpuiMcp {
             "target_id": client.target_id(),
             "pid": pid,
             "protocol_version": protocol_version,
-            "capabilities": client.descriptor().capabilities,
+            "capabilities": client.capabilities(),
         })))
     }
 
